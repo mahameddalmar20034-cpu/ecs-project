@@ -1,0 +1,258 @@
+import type { ColumnType, SortType, ViewType } from 'nocodb-sdk'
+import type { Ref } from 'vue'
+import type { EventHook } from '@vueuse/core'
+import { isInterfaceSyntheticViewId } from '~/lib/interfaceData'
+
+export function useViewSorts(view: Ref<ViewType | undefined>, reloadData?: () => void) {
+  const { sorts, eventBus } = useSmartsheetStoreOrThrow()
+
+  const { $api, $e, $eventBus } = useNuxtApp()
+
+  const { internalGet } = useInternalBatch()
+
+  const { isSharedBase } = storeToRefs(useBase())
+
+  const { hasPersonalViewPermission } = usePersonalViewPermissions(view)
+
+  const canSyncSort = hasPersonalViewPermission('sortSync')
+
+  const canListSort = hasPersonalViewPermission('sortList')
+
+  const reloadHook = inject(ReloadViewDataHookInj)
+
+  const isPublic = inject(IsPublicInj, ref(false))
+
+  // Interface pages: sorts are viewer-local — the synthetic view has no server
+  // row, so every persistence path (list/create/update/delete) must stay local.
+  const isInterfacePage = !!inject(InterfacePageDataInj, undefined)
+
+  const meta = inject(MetaInj, ref())
+
+  const loadSorts = async () => {
+    if (isPublic.value) {
+      sorts.value = []
+      return
+    }
+
+    // Nothing to load: on an interface page the picked sorts ARE the state, and a
+    // synthetic view id has no server row to read it from anyway.
+    if (isInterfacePage || isInterfaceSyntheticViewId(view.value?.id)) return
+
+    // Wait for meta to be available before loading sorts (up to 5 seconds)
+    if (!meta.value && view?.value) {
+      await until(meta).toBeTruthy({ timeout: 5000 })
+    }
+
+    try {
+      if (!canListSort.value) {
+        return
+      }
+      if (!view?.value || !meta.value) return
+
+      sorts.value = (
+        await internalGet(meta.value.fk_workspace_id!, meta.value.base_id!, {
+          operation: 'sortList',
+          viewId: view.value!.id!,
+        })
+      ).list as SortType[]
+    } catch (e: any) {
+      console.error(e)
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+  }
+
+  const saveOrUpdate = async (sort: SortType, i: number) => {
+    if (isPublic.value || isSharedBase.value || isInterfacePage || isInterfaceSyntheticViewId(view.value?.id)) {
+      sorts.value[i] = sort
+      sorts.value = [...sorts.value]
+      reloadHook?.trigger()
+      return
+    }
+
+    try {
+      if (canSyncSort.value) {
+        const sortBody = {
+          fk_column_id: sort.fk_column_id,
+          direction: sort.direction,
+          ...((sort as { fk_level_id?: string | null }).fk_level_id !== undefined
+            ? { fk_level_id: (sort as { fk_level_id?: string | null }).fk_level_id }
+            : {}),
+          ...(sort.enabled !== undefined ? { enabled: sort.enabled } : {}),
+          ...(sort.order !== undefined ? { order: sort.order } : {}),
+        }
+        if (sort.id) {
+          await $api.internal.postOperation(
+            meta.value!.fk_workspace_id!,
+            meta.value!.base_id!,
+            {
+              operation: 'sortUpdate',
+              sortId: sort.id,
+            },
+            sortBody,
+          )
+          $e('sort-updated')
+        } else {
+          sorts.value[i] = (await $api.internal.postOperation(
+            meta.value!.fk_workspace_id!,
+            meta.value!.base_id!,
+            {
+              operation: 'sortCreate',
+              viewId: view.value?.id as string,
+            },
+            sortBody,
+          )) as unknown as SortType
+        }
+      }
+      reloadData?.()
+      $e('a:sort:dir', { direction: sort.direction })
+    } catch (e: any) {
+      console.error(e)
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+  }
+
+  const insertSort = async ({
+    direction,
+    column,
+    reloadDataHook,
+  }: {
+    direction: 'asc' | 'desc'
+    column: ColumnType
+    reloadDataHook?: EventHook<boolean | void> | undefined
+  }) => {
+    try {
+      $e('a:sort:add', { from: 'column-menu' })
+      const existingSortIndex = sorts.value.findIndex((s) => s.fk_column_id === column.id)
+      const existingSort = existingSortIndex > -1 ? sorts.value[existingSortIndex] : undefined
+
+      const isLocalMode =
+        isPublic.value ||
+        isSharedBase.value ||
+        isInterfacePage ||
+        !canSyncSort.value ||
+        isInterfaceSyntheticViewId(view.value?.id)
+      // Delete existing sort and not update the state as sort count in UI will change for a sec
+      if (existingSort && !isLocalMode) {
+        await $api.internal.postOperation(
+          meta.value!.fk_workspace_id!,
+          meta.value!.base_id!,
+          {
+            operation: 'sortDelete',
+            sortId: existingSort.id!,
+          },
+          {},
+        )
+        $e('a:sort:delete')
+      }
+
+      let data: any
+
+      if (isLocalMode) {
+        data = {
+          fk_column_id: column!.id,
+          direction,
+        }
+      } else {
+        data = await $api.internal.postOperation(
+          meta.value!.fk_workspace_id!,
+          meta.value!.base_id!,
+          {
+            operation: 'sortCreate',
+            viewId: view.value?.id as string,
+          },
+          {
+            fk_column_id: column!.id,
+            direction,
+          },
+        )
+      }
+
+      sorts.value = [...sorts.value.filter((_, index) => index !== existingSortIndex), data as SortType]
+
+      eventBus.emit(SmartsheetStoreEvents.SORT_RELOAD)
+      reloadDataHook?.trigger()
+    } catch (e: any) {
+      console.error(e)
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+  }
+
+  async function deleteSort(sort: SortType, i: number) {
+    try {
+      const isLocalMode =
+        isPublic.value ||
+        isSharedBase.value ||
+        isInterfacePage ||
+        !canSyncSort.value ||
+        isInterfaceSyntheticViewId(view.value?.id)
+      if (sort.id && !isLocalMode) {
+        await $api.internal.postOperation(
+          meta.value!.fk_workspace_id!,
+          meta.value!.base_id!,
+          {
+            operation: 'sortDelete',
+            sortId: sort.id,
+          },
+          {},
+        )
+      }
+      sorts.value.splice(i, 1)
+      sorts.value = [...sorts.value]
+
+      reloadHook?.trigger()
+      $e('a:sort:delete')
+    } catch (e: any) {
+      console.error(e)
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+  }
+
+  const addSort = (column?: ColumnType) => {
+    sorts.value = [
+      ...sorts.value,
+      {
+        fk_column_id: column?.id,
+        direction: 'asc',
+      },
+    ]
+
+    $e('a:sort:add', { length: sorts?.value?.length })
+  }
+
+  // Keep the list ordered by `order` — a realtime reorder (incl. undo/redo,
+  // which only changes the `order` field) must re-sort, otherwise the visible
+  // order stays stale until a reload.
+  const sortByOrder = (list: SortType[]) => [...list].sort((a, b) => (a.order ?? Infinity) - (b.order ?? Infinity))
+
+  const evtListener = (evt: string, payload: any) => {
+    if (payload.fk_view_id !== view.value?.id) return
+
+    if (evt === 'sort_create') {
+      if (!sorts.value.some((s) => s.id === payload.id)) {
+        sorts.value = sortByOrder([...sorts.value, payload])
+      }
+      reloadHook?.trigger()
+    } else if (evt === 'sort_update') {
+      const index = sorts.value.findIndex((s) => s.id === payload.id)
+      if (index !== -1) {
+        const next = [...sorts.value]
+        next[index] = payload
+        sorts.value = sortByOrder(next)
+      }
+      reloadHook?.trigger()
+    } else if (evt === 'sort_delete') {
+      sorts.value = sorts.value.filter((s) => s.id !== payload.id)
+      reloadHook?.trigger()
+    }
+  }
+
+  onMounted(() => {
+    $eventBus.realtimeViewMetaEventBus.on(evtListener)
+  })
+
+  onBeforeUnmount(() => {
+    $eventBus.realtimeViewMetaEventBus.off(evtListener)
+  })
+
+  return { sorts, loadSorts, addSort, deleteSort, saveOrUpdate, insertSort, canSyncSort }
+}

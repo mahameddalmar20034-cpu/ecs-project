@@ -1,0 +1,183 @@
+import type {
+  FactoryPort,
+  FactoryPreview,
+  FactoryRepoType,
+  FactorySessionView,
+  FactoryStreamState,
+} from 'nocodb-sdk';
+import type {
+  BaseVariableType,
+  DependencyTableType,
+  McpToolCatalogEntry,
+  NcContext,
+  NcRequest,
+  ProseMirrorDoc,
+  RowColoringInfo,
+  TableType,
+} from 'nocodb-sdk';
+import type { PagedResponseImpl } from '~/helpers/PagedResponse';
+import type { OPERATION_SCOPES } from '~/controllers/internal/operationScopes';
+import type { Dashboard, Workflow } from '~/models';
+import type { WebBookmarkMetadata } from '~/services/web-bookmark.service';
+import type {
+  Column,
+  DataReflection,
+  Document,
+  Extension,
+  Filter,
+  Hook,
+  HookLog,
+  Integration,
+  MCPToken,
+  Model,
+  OAuthClient,
+  Script,
+  Sort,
+  View,
+} from '~/models';
+
+export type InternalGETResponseType = Promise<
+  | void
+  | RowColoringInfo
+  | null
+  | DataReflection
+  | Integration
+  // `refTableGet` spreads the Model, so the methods and getters are gone.
+  | (TableType & { is_private: boolean })
+  | Document
+  | Document[]
+  | MCPToken
+  | MCPToken[]
+  | Script
+  | Script[]
+  | PagedResponseImpl<any>
+  | Model[]
+  | Column[]
+  | View[]
+  | {
+      source_table_missing: boolean;
+      columns: Column[];
+      views: View[];
+      visible_source_column_ids: string[];
+    }
+  | Filter[]
+  | Sort[]
+  | Hook[]
+  | HookLog[]
+  | { hash: string }
+  | { path?: string; url?: string }
+  | OAuthClient
+  | OAuthClient[]
+  | Extension
+  | Extension[]
+  | { workspaces: any[] }
+  | { totalRows: number; counts: Record<string, number> }
+  | { count: number }
+  | {
+      tables: {
+        id: string;
+        title: string;
+        trash_disabled: boolean | null;
+        trash_retention_days: number | null;
+        is_meta: boolean;
+        has_deleted_column: boolean;
+      }[];
+      defaultRetentionDays: number;
+    }
+  | {
+      totalWorkspaces: number;
+      totalBases: number;
+      totalUsers: number;
+      editorCount: number;
+    }
+  | { pm: ProseMirrorDoc | null; markdown: string | null }
+  | { list: McpToolCatalogEntry[] }
+  // App Factory — session views and the agent output drain.
+  | FactorySessionView
+  | FactoryStreamState
+  | FactoryRepoType[]
+  | FactoryPort[]
+  | FactoryPreview
+>;
+
+export type InternalPOSTResponseType = Promise<
+  | void
+  | boolean
+  | Document
+  | MCPToken
+  | OAuthClient
+  | OAuthClient[]
+  | { msg: string }
+  | {
+      hasBreakingChanges: boolean;
+      entities: {
+        type: DependencyTableType;
+        entity: Dashboard | Workflow | Model;
+      }[];
+    }
+  | DataReflection
+  | MCPToken
+  | Script
+  | { id: string; secret?: string }
+  | { failedOps: any[] }
+  | Model
+  | Column
+  | View
+  | Filter
+  | Sort
+  | Hook
+  | Extension
+  | BaseVariableType
+  | BaseVariableType[]
+  | { added: boolean; reaction: any }
+  | {
+      link: (string | number | Record<string, any>)[];
+      unlink: (string | number | Record<string, any>)[];
+    }[]
+  | { message: string }
+  | {
+      sheets: {
+        name?: string;
+        columns: any[];
+        previewData: any[];
+        totalSampleRows: number;
+        totalRows: number;
+        detectedDelimiter?: string;
+      }[];
+    }
+  | { deleted: number; failed: { id: string; error: string }[] }
+  | { id: string; name?: string }
+  | { pm: ProseMirrorDoc | null; markdown: string | null }
+  | { logged: number }
+  | WebBookmarkMetadata
+>;
+
+export const INTERNAL_API_MODULE_PROVIDER_KEY = 'INTERNAL_API_MODULE';
+
+export interface InternalApiModule<
+  T extends InternalGETResponseType | InternalPOSTResponseType,
+> {
+  operations: (keyof typeof OPERATION_SCOPES)[];
+  httpMethod: 'GET' | 'POST';
+  /**
+   * Operations owned by this module that must be denied to public shared-base
+   * sessions (anonymous UUID holders that are granted viewer roles). The
+   * dispatcher aggregates these across all modules and passes
+   * `blockPublicBaseAccess` to the ACL gate — mirroring the per-endpoint
+   * `@Acl(..., { blockPublicBaseAccess: true })` the REST controllers use.
+   *
+   * Each module owns this decision for its own operations; omit for modules
+   * whose operations are safe for shared bases.
+   */
+  publicBaseBlockedOperations?: (keyof typeof OPERATION_SCOPES)[];
+  handle(
+    context: NcContext,
+    param: {
+      workspaceId: string;
+      baseId: string;
+      operation: keyof typeof OPERATION_SCOPES;
+      payload?: any;
+      req: NcRequest;
+    },
+  ): T;
+}

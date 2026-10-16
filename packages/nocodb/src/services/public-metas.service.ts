@@ -1,0 +1,404 @@
+import { Injectable } from '@nestjs/common';
+import {
+  isCreatedOrLastModifiedByCol,
+  isLinksOrLTAR,
+  ncIsObject,
+  RelationTypes,
+  UITypes,
+  ViewLockType,
+  ViewTypes,
+} from 'nocodb-sdk';
+import type {
+  CalendarView,
+  LinkToAnotherRecordColumn,
+  LookupColumn,
+  RollupColumn,
+  TimelineRange,
+  TimelineView,
+} from '~/models';
+import type { NcContext } from '~/interface/config';
+import {
+  Base,
+  BaseUser,
+  Column,
+  GridViewColumn,
+  Model,
+  PresignedUrl,
+  Source,
+  View,
+} from '~/models';
+import { NcError } from '~/helpers/catchError';
+import { extractProps } from '~/helpers/extractProps';
+import { extractDisplayNameFromEmail } from '~/utils/emailUtils';
+import { setModelContext } from '~/helpers/modelContext';
+import { hasDefaultTableVisibility } from '~/helpers/tableHelpers';
+import { isSharedViewAccess } from '~/helpers/accessSource';
+import { projectRelatedMetas } from '~/helpers/relatedMetaProjection';
+import { withoutViewSecrets } from '~/helpers/publicViewSecrets';
+
+@Injectable()
+export class PublicMetasService {
+  async viewMetaGet(
+    context: NcContext,
+    param: { sharedViewUuid: string; password: string },
+  ) {
+    const view: View & {
+      relatedMetas?: { [ket: string]: Model };
+      users?: { id: string; display_name: string; email: string }[];
+      client?: string;
+      source?: Pick<Source, 'id' | 'type' | 'is_meta' | 'is_local'>;
+    } = await View.getByUUID(context, param.sharedViewUuid);
+
+    if (!view) NcError.get(context).viewNotFound(param.sharedViewUuid);
+
+    if (!(await View.verifyPassword(view, param.password))) {
+      NcError.get(context).invalidSharedViewPassword();
+    }
+
+    const base = await Base.get(context, view.base_id);
+
+    this.checkViewBaseType(view, base);
+
+    view.lock_type = ViewLockType.Collaborative;
+
+    await view.getFilters();
+    await view.getSorts();
+
+    await view.getViewWithInfo();
+    await view.getColumns();
+    await view.getModelWithInfo();
+
+    // A shared view can outlive its table: trashing a table soft-deletes only
+    // the model row (Model.softDelete), leaving the view + its share UUID intact.
+    // View.getByUUID still resolves, but the model is gone. The shared frontend
+    // calls viewMetaGet first to load the schema, so guard here to return a clean
+    // 4xx instead of a 500 on page load, before the data endpoints are reached.
+    //
+    // Two cases to cover: Model.getWithInfo returns null on a cache-miss (DB query
+    // filters soft-deleted rows) → view.model is unset; on a cache-hit it returns
+    // the cached row without re-checking the flag → view.model.deleted is true.
+    if (!view.model || view.model.deleted) {
+      NcError.get(context).tableNotFound(view.fk_model_id);
+    }
+
+    await view.model.getColumns();
+
+    const source = await Source.get(context, view.model.source_id);
+    view.client = source.type;
+    view.source = {
+      id: source.id,
+      type: source.type,
+      is_meta: source.is_meta,
+      is_local: source.is_local,
+    };
+
+    // Required for Calendar / Timeline views — the date columns that drive
+    // the bar / event positions are usually hidden in the field menu, so the
+    // visibility filter below would drop them from view.model.columns and
+    // leave the shared frontend with no range columns to render.
+    const rangeColumns = [];
+
+    if (view.type === ViewTypes.CALENDAR) {
+      const calendarRange = (view.view as CalendarView)?.calendar_range ?? [];
+      for (const c of calendarRange) {
+        if (c.fk_from_column_id) {
+          rangeColumns.push(c.fk_from_column_id);
+        } else if ((c as any).fk_to_column_id) {
+          rangeColumns.push((c as any).fk_to_column_id);
+        }
+      }
+    } else if (view.type === ViewTypes.TIMELINE) {
+      // Timeline ranges can have both from and to date columns.
+      const timelineRange = ((view.view as TimelineView)?.timeline_range ??
+        []) as TimelineRange[];
+      for (const c of timelineRange) {
+        if (c.fk_from_column_id) rangeColumns.push(c.fk_from_column_id);
+        if (c.fk_to_column_id) rangeColumns.push(c.fk_to_column_id);
+      }
+    }
+
+    view.model.columns = view.columns
+      .filter((c) => {
+        const column = view.model.columnsById[c.fk_column_id];
+
+        if (rangeColumns.includes(c.fk_column_id)) {
+          return true;
+        }
+        // Check if column exists to prevent processing non-existent columns
+        if (!column) return false;
+
+        return (
+          (c instanceof GridViewColumn && c.group_by) ||
+          c.show ||
+          (column.rqd && !column.cdf && !column.ai) ||
+          column.pk ||
+          view.model.columns.some(
+            (c1) =>
+              isLinksOrLTAR(c1.uidt) &&
+              (<LinkToAnotherRecordColumn>c1.colOptions).type ===
+                RelationTypes.BELONGS_TO &&
+              view.columns.some((vc) => vc.fk_column_id === c1.id && vc.show) &&
+              (<LinkToAnotherRecordColumn>c1.colOptions).fk_child_column_id ===
+                c.fk_column_id,
+          ) ||
+          view.model.columns.some(
+            (c1) =>
+              (UITypes.Lookup === c1.uidt || UITypes.Rollup === c1.uidt) &&
+              c1.colOptions &&
+              (<LookupColumn | RollupColumn>c1.colOptions)
+                .fk_relation_column_id === c.fk_column_id,
+          )
+        );
+      })
+      .map((c) =>
+        setModelContext(
+          new Column({
+            ...c,
+            ...view.model.columnsById[c.fk_column_id],
+          } as any),
+          context,
+        ),
+      ) as any;
+
+    const relatedMetas = {};
+
+    // load related table metas
+    for (const col of view.model.columns) {
+      await this.extractRelatedMetas(context, { col, relatedMetas });
+    }
+
+    // Some times related metas are null, so we need to filter them out
+    for (const key in relatedMetas) {
+      if (relatedMetas[key] == null) delete relatedMetas[key];
+      else relatedMetas[key] = withoutViewSecrets(relatedMetas[key]);
+    }
+
+    // `extractRelatedMetas` above attaches each related/junction table's FULL
+    // column set, so an anonymous consumer would get the names, types and select
+    // options of columns the share never exposes. Project down to what the DATA
+    // path returns under `pkAndPvOnly` — the two must agree, or the frontend
+    // renders fields the API refuses to return.
+    if (isSharedViewAccess(context)) {
+      projectRelatedMetas(relatedMetas, view.model.columns);
+    }
+
+    view.relatedMetas = relatedMetas;
+
+    if (
+      view.model.columns.some(
+        (c) => c.uidt === UITypes.User || isCreatedOrLastModifiedByCol(c),
+      )
+    ) {
+      const baseUsers = await BaseUser.getUsersList(context, {
+        base_id: view.model.base_id,
+      });
+
+      await PresignedUrl.signMetaIconImage(baseUsers);
+
+      view.users = baseUsers.map((u) => ({
+        id: u.id,
+        display_name: extractDisplayNameFromEmail(u.email, u.display_name),
+        email: '',
+        meta: ncIsObject(u.meta)
+          ? extractProps(u.meta, ['icon', 'iconType'])
+          : null,
+        deleted: u.deleted,
+      }));
+    }
+
+    // Never leak the stored password to the public viewer. Return a shallow
+    // copy with password stripped — don't mutate the loaded instance, so the
+    // strip stays safe even if `View.getByUUID` ever gains caching. Mirrors
+    // the EE dashboardMetaGet pattern.
+    const publicView = Object.assign(
+      Object.create(Object.getPrototypeOf(view)),
+      view,
+      {
+        password: undefined,
+      },
+    );
+
+    // The strip above only covers the requested view — `getModelWithInfo` also
+    // attaches every sibling view on the table.
+    publicView.model = withoutViewSecrets(publicView.model);
+
+    // Form views store an `email` recipient map (which base collaborators get
+    // submission emails) — builder-only config that must never reach the
+    // unauthenticated public form. Strip it from the copy (a fresh nested
+    // object, so the loaded/cached FormView instance is left untouched).
+    if (publicView.type === ViewTypes.FORM && publicView.view) {
+      publicView.view = { ...publicView.view, email: undefined };
+    }
+
+    return publicView;
+  }
+
+  protected async extractRelatedMetas(
+    context: NcContext,
+    {
+      col,
+      relatedMetas = {},
+    }: {
+      col: Column<any>;
+      relatedMetas: Record<string, Model>;
+    },
+  ) {
+    if (isLinksOrLTAR(col.uidt)) {
+      await this.extractLTARRelatedMetas(context, {
+        ltarColOption: await col.getColOptions<LinkToAnotherRecordColumn>(),
+        relatedMetas,
+      });
+    } else if (UITypes.Lookup === col.uidt) {
+      const lookupColOption = await col.getColOptions<LookupColumn>();
+      if (lookupColOption?.error) return;
+      await this.extractLookupRelatedMetas(context, {
+        lookupColOption,
+        relatedMetas,
+      });
+    }
+  }
+
+  protected async extractLTARRelatedMetas(
+    context: NcContext,
+    {
+      ltarColOption,
+      relatedMetas = {},
+    }: {
+      ltarColOption: LinkToAnotherRecordColumn;
+      relatedMetas: { [key: string]: Model };
+    },
+  ) {
+    const { refContext, mmContext } = ltarColOption.getRelContext();
+
+    relatedMetas[ltarColOption.fk_related_model_id] = await Model.getWithInfo(
+      refContext,
+      {
+        id: ltarColOption.fk_related_model_id,
+      },
+    );
+    this.filterIfLimitedAccess(
+      context,
+      relatedMetas,
+      ltarColOption.fk_related_model_id,
+    );
+    if (ltarColOption.type === 'mm') {
+      relatedMetas[ltarColOption.fk_mm_model_id] = await Model.getWithInfo(
+        mmContext,
+        {
+          id: ltarColOption.fk_mm_model_id,
+        },
+      );
+      this.filterIfLimitedAccess(
+        context,
+        relatedMetas,
+        ltarColOption.fk_mm_model_id,
+      );
+    }
+  }
+
+  private filterIfLimitedAccess(
+    context: NcContext,
+    relatedMetas: {
+      [p: string]: Model;
+    },
+    tableId: string,
+  ) {
+    if (
+      relatedMetas[tableId]?.columns &&
+      !hasDefaultTableVisibility(tableId, context.permissions)
+    ) {
+      relatedMetas[tableId].columns = relatedMetas[tableId].columns.filter(
+        (col) => {
+          return col.pk || col.pv;
+        },
+      );
+    }
+  }
+
+  protected async extractLookupRelatedMetas(
+    context: NcContext,
+    {
+      lookupColOption,
+      relatedMetas = {},
+    }: {
+      lookupColOption: LookupColumn;
+      relatedMetas: { [key: string]: Model };
+    },
+  ) {
+    const relationCol = await Column.get(context, {
+      colId: lookupColOption.fk_relation_column_id,
+    });
+
+    if (!relationCol) return;
+
+    const { refContext = context } =
+      (
+        relationCol.colOptions as LinkToAnotherRecordColumn
+      )?.getRelContext?.() || {};
+
+    const lookedUpCol = await Column.get(refContext, {
+      colId: lookupColOption.fk_lookup_column_id,
+    });
+
+    if (!lookedUpCol) return;
+
+    // extract meta for table which belongs the relation column
+    // if not already extracted
+    if (!relatedMetas[relationCol.fk_model_id]) {
+      relatedMetas[relationCol.fk_model_id] = await Model.getWithInfo(context, {
+        id: relationCol.fk_model_id,
+      });
+
+      this.filterIfLimitedAccess(
+        context,
+        relatedMetas,
+        relationCol.fk_model_id,
+      );
+    }
+
+    // extract meta for table in which looked up column belongs
+    // if not already extracted
+    if (!relatedMetas[lookedUpCol.fk_model_id]) {
+      relatedMetas[lookedUpCol.fk_model_id] = await Model.getWithInfo(
+        refContext,
+        {
+          id: lookedUpCol.fk_model_id,
+        },
+      );
+      this.filterIfLimitedAccess(
+        context,
+        relatedMetas,
+        lookedUpCol.fk_model_id,
+      );
+    }
+
+    // extract metas related to the looked up column
+    await this.extractRelatedMetas(refContext, {
+      col: lookedUpCol,
+      relatedMetas,
+    });
+  }
+
+  async publicSharedBaseGet(
+    context: NcContext,
+    param: { sharedBaseUuid: string },
+  ): Promise<any> {
+    const base = await Base.getByUuid(context, param.sharedBaseUuid);
+
+    if (!base) {
+      NcError.baseNotFound(param.sharedBaseUuid);
+    }
+
+    this.checkBaseType(base);
+
+    return { base_id: base.id, base_title: base.title };
+  }
+
+  public checkBaseType(_base: Base) {
+    // placeholder for future checks
+  }
+
+  public checkViewBaseType(_view: View, _base: Base) {
+    // placeholder for future checks
+  }
+}

@@ -1,0 +1,836 @@
+import { UITypes } from 'nocodb-sdk';
+import { v4 as uuidv4 } from 'uuid';
+import type { DriverClient } from '~/utils/nc-config';
+import type { BoolType, SourceType } from 'nocodb-sdk';
+import { NcContext } from '~/interface/config';
+import { Base, Model, SyncSource } from '~/models';
+import NocoCache from '~/cache/NocoCache';
+import {
+  CacheDelDirection,
+  CacheGetType,
+  CacheScope,
+  MetaTable,
+  RootScopes,
+} from '~/utils/globals';
+import Noco from '~/Noco';
+import { extractProps } from '~/helpers/extractProps';
+import { NcError } from '~/helpers/catchError';
+import NcConnectionMgrv2 from '~/utils/common/NcConnectionMgrv2';
+import {
+  parseMetaProp,
+  prepareForDb,
+  prepareForResponse,
+  stringifyMetaProp,
+} from '~/utils/modelUtils';
+import View from '~/models/View';
+import {
+  decryptPropIfRequired,
+  deepMerge,
+  encryptPropIfRequired,
+  isEncryptionRequired,
+} from '~/utils';
+import { NcCache } from '~/decorators/nc-cache.decorator';
+import {
+  getModelContext,
+  setModelContext,
+  throwMissingContext,
+} from '~/helpers/modelContext';
+
+/**
+ * Columns an update may set. `is_meta` / `is_local` are deliberately absent:
+ * they decide whether a source resolves its connection from NocoDB's internal
+ * config, and therefore whether the delete guard applies. Both are settled by
+ * `Base.insert` at base creation and must never change afterwards — GHSA-982h
+ * closed the request path, this closes the model for every other caller.
+ */
+export const SOURCE_UPDATE_PROPS = [
+  'alias',
+  'config',
+  'type',
+  'inflection_column',
+  'inflection_table',
+  'order',
+  'enabled',
+  'meta',
+  'deleted',
+  'fk_sql_executor_id',
+  'is_schema_readonly',
+  'is_data_readonly',
+  'fk_integration_id',
+  'is_encrypted',
+];
+
+export default class Source implements SourceType {
+  id?: string;
+  fk_workspace_id?: string;
+  base_id?: string;
+  alias?: string;
+  type?: DriverClient;
+  is_meta?: BoolType;
+  is_local?: BoolType;
+  is_schema_readonly?: BoolType;
+  is_data_readonly?: BoolType;
+  config?: string;
+  inflection_column?: string;
+  inflection_table?: string;
+  order?: number;
+  erd_uuid?: string;
+  enabled?: BoolType;
+  meta?: any;
+  fk_integration_id?: string;
+  integration_config?: string;
+  integration_title?: string;
+  is_encrypted?: boolean;
+  deleted?: boolean;
+
+  // Ephemeral properties
+  upgraderMode?: boolean;
+  upgraderQueries?: string[] = [];
+
+  get context(): NcContext {
+    const ctx = getModelContext(this);
+    if (ctx) return ctx;
+    if (this.fk_workspace_id && this.base_id) {
+      return {
+        workspace_id: this.fk_workspace_id,
+        base_id: this.base_id,
+      } as NcContext;
+    }
+    throwMissingContext('Source');
+  }
+
+  constructor(source: Partial<SourceType>) {
+    Object.assign(this, source);
+  }
+
+  protected static castType(source: Source, context?: NcContext): Source {
+    const instance = source && new Source(source);
+    if (instance && context) setModelContext(instance, context);
+    return instance;
+  }
+
+  protected static encryptConfigIfRequired(obj: Record<string, unknown>) {
+    obj.config = encryptPropIfRequired({ data: obj });
+    obj.is_encrypted = isEncryptionRequired();
+  }
+
+  public static async createBase(
+    context: NcContext,
+    source: SourceType & {
+      baseId: string;
+      created_at?;
+      updated_at?;
+      meta?: any;
+      is_encrypted?: boolean;
+    },
+    ncMeta = Noco.ncMeta,
+  ) {
+    // `id` is deliberately absent — metaInsert2 generates it. A caller-chosen
+    // id can collide with a source in another base, and the connection cache
+    // then hands over that base's live DB connection.
+    const insertObj = extractProps(source, [
+      'alias',
+      'config',
+      'type',
+      'is_meta',
+      'is_local',
+      'inflection_column',
+      'inflection_table',
+      'order',
+      'enabled',
+      'meta',
+      'is_schema_readonly',
+      'is_data_readonly',
+      'fk_integration_id',
+      'is_encrypted',
+    ]);
+
+    this.encryptConfigIfRequired(insertObj);
+
+    if ('meta' in insertObj) {
+      insertObj.meta = stringifyMetaProp(insertObj);
+    }
+
+    insertObj.order = await ncMeta.metaGetNextOrder(MetaTable.SOURCES, {
+      base_id: source.baseId,
+    });
+
+    const { id } = await ncMeta.metaInsert2(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.SOURCES,
+      insertObj,
+    );
+
+    const returnBase = await this.get(context, id, false, ncMeta);
+
+    await NocoCache.appendToList(
+      context,
+      CacheScope.SOURCE,
+      [source.baseId],
+      `${CacheScope.SOURCE}:${id}`,
+    );
+
+    return returnBase;
+  }
+
+  public static async update(
+    context: NcContext,
+    sourceId: string,
+    source: SourceType & {
+      meta?: any;
+      deleted?: boolean;
+      fk_sql_executor_id?: string;
+      is_encrypted?: boolean;
+    },
+    ncMeta = Noco.ncMeta,
+  ) {
+    const oldSource = await this.get(context, sourceId, false, ncMeta);
+
+    if (!oldSource) NcError.sourceNotFound(sourceId);
+
+    const updateObj = extractProps(source, SOURCE_UPDATE_PROPS);
+
+    if (updateObj.config) {
+      this.encryptConfigIfRequired(updateObj);
+    }
+
+    // type property is undefined even if not provided
+    if (!updateObj.type) {
+      updateObj.type = oldSource.type;
+    }
+
+    if ('meta' in updateObj) {
+      updateObj.meta = stringifyMetaProp(updateObj);
+    }
+
+    // if order is missing (possible in old versions), get next order
+    if (!oldSource.order && !updateObj.order) {
+      updateObj.order = await ncMeta.metaGetNextOrder(MetaTable.SOURCES, {
+        base_id: oldSource.base_id,
+      });
+
+      if (updateObj.order <= 1 && !oldSource.isMeta()) {
+        updateObj.order = 2;
+      }
+    }
+
+    // keep order 1 for default source
+    if (oldSource.isMeta()) {
+      updateObj.order = 1;
+    }
+
+    // keep order 1 for default source
+    if (!oldSource.isMeta()) {
+      if (updateObj.order <= 1) {
+        NcError.badRequest('Cannot change order to 1 or less');
+      }
+
+      // if order is 1 for non-default source, move it to last
+      if (oldSource.order <= 1 && !updateObj.order) {
+        updateObj.order = await ncMeta.metaGetNextOrder(MetaTable.SOURCES, {
+          base_id: oldSource.base_id,
+        });
+      }
+    }
+
+    await ncMeta.metaUpdate(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.SOURCES,
+      prepareForDb(updateObj),
+      oldSource.id,
+    );
+
+    await NocoCache.update(
+      context,
+      `${CacheScope.SOURCE}:${sourceId}`,
+      prepareForResponse(updateObj),
+    );
+
+    // trigger cache clear and don't wait
+    this.updateRelatedCaches(context, sourceId, ncMeta).catch((e) => {
+      console.error(e);
+    });
+
+    // Bump Redis version so other servers invalidate on next read.
+    // Don't destroy the local connection — Source.update() is also called
+    // for metadata-only changes (readonly flags, alias, order) where the
+    // connection config hasn't changed. Callers that change connection config
+    // (integrations service, sourceCleanup) call resetSource() directly.
+    await NcConnectionMgrv2.bumpSourceVersion(oldSource);
+
+    return await this.get(context, oldSource.id, false, ncMeta);
+  }
+
+  static async list(
+    context: NcContext,
+    args: { baseId: string; includeDeleted?: boolean },
+    ncMeta = Noco.ncMeta,
+  ): Promise<Source[]> {
+    const cachedList = await NocoCache.getList(context, CacheScope.SOURCE, [
+      args.baseId,
+    ]);
+    let { list: sourceDataList } = cachedList;
+    const { isNoneList } = cachedList;
+    if (!isNoneList && !sourceDataList.length) {
+      const qb = ncMeta
+        .knex(MetaTable.SOURCES)
+        .select(`${MetaTable.SOURCES}.*`)
+        .where(`${MetaTable.SOURCES}.base_id`, context.base_id);
+
+      if (!args.includeDeleted) {
+        qb.where((whereQb) => {
+          whereQb
+            .where(`${MetaTable.SOURCES}.deleted`, false)
+            .orWhereNull(`${MetaTable.SOURCES}.deleted`);
+        });
+      }
+
+      qb.orderBy(`${MetaTable.SOURCES}.order`, 'asc');
+
+      this.extendQb(qb, context);
+
+      sourceDataList = await qb;
+
+      // parse JSON metadata
+      for (const source of sourceDataList) {
+        source.meta = parseMetaProp(source, 'meta');
+      }
+
+      await NocoCache.setList(
+        context,
+        CacheScope.SOURCE,
+        [args.baseId],
+        sourceDataList,
+      );
+    }
+
+    sourceDataList.sort(
+      (a, b) => (a?.order ?? Infinity) - (b?.order ?? Infinity),
+    );
+
+    return sourceDataList?.map((sourceData) => {
+      return this.castType(sourceData, context);
+    });
+  }
+
+  @NcCache({
+    key: (args) => args[1],
+  })
+  static async get(
+    context: NcContext,
+    id: string,
+    force = false,
+    ncMeta = Noco.ncMeta,
+  ): Promise<Source> {
+    let sourceData =
+      id &&
+      (await NocoCache.get(
+        context,
+        `${CacheScope.SOURCE}:${id}`,
+        CacheGetType.TYPE_OBJECT,
+      ));
+    if (!sourceData) {
+      const qb = ncMeta
+        .knex(MetaTable.SOURCES)
+        .select(`${MetaTable.SOURCES}.*`)
+        .where(`${MetaTable.SOURCES}.id`, id)
+        .where(`${MetaTable.SOURCES}.base_id`, context.base_id);
+
+      this.extendQb(qb, context);
+
+      if (!force) {
+        qb.where((whereQb) => {
+          whereQb
+            .where(`${MetaTable.SOURCES}.deleted`, false)
+            .orWhereNull(`${MetaTable.SOURCES}.deleted`);
+        });
+      }
+
+      sourceData = await qb.first();
+
+      if (sourceData) {
+        sourceData.meta = parseMetaProp(sourceData, 'meta');
+      }
+
+      await NocoCache.set(context, `${CacheScope.SOURCE}:${id}`, sourceData);
+    }
+    return this.castType(sourceData, context);
+  }
+
+  public async getConnectionConfig(): Promise<any> {
+    if (this.is_meta || this.is_local) {
+      const metaConfig = await NcConnectionMgrv2.getDataConfig();
+      const config = { ...metaConfig };
+      if (config.client === 'sqlite3') {
+        config.connection = metaConfig;
+      }
+      return config;
+    }
+
+    const config = this.getConfig();
+
+    // todo: update sql-client args
+    if (config?.client === 'sqlite3') {
+      config.connection.filename =
+        config.connection.filename || config.connection?.connection.filename;
+    }
+
+    return config;
+  }
+
+  // MSSQL's tedious driver strictly requires typed connection options:
+  //   port — must be a number (jdbcToXcConfig / UI form pass strings).
+  //   encrypt — strict boolean check (`typeof === 'boolean'`); string
+  //     "true" silently treated as falsy (or ignored on the secure path).
+  //   trustServerCertificate — strict boolean; tedious THROWS TypeError
+  //     for non-boolean.
+  //
+  // Persisted form values are strings (other dialects tolerate them).
+  // getConfig() is the one method every connection path funnels through —
+  // CE + EE getConnectionConfig and getSourceConfig all call it — so
+  // normalize here, guarded to mssql only.
+  protected normalizeMssqlConfig(config: any): any {
+    if (config?.client !== 'mssql') return config;
+    const conn = config.connection;
+    if (!conn || typeof conn !== 'object') return config;
+
+    // Numeric options
+    const numericKeys = ['port', 'connectTimeout', 'requestTimeout'];
+    const coerceNum = (target: any, k: string) => {
+      if (typeof target[k] === 'string' && target[k].trim() !== '') {
+        const n = Number(target[k]);
+        if (Number.isFinite(n)) target[k] = n;
+      }
+    };
+    for (const k of numericKeys) {
+      coerceNum(conn, k);
+      if (conn.options) coerceNum(conn.options, k);
+    }
+
+    // Boolean options — tedious does a strict typeof check (and throws
+    // for non-boolean `trustServerCertificate`). Coerce the canonical
+    // 'true'/'false' strings; leave anything else (e.g. encrypt='strict'
+    // — a third valid value) alone for tedious to validate.
+    const booleanKeys = [
+      'encrypt',
+      'trustServerCertificate',
+      'enableArithAbort',
+      'readOnlyIntent',
+      'abortTransactionOnError',
+    ];
+    const coerceBool = (target: any, k: string) => {
+      if (typeof target[k] !== 'string') return;
+      const v = target[k].trim().toLowerCase();
+      if (v === 'true') target[k] = true;
+      else if (v === 'false') target[k] = false;
+    };
+    for (const k of booleanKeys) {
+      coerceBool(conn, k);
+      if (conn.options) coerceBool(conn.options, k);
+    }
+
+    // tedious negotiates a 4 KB TDS packet by default, so large result sets
+    // fragment into many small packets. Request a bigger packet (SQL Server
+    // negotiates down if it can't honor it) so grid pages transfer in fewer
+    // round-trips. Only set a default — never override an explicit value.
+    conn.options = conn.options ?? {};
+    if (conn.options.packetSize == null && conn.packetSize == null) {
+      conn.options.packetSize = 16384;
+    }
+
+    return config;
+  }
+
+  public getConfig(skipIntegrationConfig = false): any {
+    if (this.is_meta) {
+      const metaConfig = Noco.getConfig()?.meta?.db;
+      const config = { ...metaConfig };
+      if (config.client === 'sqlite3') {
+        config.connection = metaConfig;
+      }
+      return config;
+    }
+
+    const config = decryptPropIfRequired({
+      data: this,
+    });
+
+    if (skipIntegrationConfig) {
+      return this.normalizeMssqlConfig(config);
+    }
+
+    if (!this.integration_config) {
+      return this.normalizeMssqlConfig(config);
+    }
+
+    const integrationConfig = decryptPropIfRequired({
+      data: this,
+      prop: 'integration_config',
+    });
+    // merge integration config with source config
+    // override integration config with source config if exists
+    // only override database and searchPath
+    //
+    // IMPORTANT: apply ONLY keys the source config actually defines. The old
+    // `partialExtract(config, [['connection','database'],['searchPath']])`
+    // emitted the requested keys even when absent (as `undefined`), and
+    // `deepMerge` then overwrote the integration's real `searchPath` /
+    // `connection.database` with `undefined` — erasing the integration's
+    // configured schema so the source silently bound to `public`. Only a
+    // source-level value that is actually set should override the integration.
+    const sourceOverride: Record<string, any> = {};
+    if (config?.searchPath !== undefined) {
+      sourceOverride.searchPath = config.searchPath;
+    }
+    if (config?.connection?.database !== undefined) {
+      sourceOverride.connection = { database: config.connection.database };
+    }
+    let mergedConfig = deepMerge(integrationConfig, sourceOverride);
+
+    // if searchPath is not array/string or if an empty array, remove it
+    if (
+      (!Array.isArray(mergedConfig.searchPath) &&
+        typeof mergedConfig.searchPath !== 'string') ||
+      !mergedConfig.searchPath?.length
+    ) {
+      mergedConfig = { ...mergedConfig, searchPath: undefined };
+    }
+
+    return this.normalizeMssqlConfig(mergedConfig);
+  }
+
+  public getSourceConfig(): any {
+    return this.getConfig(true);
+  }
+
+  getProject(ncMeta = Noco.ncMeta): Promise<Base> {
+    return Base.get(this.context, this.base_id, ncMeta);
+  }
+
+  async sourceCleanup(_ncMeta = Noco.ncMeta) {
+    await NcConnectionMgrv2.deleteAwait(this);
+
+    // Bump Redis version so all servers invalidate on next read
+    await NcConnectionMgrv2.bumpSourceVersion(this);
+  }
+
+  /**
+   * A base must keep its own source, and must never be left with none. The
+   * rationale for each arm is inline below.
+   */
+  protected assertDeletable(sources: Source[], force?: boolean) {
+    if (force) return;
+
+    // Deliberately NOT skipped for an already soft-deleted source: `deleted` is
+    // settable, so an early return here would let a caller soft-delete a base's
+    // own source and then hard-delete it past this guard. A cascade that has to
+    // remove it passes `force`.
+
+    // Checked first: on a single-source base the positional arm below would also
+    // match, and "only source" is the accurate reason. Only live siblings count —
+    // a soft-deleted row left in a cached list must not make this look like it is
+    // not the last source.
+    if (!sources.some((source) => source.id !== this.id && !source.deleted)) {
+      NcError.get(this.context).badRequest(
+        'Cannot delete the only source of a base',
+      );
+    }
+
+    // Flags AND position: neither is reliable alone. A base's own source can
+    // carry neither flag, and `order` does not always put it first — so keep both
+    // arms rather than trade one failure mode for the other.
+    if (this.isMeta() || sources[0]?.id === this.id) {
+      NcError.get(this.context).badRequest(
+        "Cannot delete a base's default source",
+      );
+    }
+  }
+
+  async delete(ncMeta = Noco.ncMeta, { force }: { force?: boolean } = {}) {
+    const context = this.context;
+
+    const sources = await Source.list(
+      context,
+      { baseId: this.base_id },
+      ncMeta,
+    );
+
+    this.assertDeletable(sources, force);
+
+    const models = await Model.list(
+      context,
+      {
+        source_id: this.id,
+        base_id: this.base_id,
+        includeDeleted: true,
+      },
+      ncMeta,
+    );
+
+    const relColumns = [];
+    const relRank = {
+      [UITypes.Lookup]: 1,
+      [UITypes.Rollup]: 2,
+      [UITypes.ForeignKey]: 3,
+      [UITypes.LinkToAnotherRecord]: 4,
+    };
+
+    for (const model of models) {
+      for (const col of await model.getColumns(ncMeta, undefined, true, true)) {
+        let colOptionTableName = null;
+        let cacheScopeName = null;
+        switch (col.uidt) {
+          case UITypes.Rollup:
+            colOptionTableName = MetaTable.COL_ROLLUP;
+            cacheScopeName = CacheScope.COL_ROLLUP;
+            break;
+          case UITypes.Lookup:
+            colOptionTableName = MetaTable.COL_LOOKUP;
+            cacheScopeName = CacheScope.COL_LOOKUP;
+            break;
+          case UITypes.ForeignKey:
+          case UITypes.LinkToAnotherRecord:
+            colOptionTableName = MetaTable.COL_RELATIONS;
+            cacheScopeName = CacheScope.COL_RELATION;
+            break;
+        }
+        if (colOptionTableName && cacheScopeName) {
+          relColumns.push({ col, colOptionTableName, cacheScopeName });
+        }
+      }
+    }
+
+    relColumns.sort((a, b) => {
+      return relRank[a.col.uidt] - relRank[b.col.uidt];
+    });
+
+    for (const relCol of relColumns) {
+      await ncMeta.metaDelete(
+        context.workspace_id,
+        context.base_id,
+        relCol.colOptionTableName,
+        {
+          fk_column_id: relCol.col.id,
+        },
+      );
+      await NocoCache.deepDel(
+        context,
+        `${relCol.cacheScopeName}:${relCol.col.id}`,
+        CacheDelDirection.CHILD_TO_PARENT,
+      );
+    }
+
+    for (const model of models) {
+      await model.delete(ncMeta, true);
+    }
+
+    const syncSources = await SyncSource.list(
+      context,
+      this.base_id,
+      this.id,
+      ncMeta,
+    );
+    for (const syncSource of syncSources) {
+      await SyncSource.delete(context, syncSource.id, ncMeta);
+    }
+
+    await this.sourceCleanup(ncMeta);
+
+    const res = await ncMeta.metaDelete(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.SOURCES,
+      this.id,
+    );
+
+    await NocoCache.deepDel(
+      context,
+      `${CacheScope.SOURCE}:${this.id}`,
+      CacheDelDirection.CHILD_TO_PARENT,
+    );
+
+    return res;
+  }
+
+  async softDelete(ncMeta = Noco.ncMeta, { force }: { force?: boolean } = {}) {
+    const context = this.context;
+
+    const sources = await Source.list(
+      context,
+      { baseId: this.base_id },
+      ncMeta,
+    );
+
+    this.assertDeletable(sources, force);
+
+    await Source.update(context, this.id, { deleted: true }, ncMeta);
+
+    // Release the Knex connection pool so it doesn't leak memory
+    await this.sourceCleanup(ncMeta);
+
+    await NocoCache.deepDel(
+      context,
+      `${CacheScope.SOURCE}:${this.id}`,
+      CacheDelDirection.CHILD_TO_PARENT,
+    );
+  }
+
+  async getModels(ncMeta = Noco.ncMeta) {
+    return await Model.list(
+      this.context,
+      { base_id: this.base_id, source_id: this.id },
+      ncMeta,
+    );
+  }
+
+  async shareErd(ncMeta = Noco.ncMeta) {
+    const context = this.context;
+
+    if (!this.erd_uuid) {
+      const uuid = uuidv4();
+      this.erd_uuid = uuid;
+
+      // set meta
+      await ncMeta.metaUpdate(
+        context.workspace_id,
+        context.base_id,
+        MetaTable.SOURCES,
+        {
+          erd_uuid: this.erd_uuid,
+        },
+        this.id,
+      );
+
+      await NocoCache.update(context, `${CacheScope.SOURCE}:${this.id}`, {
+        erd_uuid: this.erd_uuid,
+      });
+    }
+    return this;
+  }
+
+  async disableShareErd(ncMeta = Noco.ncMeta) {
+    const context = this.context;
+
+    if (this.erd_uuid) {
+      this.erd_uuid = null;
+
+      // set meta
+      await ncMeta.metaUpdate(
+        context.workspace_id,
+        context.base_id,
+        MetaTable.SOURCES,
+        {
+          erd_uuid: this.erd_uuid,
+        },
+        this.id,
+      );
+
+      await NocoCache.update(context, `${CacheScope.SOURCE}:${this.id}`, {
+        erd_uuid: this.erd_uuid,
+      });
+    }
+    return this;
+  }
+
+  isMeta(_only = false, _mode = 0) {
+    if (_only) {
+      if (_mode === 0) {
+        return this.is_meta;
+      }
+      return this.is_local;
+    } else {
+      return this.is_meta || this.is_local;
+    }
+  }
+
+  /**
+   * Reverse lookup: the sources referencing an integration — a THIN,
+   * response-safe projection (id, alias, base_id, project title only), used by
+   * the integration read (`includeSources`, feeds the delete-confirmation
+   * dialog), the integration delete/soft-delete cascades, and user-deletion
+   * collection. Lives here because "which sources point at X" is a Source
+   * concern; only Database integrations are ever referenced, so other types
+   * yield []. Workspace scoping applies whenever the context carries a real
+   * workspace id (EE) and is skipped for CE/BYPASS contexts.
+   */
+  static async listByIntegration(
+    context: Omit<NcContext, 'base_id'>,
+    integrationId: string,
+    { force = false }: { force?: boolean } = {},
+    ncMeta = Noco.ncMeta,
+  ): Promise<Source[]> {
+    const qb = ncMeta.knex(MetaTable.SOURCES);
+
+    qb.select(`${MetaTable.SOURCES}.id`)
+      .select(`${MetaTable.SOURCES}.alias`)
+      .select(`${MetaTable.PROJECT}.title as project_title`)
+      .select(`${MetaTable.SOURCES}.base_id`)
+      .select(`${MetaTable.SOURCES}.fk_workspace_id`)
+      .innerJoin(
+        MetaTable.PROJECT,
+        `${MetaTable.SOURCES}.base_id`,
+        `${MetaTable.PROJECT}.id`,
+      )
+      .where(`${MetaTable.SOURCES}.fk_integration_id`, integrationId);
+
+    if (
+      context.workspace_id &&
+      context.workspace_id !== RootScopes.BYPASS &&
+      context.workspace_id !== RootScopes.FULL_BYPASS
+    ) {
+      qb.where(`${MetaTable.SOURCES}.fk_workspace_id`, context.workspace_id);
+    }
+
+    if (!force) {
+      qb.where((whereQb) => {
+        whereQb
+          .where(`${MetaTable.SOURCES}.deleted`, false)
+          .orWhereNull(`${MetaTable.SOURCES}.deleted`);
+      }).where((whereQb) => {
+        whereQb
+          .where(`${MetaTable.PROJECT}.deleted`, false)
+          .orWhereNull(`${MetaTable.PROJECT}.deleted`);
+      });
+    }
+
+    const sources = await qb;
+
+    return sources.map((src) =>
+      this.castType(src, {
+        workspace_id: src.fk_workspace_id,
+        base_id: src.base_id,
+      } as NcContext),
+    );
+  }
+
+  protected static extendQb(qb: any, _context: NcContext) {
+    qb.select(
+      `${MetaTable.INTEGRATIONS}.config as integration_config`,
+      `${MetaTable.INTEGRATIONS}.title as integration_title`,
+    ).leftJoin(
+      MetaTable.INTEGRATIONS,
+      `${MetaTable.SOURCES}.fk_integration_id`,
+      `${MetaTable.INTEGRATIONS}.id`,
+    );
+  }
+
+  private static async updateRelatedCaches(
+    context: NcContext,
+    sourceId: string,
+    ncMeta = Noco.ncMeta,
+  ) {
+    // get models
+    const models = await Model.list(
+      context,
+      { source_id: sourceId, base_id: context.base_id, includeDeleted: true },
+      ncMeta,
+    );
+
+    // clear single query caches for models
+    for (const model of models) {
+      await View.clearSingleQueryCache(context, model.id, null, ncMeta);
+    }
+  }
+}

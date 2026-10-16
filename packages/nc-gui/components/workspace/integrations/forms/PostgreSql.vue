@@ -1,0 +1,164 @@
+<script lang="ts" setup>
+const { appInfo } = useGlobal()
+
+const { activeIntegration, categories, activeCategory } = useIntegrationStore()
+
+const { copy } = useCopy()
+
+const { t } = useI18n()
+
+const copyIp = async () => {
+  await copy('52.15.226.51')
+  message.success(t('msg.info.copiedToClipboard'))
+}
+
+const panelsRef = ref<HTMLElement | null>(null)
+
+onMounted(() => {
+  if (!panelsRef.value) return
+
+  const panels = panelsRef.value.querySelectorAll('.panel')
+  panels.forEach((panel) => {
+    categories.value.push({
+      label: panel.getAttribute('data-label') as string,
+      icon: panel.getAttribute('data-icon'),
+    })
+  })
+
+  // focus first input
+  nextTick(() => {
+    const firstInput = panels[0].querySelector('input')
+    if (firstInput) firstInput.focus()
+  })
+})
+
+const onInputFocus = () => {
+  const target = document.activeElement
+  const panel = target?.closest('.panel')
+  if (panel) {
+    activeCategory.value = {
+      label: panel.getAttribute('data-label') as string,
+      icon: panel.getAttribute('data-icon'),
+    }
+  }
+}
+</script>
+
+<template>
+  <div ref="panelsRef" class="panels">
+    <WorkspaceIntegrationsPanel :title="$t('labels.integrationDetails')" icon="info">
+      <template v-if="appInfo.isCloud && !appInfo.isOnPrem" #header-info>
+        <div
+          class="text-nc-content-gray-muted !text-xs font-weight-normal flex items-center gap-2 cursor-pointer flex items-center"
+          @click="copyIp"
+        >
+          <GeneralIcon icon="info" class="text-primary" />
+          {{ $t('msg.info.whitelistIpForDatabaseAccess') }}
+          <GeneralIcon
+            icon="duplicate"
+            class="text-nc-content-gray w-5 h-5 p-1 border-1 rounded-md border-nc-border-gray-medium"
+          />
+        </div>
+      </template>
+      <div>
+        <div class="flex flex-col w-1/2 pr-3">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('general.title') }}</label>
+          <a-input v-model:value="activeIntegration.payload.title" class="input-text" :maxlength="255" @focus="onInputFocus" />
+        </div>
+      </div>
+    </WorkspaceIntegrationsPanel>
+    <WorkspaceIntegrationsPanel :title="$t('labels.pgConnectionDetails')" icon="link">
+      <div class="input-group">
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.host') }}</label>
+          <a-input v-model:value="activeIntegration.payload.host" class="input-text" @focus="onInputFocus" />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.pgPort') }}</label>
+          <a-input v-model:value="activeIntegration.payload.port" class="input-text" @focus="onInputFocus" />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('objects.user') }}</label>
+          <a-input v-model:value="activeIntegration.payload.user" class="input-text" autocomplete="off" @focus="onInputFocus" />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.password') }}</label>
+          <a-input
+            v-model:value="activeIntegration.payload.password"
+            class="input-text"
+            type="password"
+            autocomplete="off"
+            @focus="onInputFocus"
+          />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.schema') }}</label>
+          <a-input v-model:value="activeIntegration.payload.schema" class="input-text" @focus="onInputFocus" />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.database') }}</label>
+          <a-input v-model:value="activeIntegration.payload.database" class="input-text" @focus="onInputFocus" />
+        </div>
+      </div>
+    </WorkspaceIntegrationsPanel>
+    <WorkspaceIntegrationsPanel :title="$t('title.advancedParameters')" icon="lock" :collapsible="true">
+      <div class="input-group">
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.pgSslMode') }}</label>
+          <a-select v-model:value="activeIntegration.payload.sslMode" class="input-text" @focus="onInputFocus">
+            <a-select-option value="disable">{{ $t('general.disable') }}</a-select-option>
+            <a-select-option value="require">{{ $t('labels.sslModeRequire') }}</a-select-option>
+            <a-select-option value="verify-ca">{{ $t('labels.sslModeVerifyCa') }}</a-select-option>
+            <a-select-option value="verify-full">{{ $t('labels.sslModeVerifyFull') }}</a-select-option>
+          </a-select>
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.sslRootCertificate') }}</label>
+          <a-input v-model:value="activeIntegration.payload.sslRootCert" class="input-text" @focus="onInputFocus" />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.sslCertificate') }}</label>
+          <a-input v-model:value="activeIntegration.payload.sslCert" class="input-text" @focus="onInputFocus" />
+        </div>
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.sslKey') }}</label>
+          <a-input v-model:value="activeIntegration.payload.sslKey" class="input-text" @focus="onInputFocus" />
+        </div>
+      </div>
+      <div class="w-full border-t-1 mt-2 mb-4"></div>
+      <div class="input-group">
+        <div class="input-item">
+          <label class="!text-xs font-weight-normal pb-1">{{ $t('labels.extraConnectionParameters') }}</label>
+          <a-input v-model:value="activeIntegration.payload.sslCert" class="input-text" @focus="onInputFocus" />
+        </div>
+      </div>
+    </WorkspaceIntegrationsPanel>
+    <WorkspaceIntegrationsPanel :title="$t('labels.connectionJson')" icon="code">DUMMY</WorkspaceIntegrationsPanel>
+  </div>
+</template>
+
+<style lang="scss" scoped>
+.panels {
+  @apply w-3/4 flex flex-col;
+
+  .panel {
+    @apply border-1 border-nc-border-gray-medium px-4 py-4 rounded-lg mb-4;
+
+    .panel-label {
+      @apply text-md font-weight-bold;
+    }
+
+    .input-text {
+      @apply w-full rounded-md;
+    }
+
+    .input-group {
+      @apply flex flex-wrap w-full;
+
+      .input-item {
+        @apply flex flex-col w-1/2 pr-3 mb-3;
+      }
+    }
+  }
+}
+</style>

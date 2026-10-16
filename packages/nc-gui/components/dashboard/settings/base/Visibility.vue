@@ -1,0 +1,141 @@
+<script setup lang="ts">
+const { t } = useI18n()
+
+const baseStore = useBase()
+const basesStore = useBases()
+const { base } = storeToRefs(baseStore)
+
+const _projectId = inject(ProjectIdInj, undefined)
+const { loadTables, hasEmptyOrNullFilters } = baseStore
+
+const baseId = computed(() => _projectId?.value ?? base.value?.id)
+
+const showNullAndEmptyInFilter = ref()
+
+const { includeM2M, showNull } = useGlobal()
+
+// Only this switch writes base meta — the two above are per-user preferences. A copy
+// shows production's meta, so a change made here would be discarded on the next read.
+const isLaneInstance = computed(() => !!basesStore.bases.get(baseId.value!)?.is_lane_instance)
+
+watch(includeM2M, async () => await loadTables())
+
+onMounted(async () => {
+  await until(() => !!baseId.value).toBeTruthy()
+  try {
+    await basesStore.loadProject(baseId.value!, true)
+  } catch (e: any) {
+    // ignore
+  }
+  showNullAndEmptyInFilter.value = basesStore.getProjectMeta(baseId.value!)?.showNullAndEmptyInFilter
+})
+
+async function showNullAndEmptyInFilterOnChange(evt: boolean) {
+  const base = basesStore.bases.get(baseId.value!)
+  if (!base) throw new Error(`Base ${baseId.value} not found`)
+
+  const meta = basesStore.getProjectMeta(baseId.value!) ?? {}
+
+  // users cannot hide null & empty option if there is existing null / empty filters
+  if (!evt) {
+    if (await hasEmptyOrNullFilters()) {
+      showNullAndEmptyInFilter.value = true
+      message.warning(t('msg.error.nullFilterExists'))
+    }
+  }
+  const newProjectMeta = {
+    ...meta,
+    showNullAndEmptyInFilter: showNullAndEmptyInFilter.value,
+  }
+  // update local state
+  base.meta = newProjectMeta
+  // update db
+  await basesStore.updateProject(baseId.value!, {
+    meta: JSON.stringify(newProjectMeta),
+  })
+}
+</script>
+
+<template>
+  <!-- Title and description live in the shell header. -->
+  <div
+    data-testid="nc-settings-subtab-visibility"
+    class="flex flex-col h-full nc-shell-gutter pb-6 pt-3 overflow-auto nc-scrollbar-thin"
+  >
+    <!-- Two cards, because these are two kinds of setting: the first pair is a
+         per-user preference that follows you everywhere, the rest is base meta
+         that changes the base for everyone. -->
+    <div class="flex flex-col w-full max-w-3xl gap-6">
+      <div class="flex flex-col gap-2">
+        <div class="flex items-baseline gap-2 flex-wrap">
+          <span class="text-bodyDefaultSm font-semibold text-nc-content-gray-emphasis">
+            {{ $t('labels.dataDisplayPersonal') }}
+          </span>
+          <span class="text-bodySm text-nc-content-gray-muted">{{ $t('labels.dataDisplayPersonalHint') }}</span>
+        </div>
+
+        <div class="flex flex-col border-1 rounded-lg border-nc-border-gray-medium">
+          <div class="flex w-full px-3 py-2 gap-2 flex-col">
+            <div class="flex w-full gap-1 items-center">
+              <NcSwitch
+                v-model:checked="includeM2M"
+                v-e="['c:themes:show-m2m-tables']"
+                size="xsmall"
+                class="nc-settings-meta-misc-m2m"
+              >
+                <span class="text-nc-content-gray font-semibold flex-1">
+                  {{ $t('msg.info.showM2mTables') }}
+                </span>
+              </NcSwitch>
+            </div>
+            <span class="text-nc-content-gray-muted pl-10">{{ $t('msg.info.showM2mTablesDesc') }}</span>
+          </div>
+
+          <div class="flex w-full px-3 border-t-1 border-nc-border-gray-medium py-2 gap-2 flex-col">
+            <div class="flex w-full gap-1 items-center">
+              <NcSwitch v-model:checked="showNull" v-e="['c:settings:show-null']" size="xsmall" class="nc-settings-show-null">
+                <span class="text-nc-content-gray font-semibold flex-1">
+                  {{ $t('msg.info.showNullInCells') }}
+                </span>
+              </NcSwitch>
+            </div>
+            <span class="text-nc-content-gray-muted pl-10">{{ $t('msg.info.showNullInCellsDesc') }}</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex flex-col gap-2">
+        <div class="flex items-baseline gap-2 flex-wrap">
+          <span class="text-bodyDefaultSm font-semibold text-nc-content-gray-emphasis">
+            {{ $t('labels.dataDisplayShared') }}
+          </span>
+          <span class="text-bodySm text-nc-content-gray-muted">{{ $t('labels.dataDisplaySharedHint') }}</span>
+        </div>
+
+        <div class="flex flex-col border-1 rounded-lg border-nc-border-gray-medium">
+          <div class="flex w-full px-3 py-2 gap-2 flex-col">
+            <div class="flex w-full gap-1 items-center">
+              <NcTooltip :title="isLaneInstance ? $t('tooltip.featureOnProductionOnly') : ''" :disabled="!isLaneInstance">
+                <NcSwitch
+                  v-model:checked="showNullAndEmptyInFilter"
+                  v-e="['c:settings:show-null-and-empty-in-filter']"
+                  size="xsmall"
+                  class="nc-settings-show-null-and-empty-in-filter"
+                  :disabled="isLaneInstance"
+                  @change="showNullAndEmptyInFilterOnChange"
+                >
+                  <span class="text-nc-content-gray font-semibold flex-1">
+                    {{ $t('msg.info.showNullAndEmptyInFilter') }}
+                  </span>
+                </NcSwitch>
+              </NcTooltip>
+            </div>
+            <span class="text-nc-content-gray-muted pl-10">{{ $t('msg.info.showNullAndEmptyInFilterDesc') }}</span>
+          </div>
+
+          <DashboardSettingsBaseAppOrder v-if="isEeUI" />
+        </div>
+      </div>
+    </div>
+  </div>
+</template>

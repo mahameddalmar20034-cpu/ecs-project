@@ -1,0 +1,200 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "NocoDB v3",
+    "version": "3.0",
+    "description": "NocoDB API Documentation"
+  },
+  "servers": [
+    {
+      "url": "https://app.nocodb.com"
+    }
+  ],
+  "paths": {},
+  "components": {
+    "schemas": {
+      "Attachment": {
+        "title": "Attachment",
+        "type": "object",
+        "properties": {
+          "mimetype": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "icon": {
+            "type": "string"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error code",
+            "example": "ERR_INVALID_FILTER"
+          },
+          "message": {
+            "type": "string",
+            "example": "Invalid filter field 'Nope' not found"
+          }
+        },
+        "required": [
+          "error",
+          "message"
+        ]
+      },
+      "LinkedRecord": {
+        "title": "Linked record",
+        "type": "object",
+        "description": "A record from the related table. `fields` holds the requested fields, or the display value by default.",
+        "properties": {
+          "id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "description": "Record identifier (primary key value)"
+          },
+          "id_fields": {
+            "type": "object",
+            "description": "Individual primary key field values as object"
+          },
+          "fields": {
+            "type": "object",
+            "description": "Record fields data"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    },
+    "securitySchemes": {
+      "xcToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "xc-token",
+        "description": "API token"
+      },
+      "bearerAuth": {
+        "name": "Authorization",
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Bearer token authentication. Use 'Authorization: Bearer <token>' header format. This is an alternative to the xc-token header."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "BadRequest",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "Example 1": {
+                "value": {
+                  "error": "ERR_INVALID_REQUEST_BODY",
+                  "message": "Property 'id' is required on index 0"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Unauthorized",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "Example 1": {
+                "value": {
+                  "error": "ERR_AUTHENTICATION_REQUIRED",
+                  "message": "Authentication required - Invalid token"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Forbidden",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "Example 1": {
+                "value": {
+                  "error": "ERR_FORBIDDEN",
+                  "message": "Forbidden - You do not have permission to perform this action"
+                }
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "NotFound",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "Example 1": {
+                "value": {
+                  "error": "ERR_RECORD_NOT_FOUND",
+                  "message": "Record '99999' not found"
+                }
+              }
+            }
+          }
+        }
+      },
+      "UnprocessableEntity": {
+        "description": "Unprocessable entity: an unknown field, view or table, or an invalid filter or sort",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "examples": {
+              "Example 1": {
+                "value": {
+                  "error": "ERR_INVALID_FILTER",
+                  "message": "Invalid filter field 'Nope' not found"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "xcToken": []
+    },
+    {
+      "bearerAuth": []
+    }
+  ]
+}

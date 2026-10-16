@@ -1,0 +1,506 @@
+import { getI18n } from '~/plugins/a.i18n'
+
+const FEATURES = [
+  // Commented-out entries are retired from the experimental-features UI but
+  // kept for revival; isFeatureEnabled resolves them via RETIRED_FEATURES below.
+  {
+    id: 'managed_apps',
+    title: 'Managed Apps',
+    description: 'Allow users to create replicable managed app environments',
+    enabled: false,
+    isEngineering: true,
+    isAdvanced: true,
+    requires: 'apps',
+  },
+  {
+    id: 'bases_v3',
+    title: 'Projects V3',
+    description: 'Experience the next generation of NocoDB with Projects V3 with and enhanced performance and optimizations.',
+    enabled: false,
+    version: 1,
+  },
+  {
+    id: 'advanced_nodes',
+    title: 'Enabled advanced nodes',
+    description: 'Enabled advanced nodes like scripts, external trigger node, etc.',
+    enabled: false,
+    isEngineering: true,
+    version: 1,
+  },
+  {
+    id: 'infinite_scrolling',
+    title: 'Infinite scrolling',
+    description: 'Effortlessly browse large datasets with infinite scrolling.',
+    enabled: true,
+    version: 1,
+  },
+  {
+    id: 'ai_beta_features',
+    title: 'AI beta features',
+    description: 'Unlock AI beta features to enhance your NocoDB experience.',
+    enabled: false,
+    version: 2,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'workflow_email_ai',
+    title: 'AI email composing',
+    description: 'Draft and rewrite the body of a workflow send-email node with AI.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isAdvanced: true,
+    isEE: true,
+  },
+  {
+    id: 'enterprise_vaults',
+    title: 'Enterprise Vaults',
+    description: "Source integration credentials from your organization's own secrets manager.",
+    enabled: ncIsPlaywright(),
+    version: 1,
+    isEE: true,
+  },
+  {
+    id: 'integrations',
+    get title() {
+      return getI18n().global.t('general.integrations')
+    },
+    description: 'Enable dynamic integrations.',
+    enabled: true,
+    version: 2,
+    isEngineering: true,
+  },
+  {
+    id: 'data_reflection',
+    title: 'Data reflection',
+    description: 'Enable data reflection.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'sync_beta_feature',
+    title: 'Advanced Sync Features',
+    description: 'Enable sync beta features like multi source sync, etc.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  // {
+  //   id: 'form_support_column_scanning',
+  //   title: 'Scanner for filling data in forms',
+  //   description: 'Enable scanner to fill data in forms.',
+  //   enabled: false,
+  //   version: 1,
+  //   isEngineering: true,
+  // },
+  // {
+  //   id: 'extensions',
+  //   title: 'Extensions beta features',
+  //   description: 'Extensions allows you to add new features or functionalities to the NocoDB platform.',
+  //   enabled: ncIsPlaywright(),
+  //   version: 4,
+  //   isEngineering: true,
+  // },
+  // {
+  //   id: 'attachment_carousel_comments',
+  //   title: 'Comments in attachment carousel',
+  //   description: 'Enable comments in attachment carousel.',
+  //   enabled: true,
+  //   version: 2,
+  // },
+  {
+    id: 'cross_base_link',
+    title: 'Cross Project Link',
+    description: 'Enables link creation between tables in different projects.',
+    enabled: false,
+    version: 1,
+    isEE: true,
+    // Licensed-only: hidden on self-hosted free (CE / unlicensed on-prem),
+    // available on licensed on-prem and cloud.
+    isLicensed: true,
+  },
+  {
+    id: 'custom_link',
+    title: 'Custom Link',
+    description: 'Allows user to create custom links using existing fields.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+    // Licensed-only: hidden on self-hosted free (CE / unlicensed on-prem),
+    // available on licensed on-prem and cloud.
+    isLicensed: true,
+  },
+  // {
+  //   id: 'view_actions',
+  //   title: 'View Actions',
+  //   description: 'Execute scripts and webhooks to all records in a view.',
+  //   enabled: false,
+  //   version: 1,
+  //   isEngineering: true,
+  //   isEE: true,
+  // },
+  // {
+  //   id: 'show_everyones_personal_views',
+  //   title: "Show Everyone's Personal Views",
+  //   description: 'With this feature we can avoid showing other users personal views in left sidebar',
+  //   enabled: false,
+  //   version: 1,
+  //   isEngineering: true,
+  //   isEE: true,
+  // },
+  // {
+  //   id: 'templates',
+  //   get title() {
+  //     return getI18n().global.t('general.templates')
+  //   },
+  //   description: 'Enable templates feature to browse and use templates.',
+  //   enabled: true,
+  //   version: 3,
+  //   isEE: true,
+  //   isOnPrem: false,
+  // },
+  // {
+  //   id: 'ai_fill_handle',
+  //   title: 'AI Fill Handle',
+  //   description: 'Use AI to fill data in cells based on existing data patterns.',
+  //   enabled: false,
+  //   version: 1,
+  //   isEngineering: true,
+  //   isEE: true,
+  // },
+  // {
+  //   id: 'gauge_widget',
+  //   title: 'Gauge Widget',
+  //   description: 'A visual indicator that displays real-time values, limits, and performance levels at a glance.',
+  //   isEngineering: true,
+  //   enabled: false,
+  //   version: 1,
+  // },
+  {
+    id: 'hide_chat_suggestions',
+    title: 'Hide chat suggestions',
+    description:
+      'Hide the suggestion prompts on the empty chat screen (follow-ups are unaffected). No suggestion API calls are made while hidden.',
+    enabled: true,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'workflows_tab',
+    title: 'Workflows tab',
+    description: 'Enable workflows tab in project overview to manage workflows.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'agents',
+    get title() {
+      return getI18n().global.t('general.agents')
+    },
+    description: 'Enable the Agents section in the sidebar.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'app_factory',
+    get title() {
+      return getI18n().global.t('general.appFactory')
+    },
+    description: 'Dispatch coding agents against the source-control repositories connected to this workspace.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'presence_visibility_toggle',
+    title: 'Presence Visibility Toggle',
+    description: 'Allow users to hide their own presence from other collaborators.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'presence_follow',
+    title: 'Follow Collaborator',
+    description: 'Follow a collaborator: track them across views and keep their cursor scrolled into view in the grid.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  // {
+  //   id: 'expanded_record_panel',
+  //   title: 'Expanded record side panel',
+  //   description: 'Open expanded records in a resizable side panel beside the grid instead of a centered modal.',
+  //   enabled: false,
+  //   version: 3,
+  //   isEngineering: true,
+  // },
+  {
+    id: 'credit_usage_overview',
+    title: 'Credit usage overview',
+    description: 'Show the credit usage chart and activity list on the billing page.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  // {
+  //   id: 'minimal_base_sections',
+  //   title: 'Minimal folder style',
+  //   description: 'Render sidebar folders as plain text headers — no icon, no member indentation.',
+  //   enabled: false,
+  //   version: 1,
+  //   isEE: true,
+  // },
+  {
+    // id is persisted in localStorage and drives FEATURE_FLAG — renaming it
+    // would silently reset the toggle for anyone who had it on.
+    id: 'theme_settings',
+    title: 'Theme settings',
+    description: 'Pick a dark mode palette from the theme settings drawer in the user menu.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+  },
+  {
+    // id is persisted in localStorage and drives FEATURE_FLAG — renaming it
+    // would silently reset the toggle for anyone who had it on.
+    id: 'apps',
+    title: 'Apps',
+    description:
+      'Build, publish and install apps: the app tile in the sidebar, App Settings, the App target on the workspace home, and the /apps routes.',
+    enabled: false,
+    version: 1,
+    isAdvanced: true,
+    isEE: true,
+  },
+  {
+    // id is persisted in localStorage and drives FEATURE_FLAG — renaming it
+    // would silently reset the toggle for anyone who had it on.
+    id: 'marketplace',
+    title: 'Marketplace',
+    description: 'Add a catalog of showcase demo apps to the App Store, alongside your own published apps.',
+    enabled: false,
+    version: 1,
+    isEngineering: false,
+    isAdvanced: true,
+    isEE: true,
+    requires: 'apps',
+  },
+  {
+    id: 'connect_ai',
+    title: 'Connect your AI',
+    description: 'Show the Connect your AI card in the project sidebar, for connecting an AI client over MCP.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+  {
+    id: 'product_tours_menu',
+    title: 'Product tours menu',
+    description: 'Show the Product Tours entry in the account menu, for replaying onboarding and feature tours.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+  },
+  {
+    // id is persisted in localStorage and drives FEATURE_FLAG — renaming it
+    // would silently reset the toggle for anyone who had it on.
+    id: 'multiple_sso_clients',
+    title: 'Multiple SSO providers',
+    description: 'Allow configuring more than one SAML / OpenID provider.',
+    enabled: false,
+    version: 1,
+    isEngineering: true,
+    isEE: true,
+  },
+] as const
+
+// Retired flags: FEATURES entries commented out above, but kept in FEATURE_FLAG
+// so dormant consumer code still compiles — isFeatureEnabled resolves them to
+// the fixed state below. Revive one by uncommenting its entry and removing it here.
+const RETIRED_FEATURES = {
+  extensions: ncIsPlaywright(), // e2e builds keep beta extensions available
+  form_support_column_scanning: false,
+  view_actions: false,
+  show_everyones_personal_views: false,
+  ai_fill_handle: false,
+  gauge_widget: false,
+  expanded_record_panel: false,
+  minimal_base_sections: false,
+}
+
+export type RetiredFeatureId = keyof typeof RETIRED_FEATURES
+
+export const FEATURE_FLAG = {
+  ...(Object.fromEntries(Object.keys(RETIRED_FEATURES).map((id) => [id.toUpperCase(), id])) as Record<
+    Uppercase<RetiredFeatureId>,
+    RetiredFeatureId
+  >),
+  ...(Object.fromEntries(FEATURES.map((feature) => [feature.id.toUpperCase(), feature.id])) as Record<
+    Uppercase<(typeof FEATURES)[number]['id']>,
+    (typeof FEATURES)[number]['id']
+  >),
+}
+
+export type BetaFeatureId = (typeof FEATURES)[number]['id']
+export type BetaFeatureType = (typeof FEATURES)[number]
+
+const RETIRED_FEATURE_STATES: Partial<Record<BetaFeatureId | RetiredFeatureId, boolean>> = RETIRED_FEATURES
+
+const STORAGE_KEY = 'featureToggleStates'
+
+export const useBetaFeatureToggle = createSharedComposable(() => {
+  const features = ref<BetaFeatureType[]>(deepClone(FEATURES))
+
+  const featureMap = computed(() =>
+    features.value.reduce((acc, f) => {
+      acc[f.id] = f
+      return acc
+    }, {} as Partial<Record<BetaFeatureId | RetiredFeatureId, BetaFeatureType>>),
+  )
+
+  const { appInfo } = useGlobal()
+
+  const featureStates = computed(() => {
+    return features.value.reduce((acc, feature) => {
+      const isEeFeatureEnabled = feature.isEE && !isEeUI ? false : feature.enabled
+      const isOnPremFeatureEnabled = !appInfo.value.isOnPrem || feature.isOnPrem !== false
+      const isCloudFeatureEnabled = !appInfo.value.isCloud || feature.isCloud !== false
+
+      acc[feature.id] = isEeFeatureEnabled && isOnPremFeatureEnabled && isCloudFeatureEnabled
+      return acc
+    }, {} as Partial<Record<BetaFeatureId | RetiredFeatureId, boolean>>)
+  })
+
+  const { $e } = useNuxtApp()
+
+  const isEngineeringModeOn = ref(false)
+
+  const isAdvancedModeOn = ref(false)
+
+  const isExperimentalFeatureModalOpen = ref(false)
+
+  const saveFeatures = () => {
+    try {
+      const featuresToSave = features.value.map((feature) => ({
+        id: feature.id,
+        enabled: feature.enabled,
+        version: feature.version,
+      }))
+
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(featuresToSave))
+    } catch (error) {
+      console.error('Failed to save features:', error)
+    }
+  }
+
+  const toggleFeature = (id: BetaFeatureId, forceUpdate?: boolean) => {
+    const feature = features.value.find((f) => f.id === id)
+    if (feature) {
+      if (forceUpdate !== undefined) {
+        feature.enabled = forceUpdate
+      } else {
+        feature.enabled = !feature.enabled
+      }
+      $e(`a:feature-preview:${id}:${feature.enabled ? 'on' : 'off'}`)
+      saveFeatures()
+
+      return true
+    } else {
+      console.error(`Feature ${id} not found`)
+    }
+  }
+
+  const isFeatureEnabled = (id: BetaFeatureId | RetiredFeatureId) => {
+    // useEeConfig is called inside this function (not at the top level of the composable), to avoid a recursive call
+    const { showEEFeatures, isEEFeatureBlocked } = useEeConfig()
+
+    const feature = featureMap.value[id]
+
+    if (feature && 'isEE' in feature && feature.isEE && !showEEFeatures.value) {
+      return false
+    }
+
+    // Licensed-only features are unavailable on self-hosted free (CE / unlicensed
+    // on-prem). `isEEFeatureBlocked` is true exactly there; false on licensed
+    // on-prem and cloud.
+    if (feature && 'isLicensed' in feature && feature.isLicensed && isEEFeatureBlocked.value) {
+      return false
+    }
+
+    // A sub-feature of something that is itself behind a flag: off whenever its
+    // parent is. One level of recursion per hop and FEATURES declares no cycle.
+    if (feature && 'requires' in feature && feature.requires && !isFeatureEnabled(feature.requires)) {
+      return false
+    }
+
+    return featureStates.value[id] ?? RETIRED_FEATURE_STATES[id] ?? false
+  }
+
+  const initializeFeatures = () => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY)
+      if (stored) {
+        const parsedFeatures = JSON.parse(stored) as Array<{
+          id: string
+          enabled: boolean
+          version?: number
+        }>
+
+        features.value = FEATURES.map((defaultFeature) => {
+          const storedFeature = parsedFeatures.find((f) => f.id === defaultFeature.id)
+
+          if (!storedFeature) {
+            return { ...defaultFeature }
+          }
+
+          const storedVersion = storedFeature.version || 1
+          const currentVersion = defaultFeature.version || 1
+
+          if (storedVersion < currentVersion) {
+            console.log(`Feature ${defaultFeature.id} updated from v${storedVersion} to v${currentVersion}`)
+            return {
+              ...defaultFeature,
+            }
+          }
+          return {
+            ...defaultFeature,
+            enabled: storedFeature.enabled,
+          }
+        })
+      } else {
+        features.value = deepClone(FEATURES)
+      }
+    } catch (error) {
+      console.error('Failed to initialize features:', error)
+      features.value = deepClone(FEATURES)
+    }
+
+    saveFeatures()
+  }
+
+  return {
+    features,
+    toggleFeature,
+    isFeatureEnabled,
+    isEngineeringModeOn,
+    isAdvancedModeOn,
+    isExperimentalFeatureModalOpen,
+    initializeFeatures,
+  }
+})

@@ -1,0 +1,7 @@
+# Credentials. Never commit.
+docker.env
+nocodb/db.json
+
+# Runtime data (named volumes are managed by Docker, not stored here)
+letsencrypt/
+nocodb/

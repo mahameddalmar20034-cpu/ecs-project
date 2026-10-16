@@ -1,0 +1,269 @@
+import { getActivePinia } from 'pinia'
+import { isAxiosError } from 'axios'
+import type { Actions, AppInfo, Getters, State } from './types'
+import type { NcBreakpoint } from '~/lib/constants'
+
+export function useGlobalActions(state: State, _getters: Getters): Actions {
+  const isTokenUpdatedTab = useState('isTokenUpdatedTab', () => false)
+
+  const setIsMobileMode = (isMobileMode: boolean) => {
+    state.isMobileMode.value = isMobileMode
+  }
+
+  const setActiveBreakpoint = (breakpoint: NcBreakpoint) => {
+    state.activeBreakpoint.value = breakpoint
+  }
+
+  /** Sign out by deleting the token from localStorage */
+  const signOut: Actions['signOut'] = async ({
+    redirectToSignin,
+    signinUrl = '/signin',
+    skipApiCall = false,
+  }: SignOutParams = {}) => {
+    try {
+      // call and invalidate refresh token only if user manually triggered logout
+      if (!skipApiCall) {
+        const nuxtApp = useNuxtApp()
+        await nuxtApp.$api.auth.signout()
+      }
+    } catch {
+      // ignore error
+    } finally {
+      state.token.value = null
+      state.user.value = null
+
+      // `useInviteLinks` caches invite links *with their raw tokens*, and it is a
+      // VueUse singleton rather than a Pinia store, so the dispose loop below
+      // never reaches it. Left behind, the next user to sign in on this tab is
+      // served the previous user's links straight from the cache.
+      try {
+        useInviteLinks().reset()
+      } catch {
+        // composable may not have been instantiated yet — safe to ignore
+      }
+
+      if (redirectToSignin) {
+        await navigateTo(signinUrl)
+      }
+
+      // clear all stores data on logout
+      const pn = getActivePinia()
+      if (pn) {
+        pn._s.forEach((store) => {
+          store.$dispose()
+          delete pn.state.value[store.$id]
+        })
+      }
+    }
+  }
+
+  const loadAppInfo = async () => {
+    try {
+      state.appInfoStatus.value = 'loading'
+      const nuxtApp = useNuxtApp()
+      state.appInfo.value = (await nuxtApp.$api.utils.appInfo()) as AppInfo
+      state.appInfoStatus.value = 'loaded'
+    } catch (e) {
+      state.appInfoStatus.value = 'error'
+      console.error(e)
+    }
+  }
+
+  /** Sign in by setting the token in localStorage
+   * keepProps - is for keeping any existing role info if user id is same as previous user
+   * */
+  const signIn: Actions['signIn'] = (newToken, keepProps = false) => {
+    isTokenUpdatedTab.value = true
+    state.token.value = newToken
+
+    if (state.jwtPayload.value) {
+      state.user.value = {
+        ...(keepProps && state.user.value?.id === state.jwtPayload.value.id ? state.user.value || {} : {}),
+        id: state.jwtPayload.value.id,
+        email: state.jwtPayload.value.email,
+        firstname: state.jwtPayload.value.firstname,
+        lastname: state.jwtPayload.value.lastname,
+        roles: state.jwtPayload.value.roles,
+        display_name: state.jwtPayload.value.display_name,
+      }
+    }
+
+    // The default workspace is created when the first user signs up, after appInfo was loaded.
+    if (newToken && !state.appInfo.value.defaultWorkspaceId) loadAppInfo()
+  }
+
+  /** manually try to refresh token */
+  const _refreshToken = async ({
+    axiosInstance,
+    skipSignOut = false,
+  }: {
+    axiosInstance?: any
+    skipSignOut?: boolean
+  } = {}) => {
+    const nuxtApp = useNuxtApp()
+    const t = nuxtApp.vueApp.i18n.global.t
+
+    if (!axiosInstance) {
+      axiosInstance = nuxtApp.$api?.instance
+    }
+
+    try {
+      const response = await axiosInstance.post('/auth/token/refresh', null, {
+        withCredentials: true,
+      })
+      if (response.data?.token) {
+        signIn(response.data.token, true)
+        return response.data.token
+      }
+      return null
+    } catch (e) {
+      // Only sign out when the server actually REJECTED the refresh. A request
+      // that never got a response (connection reset, a moment of
+      // unavailability) says nothing about session validity, and signing out on
+      // it discards a good session. A genuine expiry still arrives as a 401.
+      const serverRejected = isAxiosError(e) && !!e.response
+
+      if (serverRejected && state.token.value && state.user.value && !skipSignOut) {
+        await signOut({
+          skipApiCall: true,
+        })
+        message.error(t('msg.error.youHaveBeenSignedOut'))
+      }
+
+      // Let callers tell a dead session from a blip. Returning null for a
+      // transient failure would defeat the guard above: the API interceptor
+      // signs out on a falsy return. Kept identical to the EE copy.
+      if (!serverRejected) throw e
+
+      return null
+    }
+  }
+
+  const refreshToken = useSharedExecutionFn('refreshToken', _refreshToken, {
+    timeout: 10000,
+    storageDelay: 1000,
+  })
+
+  const navigateToProject = ({
+    workspaceId: _workspaceId,
+    type: _type,
+    baseId,
+    query,
+  }: {
+    workspaceId?: string
+    baseId?: string
+    query?: any
+  }) => {
+    const workspaceId = _workspaceId || 'nc'
+    let path: string
+
+    const queryParams = query ? `?${new URLSearchParams(query).toString()}` : ''
+
+    if (baseId) {
+      path = `/${workspaceId}/${baseId}${queryParams}`
+    } else {
+      path = `/${workspaceId}${queryParams}`
+    }
+
+    navigateTo({
+      path,
+    })
+  }
+
+  const ncNavigateTo = ({
+    workspaceId: _workspaceId,
+    baseId,
+    query,
+    tableId,
+    tableTitle,
+    viewId,
+    viewTitle,
+    replace = false,
+    newTab = false,
+  }: {
+    workspaceId?: string
+    baseId?: string
+    query?: any
+    tableId?: string
+    tableTitle?: string
+    viewId?: string
+    viewTitle?: string
+    replace?: boolean
+    newTab?: boolean
+  }) => {
+    const tablePath = tableId
+      ? `/${tableId}${
+          viewId
+            ? `/${viewId}${toReadableUrlSlug([tableTitle, viewTitle]) ? `/${toReadableUrlSlug([tableTitle, viewTitle])}` : ''}`
+            : ''
+        }`
+      : ''
+
+    const workspaceId = _workspaceId || 'nc'
+    let path: string
+
+    const queryParams = query ? `?${new URLSearchParams(query).toString()}` : ''
+
+    if (baseId) {
+      path = `/${workspaceId}/${baseId}${tablePath}${queryParams}`
+    } else {
+      path = `/${workspaceId}${queryParams}`
+    }
+
+    if (newTab) {
+      window.open(`${window.location.origin}#${path}`, '_blank')
+    } else {
+      return navigateTo({
+        path,
+        replace,
+      })
+    }
+  }
+
+  const getBaseUrl = (workspaceId: string) => {
+    if (state.appInfo.value.baseHostName && location.hostname !== `${workspaceId}.${state.appInfo.value.baseHostName}`) {
+      return `https://${workspaceId}.${state.appInfo.value.baseHostName}`
+    }
+    return undefined
+  }
+
+  const getMainUrl = () => {
+    return undefined
+  }
+
+  const setGridViewPageSize = (pageSize: number) => {
+    state.gridViewPageSize.value = pageSize
+  }
+
+  const setLeftSidebarSize = ({ old, current }: { old?: number; current?: number }) => {
+    state.leftSidebarSize.value = {
+      old: old ?? state.leftSidebarSize.value.old,
+      current: current ?? state.leftSidebarSize.value.current,
+    }
+  }
+
+  const setAddNewRecordGridMode = (isGridMode: boolean) => {
+    state.isAddNewRecordGridMode.value = isGridMode
+  }
+
+  const updateSyncDataUpvotes = (upvotes: string[]) => {
+    state.syncDataUpvotes.value = upvotes
+  }
+
+  return {
+    signIn,
+    signOut,
+    refreshToken,
+    loadAppInfo,
+    setIsMobileMode,
+    setActiveBreakpoint,
+    navigateToProject,
+    getBaseUrl,
+    ncNavigateTo,
+    getMainUrl,
+    setGridViewPageSize,
+    setLeftSidebarSize,
+    setAddNewRecordGridMode,
+    updateSyncDataUpvotes,
+  }
+}

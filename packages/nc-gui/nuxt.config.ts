@@ -1,0 +1,461 @@
+import { dirname, resolve } from 'node:path'
+import VueI18nPlugin from '@intlify/unplugin-vue-i18n/vite'
+import Icons from 'unplugin-icons/vite'
+import IconsResolver from 'unplugin-icons/resolver'
+import Components from 'unplugin-vue-components/vite'
+import { AntDesignVueResolver } from 'unplugin-vue-components/resolvers'
+import { FileSystemIconLoader } from 'unplugin-icons/loaders'
+
+import PurgeIcons from 'vite-plugin-purge-icons'
+// https://nuxt.com/docs/api/configuration/nuxt-config
+export default defineNuxtConfig({
+  future: {
+    compatibilityVersion: 4,
+  },
+
+  ignore: [...(process.env.NODE_ENV === 'production' ? ['pages/playground.vue', 'pages/playground/**/*'] : [])],
+
+  modules: ['@vueuse/nuxt', '@unocss/nuxt', '@nuxt/image', '@pinia/nuxt', '@productdevbook/chatwoot'],
+  ssr: false,
+
+  // 'uno.css' is imported from the `css` array instead, so it keeps WindiCSS's position.
+  unocss: { autoImport: false },
+
+  // Nuxt 4 defaults srcDir to `app/`; this project keeps the flat v3 layout.
+  srcDir: '.',
+
+  router: {
+    options: {
+      hashMode: false,
+    },
+  },
+  chatwoot: {
+    init: {
+      websiteToken: 'ke2YjiPnKw9gnz4PCq4RuQqR',
+      baseUrl: 'https://app.chatwoot.com',
+    },
+    settings: {
+      darkMode: 'light',
+      hideMessageBubble: true,
+    },
+  },
+  spaLoadingTemplate: false,
+
+  app: {
+    // out-in page transitions permanently blank the outlet on Nuxt 4: a re-keyed page <Suspense>
+    // makes Transition wait for an afterLeave that Vue never fires for Suspense children
+    pageTransition: false,
+    // layoutTransition: process.env.NUXT_PAGE_TRANSITION_DISABLE
+    //   ? false
+    //   : {
+    //       name: 'layout',
+    //       mode: 'out-in',
+    //     },
+    // todo: enable it back after fixing the issue with layout transition
+    layoutTransition: false,
+
+    /** In production build we need to load assets using absolute path for history-mode routing */
+    cdnURL: process.env.NODE_ENV === 'production' ? process.env.NC_CDN_URL || '/' : undefined,
+    head: {
+      htmlAttrs: { lang: 'en' },
+      link: [
+        {
+          rel: 'icon',
+          type: 'image/x-icon',
+          href: '/favicon.ico',
+        },
+        {
+          rel: 'apple-touch-icon',
+          href: '/apple-touch-icon-180x180.png',
+          sizes: '180x180',
+        },
+
+        ...(process.env.NC_CDN_URL
+          ? [
+              {
+                rel: 'preload',
+                as: 'font',
+                href: new URL('/shared/style/material.woff2', process.env.NC_CDN_URL).href,
+                type: 'font/woff2',
+                crossorigin: 'anonymous',
+              } as any,
+              { rel: 'stylesheet', href: new URL('/shared/style/fonts-new.css', process.env.NC_CDN_URL).href },
+            ]
+          : []),
+      ],
+      meta: [
+        { charset: 'utf-8' },
+        {
+          name: 'viewport',
+          content: 'width=device-width, initial-scale=1',
+        },
+        {
+          name: 'theme-color',
+          content: '#3366FF',
+        },
+        {
+          hid: 'description',
+          name: 'description',
+          content: process.env.npm_package_description || '',
+        },
+        // Open Graph
+        { hid: 'og:site_name', property: 'og:site_name', content: 'NocoDB' },
+        { hid: 'og:type', property: 'og:type', content: 'website' },
+        { hid: 'og:title', property: 'og:title', content: 'NocoDB' },
+        {
+          hid: 'og:description',
+          property: 'og:description',
+          content:
+            'NocoDB provides an intuitive spreadsheet interface for creating online databases, either from scratch or by connecting to any Postgres/MySQL. Access your data through interactive UIs or via API and SQL. Get started for free.',
+        },
+        { hid: 'og:url', property: 'og:url', content: 'https://nocodb.com' },
+        // Twitter
+        { hid: 'twitter:card', name: 'twitter:card', content: 'summary_large_image' },
+        { hid: 'twitter:title', name: 'twitter:title', content: 'NocoDB' },
+        {
+          hid: 'twitter:description',
+          name: 'twitter:description',
+          content:
+            'NocoDB provides an intuitive spreadsheet interface for creating online databases, either from scratch or by connecting to any Postgres/MySQL. Access your data through interactive UIs or via API and SQL. Get started for free.',
+        },
+        {
+          hid: 'twitter:image',
+          name: 'twitter:image',
+          content: './link-preview.webp',
+        },
+        {
+          hid: 'og:image',
+          property: 'og:image',
+          content: './link-preview.webp',
+        },
+      ],
+    },
+  },
+
+  css: [
+    ...(process.env.NC_CDN_URL ? [] : ['~/assets/style/fonts-new.css']),
+    // Where 'virtual:windi.css' sat. @unocss/nuxt's own injection is a plugin, which lands after
+    // every entry below — that would put the base reset on top of the app's global stylesheets
+    // and flip every utility-vs-global tie. Paired with `unocss.autoImport: false`.
+    '~/assets/css/theme-overrides-base.scss',
+    'uno.css',
+    '~/assets/css/global.css',
+    '~/assets/style.scss',
+    '~/assets/css/theme-overrides.scss',
+  ],
+
+  runtimeConfig: {
+    public: {
+      ncBackendUrl: '',
+      env: 'production',
+      maxPageDesignerTableRows: 100,
+      // dev picker listener (scripts/dev-comments.mjs): nc-dev sets one per instance; 0 = the page's port + 100
+      devCommentsPort: 0,
+      // NC_CLAUDE_COMMENTS=false turns Claude comments off: no dock, no picks, no listener
+      claudeComments: process.env.NC_CLAUDE_COMMENTS !== 'false',
+    },
+  },
+
+  build: {},
+
+  // disabling devtools since causing some significant performance issues when browser console open in development mode
+  devtools: { enabled: false },
+
+  vite: {
+    worker: {
+      format: 'es',
+    },
+    build: {
+      commonjsOptions: {
+        ignoreTryCatch: true,
+      },
+      minify: true,
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('/nocodb-sdk/')) {
+              return 'nocodb-sdk'
+            }
+          },
+        },
+      },
+    },
+    plugins: [
+      // ee/nuxt.config.ts re-declares these four, and Nuxt's `extends` concatenates
+      // arrays — registering them here too made every SFC run through
+      // unplugin-vue-components twice. EE owns its copies.
+      ...(process.env.EE === 'true'
+        ? []
+        : [
+            VueI18nPlugin({
+              include: [resolve(dirname('./lang/*.json'))],
+              runtimeOnly: false,
+            }),
+            Icons({
+              autoInstall: false,
+              compiler: 'vue3',
+              defaultClass: 'nc-icon',
+              customCollections: {
+                'nc-icons': FileSystemIconLoader('./assets/nc-icons', (svg) =>
+                  svg.replace(/^<svg (?!=\s*data-ignore)/, '<svg stroke="currentColor" '),
+                ),
+                'nc-icons-v2': FileSystemIconLoader('./assets/nc-icons-v2', (svg) =>
+                  svg.replace(/^<svg (?!=\s*data-ignore)/, '<svg stroke="currentColor" '),
+                ),
+              },
+            }),
+            Components({
+              resolvers: [
+                AntDesignVueResolver({
+                  importStyle: false,
+                  resolveIcons: false,
+                }),
+                IconsResolver({
+                  prefix: false,
+                  enabledCollections: [
+                    'ant-design',
+                    'bi',
+                    'cil',
+                    'clarity',
+                    'eva',
+                    'ic',
+                    'logos',
+                    'lucide',
+                    'material-symbols',
+                    'mdi',
+                    'mi',
+                    'ph',
+                    'ri',
+                    'system-uicons',
+                    'vscode-icons',
+                    'simple-icons',
+                    'nc-icons',
+                    'ion',
+                    'tabler',
+                    'carbon',
+                  ],
+                }),
+              ],
+            }),
+            PurgeIcons({
+              /* PurgeIcons Options */
+              includedCollections: ['emojione'],
+            }),
+          ]),
+    ],
+    define: {
+      'process.env.DEBUG': 'false',
+      'process.nextTick': 'globalThis.setImmediate',
+      'process.env.ANT_MESSAGE_DURATION': process.env.ANT_MESSAGE_DURATION,
+      // CJS deps referencing bare `global` used to be rewritten by rollup's commonjs plugin.
+      // Rolldown's CJS interop leaves the identifier alone, so the app threw
+      // "global is not defined" at boot in production builds.
+      'global': 'globalThis',
+    },
+    server: {
+      watch: {
+        // Polling is the portable option (Docker / network FS); NC_DEV_FAST=true
+        // swaps in native fs events, which is much cheaper on a local checkout.
+        usePolling: process.env.NC_DEV_FAST !== 'true',
+      },
+      // Vite turns this on under coding agents with warn included; a Vue warn
+      // serializes its vnode trace (MBs per line), stalling the page and the log.
+      forwardConsole: { unhandledErrors: true, logLevels: ['error'] },
+    },
+    resolve: {
+      alias: {
+        querystring: 'rollup-plugin-node-polyfills/polyfills/qs',
+        util: 'rollup-plugin-node-polyfills/polyfills/util',
+        url: 'rollup-plugin-node-polyfills/polyfills/url',
+      },
+      // Collaborative editing: TipTap (via @tiptap/pm/* → bare prosemirror-*) and
+      // y-prosemirror both import the same bare prosemirror-*/yjs packages. pnpm
+      // hoisting leaves multiple physical copies (e.g. prosemirror-view 1.37.1 vs
+      // 1.37.2), so y-prosemirror builds decorations with a different
+      // prosemirror-view class than TipTap's EditorView renders with → runtime
+      // "Cannot read properties of undefined (reading 'localsInner')". Force a
+      // single copy of each across the bundle.
+      dedupe: [
+        'yjs',
+        'y-prosemirror',
+        'y-protocols',
+        'lib0',
+        'prosemirror-view',
+        'prosemirror-state',
+        'prosemirror-model',
+        'prosemirror-transform',
+        'prosemirror-keymap',
+        'prosemirror-commands',
+        'prosemirror-schema-list',
+        'prosemirror-history',
+        'prosemirror-gapcursor',
+        'prosemirror-dropcursor',
+      ],
+    },
+    optimizeDeps: {
+      include: [
+        '@ckpack/vue-color',
+        '@tiptap/core',
+        '@tiptap/extension-code',
+        '@tiptap/extension-hard-break',
+        '@tiptap/extension-italic',
+        '@tiptap/extension-link',
+        '@tiptap/extension-mention',
+        '@tiptap/extension-placeholder',
+        '@tiptap/extension-strike',
+        '@tiptap/extension-task-list',
+        '@tiptap/extension-underline',
+        '@tiptap/html',
+        '@tiptap/pm/history',
+        '@tiptap/pm/markdown',
+        '@tiptap/pm/model',
+        '@tiptap/pm/state',
+        '@tiptap/pm/tables',
+        '@tiptap/pm/transform',
+        '@tiptap/pm/view',
+        '@tiptap/starter-kit',
+        '@tiptap/vue-3',
+        '@vue-flow/additional-components',
+        '@vue-flow/core',
+        '@vue-flow/minimap',
+        '@vuelidate/core',
+        '@vuelidate/validators',
+        '@vueuse/integrations/useQRCode',
+        '@vvo/tzdb',
+        'company-email-validator',
+        'crossoriginworker',
+        'd3-scale',
+        'dagre',
+        'dayjs/plugin/utc',
+        'dayjs/plugin/timezone',
+        'dayjs/plugin/relativeTime',
+        'deep-object-diff',
+        'diff',
+        'embla-carousel-vue',
+        'emoji-mart-vue-fast/src',
+        'esbuild-wasm',
+        'fflate',
+        'file-saver',
+        'fuse.js',
+        '@readme/httpsnippet',
+        'isomorphic-dompurify',
+        'jsbarcode',
+        'locale-codes',
+        'markdown-it',
+        'markdown-it-regexp',
+        'markdown-it-task-lists',
+        'marked',
+        'mermaid',
+        'monaco-editor',
+        'monaco-editor/esm/vs/basic-languages/javascript/javascript',
+        'papaparse',
+        'prosemirror-changeset',
+        'y-prosemirror',
+        'rehype-sanitize',
+        'rehype-stringify',
+        'remark-parse',
+        'remark-rehype',
+        'sortablejs',
+        'splitpanes',
+        'tippy.js',
+        'tiptap-markdown',
+        'unified',
+        'v3-infinite-loading',
+        'validator',
+        'validator/es/lib/isEmail',
+        'validator/lib/isMobilePhone',
+        'vue-advanced-cropper',
+        'vue-barcode-reader',
+        'vuedraggable',
+        'xlsx',
+        'youtube-vue3',
+        'lru-cache',
+        'qrcode',
+        'validator',
+        '@floating-ui/vue',
+        'validator',
+        '@stripe/stripe-js',
+        'typesense',
+        'vue3-moveable',
+        'vue-fullscreen',
+        'cronstrue',
+        'plyr',
+        'leaflet',
+        'leaflet.markercluster',
+        'uuid',
+        '@tiptap/extension-collaboration',
+        '@tiptap/extension-collaboration-cursor',
+        'y-monaco',
+        'yjs',
+        'lib0/encoding',
+        'lib0/decoding',
+        'y-protocols/sync',
+        'y-protocols/awareness',
+        'lib0/buffer',
+        'nocodb-sdk',
+        '@tiptap/extension-task-item',
+        // Vite finds these on first use otherwise, and a mid-session re-optimize
+        // reloads the page.
+        '@ant-design/icons-vue',
+        '@iconify/vue',
+        '@sentry/vue',
+        '@tiptap/extension-paragraph',
+        '@unocss/preset-mini/colors',
+        '@vueuse/integrations/useJwt',
+        'ant-design-vue',
+        'ant-design-vue/es',
+        'ant-design-vue/es/index.js',
+        'axios',
+        'dayjs',
+        'dayjs/plugin/advancedFormat',
+        'dayjs/plugin/customParseFormat.js',
+        'dayjs/plugin/duration.js',
+        'dayjs/plugin/isBetween',
+        'dayjs/plugin/isSameOrAfter',
+        'dayjs/plugin/isSameOrBefore',
+        'dayjs/plugin/relativeTime.js',
+        'dayjs/plugin/timezone.js',
+        'dayjs/plugin/updateLocale',
+        'dayjs/plugin/utc.js',
+        'dayjs/plugin/weekday.js',
+        'grapheme-splitter',
+        'html-entities',
+        'inflection',
+        'pdfjs-dist/legacy/build/pdf.mjs',
+        'pdfobject-vue',
+        'pinia',
+        'rfdc',
+        'socket.io-client',
+        'tinycolor2',
+        'unique-names-generator',
+        'validator/lib/isURL',
+        'vue-dompurify-html',
+        'vue3-text-clamp',
+      ],
+    },
+  },
+
+  // experimental props destructuring
+  vue: {
+    propsDestructure: true,
+  },
+
+  image: {
+    dir: 'assets/',
+  },
+
+  imports: {
+    dirs: ['./context', './utils/**', './lib', './composables/**', './store/**', './helpers'],
+    imports: [
+      { name: 'useI18n', from: 'vue-i18n' },
+      { name: 'message', from: 'ant-design-vue/es/index.js' },
+      { name: 'Modal', from: 'ant-design-vue/es/index.js' },
+      { name: 'Empty', from: 'ant-design-vue/es/index.js' },
+      { name: 'Form', from: 'ant-design-vue/es/index.js' },
+      { name: 'useJwt', from: '@vueuse/integrations/useJwt' },
+      { name: 'storeToRefs', from: 'pinia' },
+    ],
+  },
+
+  compatibilityDate: '2024-12-04',
+})

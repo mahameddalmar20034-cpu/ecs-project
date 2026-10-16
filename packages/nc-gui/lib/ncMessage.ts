@@ -1,0 +1,419 @@
+import { message } from 'ant-design-vue/es'
+import type { MessageArgsProps } from 'ant-design-vue/es'
+import type { VueNode } from 'ant-design-vue/es/_util/type'
+import type { VNode } from 'vue'
+import { isPrimitiveValue } from 'nocodb-sdk'
+import NcAlert, { type NcAlertProps } from '../components/nc/Alert.vue'
+import { getI18n } from '~/plugins/a.i18n'
+
+// Sign-out transiently flips this on. While signing out, in-flight/watcher
+// requests (e.g. loading workspace bases) 401 as the token is cleared; the
+// axios interceptor already handles that by redirecting to sign-in, so the raw
+// "authentication required" toast is just noise. Scoped to the brief sign-out
+// window so it never hides genuine errors (e.g. wrong password on /signin).
+//
+// `message.error` is patched to `ncMessage.error` (plugins/ant.ts), so this
+// suppresses every error toast in the app — deliberate messages raised during
+// sign-out must opt out with `{ forceShow: true }`.
+let ncErrorToastsSuppressed = false
+export const setNcErrorToastsSuppressed = (suppressed: boolean) => {
+  ncErrorToastsSuppressed = suppressed
+}
+
+interface NcAlertMessageProps
+  extends Pick<
+    NcAlertProps,
+    | 'showIcon'
+    | 'closable'
+    | 'align'
+    | 'copyText'
+    | 'copyBtnTooltip'
+    | 'messageClass'
+    | 'descriptionClass'
+    | 'duration'
+    | 'showDuration'
+  > {}
+
+/**
+ * `NcMessageObjectProps` defines the properties allowed in `ncMessage`,
+ * extending `NcAlertProps` while omitting fields that are irrelevant for messages.
+ */
+export interface NcMessageObjectProps extends NcAlertMessageProps, Omit<MessageArgsProps, 'type' | 'content'> {
+  title?: string
+  content?: string | (() => VueNode) | VueNode
+  /**
+   * Custom action slot content to be rendered inside the alert.
+   * It can be either a `VueNode` or a function returning a `VueNode`.
+   */
+  action?: VNode | (() => VNode)
+  showDefaultMessage?: boolean
+  showCopyBtn?: boolean
+  /**
+   * Show even while error toasts are suppressed during sign-out — for deliberate,
+   * user-facing messages. See `ncErrorToastsSuppressed`.
+   */
+  forceShow?: boolean
+  /**
+   * For internal use only
+   */
+  renderAsNcAlert?: boolean
+}
+
+/**
+ * `NcMessageProps` can either be a string (message text) or an object of type `NcMessageObjectProps`.
+ */
+export type NcMessageProps = NcMessageObjectProps | VueNode
+
+/**
+ * Use `copyText` & `copyBtnTooltip` to set the copy text & tooltip for the copy button if params is primitive value
+ */
+export interface NcMessageExtraProps
+  extends Pick<NcMessageObjectProps, 'showDefaultMessage' | 'showCopyBtn' | 'copyText' | 'copyBtnTooltip' | 'forceShow'> {}
+
+const defaultNcMessageExtraProps = {
+  showDefaultMessage: false,
+  showCopyBtn: true,
+}
+
+// Error messages that are handled via dedicated modals — suppress toasts for these
+const MODAL_HANDLED_MESSAGES = ['Two-factor authentication setup required for this workspace']
+
+/**
+ * Default values for `NcMessageObjectProps`.
+ */
+const initialValue = {
+  title: '',
+  content: '',
+  showIcon: true,
+  closable: true,
+  align: 'top',
+  class: '',
+  messageClass: '',
+  descriptionClass: '',
+  renderAsNcAlert: true,
+  ...defaultNcMessageExtraProps,
+} as NcMessageObjectProps
+
+const initialToastTypeValue = {
+  closable: false,
+  showCopyBtn: false,
+  showDuration: false,
+  showIcon: false,
+  duration: 2,
+} as NcMessageObjectProps
+
+/**
+ * Generates the key that identifies a message instance.
+ *
+ * Identical repeated messages (same type + title + content) reuse a single
+ * stable key so ant updates the one existing toast instead of stacking a
+ * duplicate — this collapses a flood of the same error into one. Falls back to
+ * a unique key for non-primitive content (VNode/function) or when the caller
+ * supplies an explicit `key`.
+ */
+const generateMessageKey = (
+  type: NcAlertProps['type'],
+  title: string | undefined,
+  content: NcMessageObjectProps['content'],
+  params: NcMessageProps,
+) => {
+  // caller-supplied key wins
+  if (!ncIsString(params) && (params as NcMessageObjectProps)?.key) {
+    return (params as NcMessageObjectProps).key
+  }
+
+  // dedup identical messages by hashing type + title + content (isPrimitiveValue also covers null/undefined)
+  if (isPrimitiveValue(content)) {
+    const raw = `${type}|${title ?? ''}|${content ?? ''}`
+    let hash = 0
+    for (let i = 0; i < raw.length; i++) {
+      hash = (Math.imul(31, hash) + raw.charCodeAt(i)) | 0
+    }
+    return `ncMessage_dedup_${hash >>> 0}`
+  }
+
+  return `ncMessage_${Date.now()}_${Math.random()}`
+}
+
+function isNcMessageObjectProps(params: any): params is NcMessageObjectProps {
+  return !ncIsEmptyObject(params)
+}
+
+/**
+ * Processes `NcMessageProps` and merges them with default values.
+ * - If a string is provided, it sets it as the description while applying a default content based on type.
+ * - If neither `content` nor `description` exist, the content is set to the default localized text.
+ * - Uses the spread operator to ensure proper merging of values.
+ *
+ * @param type - The type of message (`success`, `error`, `info`, `warning`).
+ * @param params - The message parameters, either a string or an object.
+ * @param ncMessageExtraProps - The extra props
+ * @returns A full `NcMessageObjectProps` object with defaults applied.
+ */
+const getMessageProps = (
+  type: NcAlertProps['type'],
+  params: NcMessageProps,
+  ncMessageExtraProps: NcMessageExtraProps = defaultNcMessageExtraProps,
+): NcMessageObjectProps => {
+  const updatedParams = { ...initialValue, ...(type === 'toast' ? initialToastTypeValue : {}) }
+  let content = ''
+
+  if (type === 'toast') {
+    if (isPrimitiveValue(params)) {
+      return {
+        ...updatedParams,
+        content: params,
+        renderAsNcAlert: true,
+      }
+    } else {
+      return {
+        ...updatedParams,
+        ...params,
+        renderAsNcAlert: true,
+      }
+    }
+  } else if (isPrimitiveValue(params)) {
+    content = params?.toString() ?? ''
+    // If params is a string, use it as the description and apply a default message based on type
+    return {
+      ...updatedParams,
+      title: ncMessageExtraProps.showDefaultMessage || !content ? getI18n().global.t(`objects.ncMessage.${type}`) : '',
+      content,
+      copyText: ncMessageExtraProps.showCopyBtn ? ncMessageExtraProps.copyText ?? content ?? '' : '',
+    }
+  } else if (!isNcMessageObjectProps(params)) {
+    content = params
+    return {
+      ...updatedParams,
+      title: ncMessageExtraProps.showDefaultMessage || !content ? getI18n().global.t(`objects.ncMessage.${type}`) : '',
+      content,
+      renderAsNcAlert: false,
+    }
+  } else {
+    const showDefaultMessage = ncMessageExtraProps.showDefaultMessage ?? params.showDefaultMessage
+
+    /**
+     * default value of `ncMessageExtraProps.showCopyBtn` & `params.showCopyBtn` is true, so if one is false then we should not show
+     */
+    const showCopyBtn = ncMessageExtraProps.showCopyBtn && params.showCopyBtn
+
+    let copyText = ''
+
+    if (showCopyBtn) {
+      if (params?.copyText || ncMessageExtraProps.copyText) {
+        copyText = params?.copyText || ncMessageExtraProps.copyText
+      } else if (isPrimitiveValue(params.content)) {
+        copyText = params.content?.toString() ?? params.title ?? ''
+      }
+    }
+
+    // If neither title nor content exist, set message to the default localized text
+    const showDefaultTitle = !updatedParams.title && !updatedParams.content && showDefaultMessage
+
+    // Merge provided object properties into the default values using the spread operator
+    return {
+      ...updatedParams,
+      ...params,
+      copyText,
+      ...(showDefaultTitle ? { title: getI18n().global.t(`objects.ncMessage.${type}`) } : {}),
+      renderAsNcAlert: isPrimitiveValue(params.content),
+    }
+  }
+}
+
+/**
+ * Displays a message using Ant Design's `message.open`, rendering an `NcAlert` inside.
+ * Note: we have to render our `NcAlert` only if content is primitive value
+ * @param type - The type of message (`success`, `error`, `info`, `warning`).
+ * @param params - The message content or properties.
+ * @param duration - Optional duration in seconds before auto-dismissal.
+ *
+ */
+
+const showMessage = (
+  type: NcAlertProps['type'],
+  params: NcMessageProps,
+  duration?: number,
+  ncMessageExtraProps?: NcMessageExtraProps,
+) => {
+  const props = getMessageProps(type, params, ncMessageExtraProps)
+
+  const {
+    onClick,
+    onClose,
+    content,
+    title,
+    getPopupContainer,
+    style,
+    appContext,
+    prefixCls = '',
+    rootPrefixCls = '',
+    renderAsNcAlert,
+    showCopyBtn: _showCopyBtn,
+    showDefaultMessage: _showDefaultMessage,
+    forceShow,
+    ...ncAlertProps
+  } = props
+
+  // If title & content is blank then no need to show blank toast message
+  if (!title && !content) return
+
+  // Skip toast for errors already handled via dedicated modals
+  if (type === 'error' && ncIsString(content) && MODAL_HANDLED_MESSAGES.some((msg) => content.includes(msg))) return
+
+  // Skip error toasts while signing out — see ncErrorToastsSuppressed above.
+  // `forceShow` only reaches `props` for object params, so also honour it from the extra props.
+  if (type === 'error' && ncErrorToastsSuppressed && !forceShow && !ncMessageExtraProps?.forceShow) return
+
+  const key = generateMessageKey(type, title, content, params)
+
+  let ncDuration = duration ?? ncAlertProps.duration
+
+  // If showDuration is false and duration is not provided, then set duration to 3 seconds
+  if (!ncAlertProps.showDuration && !ncDuration) {
+    ncDuration = 3
+  }
+
+  return message.open({
+    key,
+    content: renderAsNcAlert
+      ? () =>
+          h(
+            NcAlert,
+            {
+              ...ncAlertProps,
+              message: title,
+              description: content,
+              type,
+              isNotification: true,
+              onClose: () => {
+                onClose?.()
+                message.destroy(key)
+              },
+              duration: ncDuration,
+            },
+            {
+              action: ncIsFunction(ncAlertProps.action)
+                ? ncAlertProps.action
+                : ncAlertProps.action
+                ? () => ncAlertProps.action
+                : undefined,
+              icon: ncIsFunction(ncAlertProps.icon) ? ncAlertProps.icon : ncAlertProps.icon ? () => ncAlertProps.icon : undefined,
+            },
+          )
+      : content,
+    type: !renderAsNcAlert && type !== 'toast' ? type : undefined,
+    duration: ncDuration,
+    prefixCls,
+    rootPrefixCls,
+    getPopupContainer,
+    onClose() {
+      onClose?.()
+    },
+    style,
+    appContext,
+    onClick(event) {
+      onClick?.(event)
+    },
+  })
+}
+
+/**
+ * `ncMessage` provides methods to display different types of messages.
+ *
+ * ## Usage Examples:
+ *
+ * ### Display a default success message (title based on type)
+ * ```ts
+ * ncMessage.success();
+ * ncMessage.error();
+ * ncMessage.info();
+ * ncMessage.warn();
+ * ```
+ *
+ * ### Display a success message with a custom title only
+ * ```ts
+ * ncMessage.success({
+ *   title: 'Table created successfully',
+ * });
+ * ```
+ *
+ * ### Display a success message with a custom description only
+ * ```ts
+ * ncMessage.success({
+ *   content: 'Lorem ipsum dolor sit amet, consectetur adipiscing.',
+ * });
+ * ```
+ *
+ * ### Display a default title based on type with a custom description
+ * ```ts
+ * ncMessage.success('Lorem ipsum dolor sit amet, consectetur adipiscing', undefined, { showDefaultMessage: false });
+ * ncMessage.error('Lorem ipsum dolor sit amet, consectetur adipiscing', undefined, { showDefaultMessage: false });
+ * ncMessage.info('Lorem ipsum dolor sit amet, consectetur adipiscing', undefined, { showDefaultMessage: false });
+ * ncMessage.warn('Lorem ipsum dolor sit amet, consectetur adipiscing', undefined, { showDefaultMessage: false });
+ * ```
+ *
+ * ### Fully customized success message
+ * ```ts
+ * ncMessage.success({
+ *   title: 'Table created successfully',
+ *   content: 'Lorem ipsum dolor sit amet, consectetur adipiscing',
+ *   copyText: 'Lorem ipsum dolor sit amet, consectetur adipiscing',
+ *   showIcon: true,
+ *   closable: true,
+ *   showDuration: false,
+ *   align: 'center',
+ *   action: h(
+ *     resolveComponent('NcButton'),
+ *     {
+ *       onClick: () => {
+ *         console.log('clicked')
+ *       },
+ *       size: 'small',
+ *       type: 'secondary',
+ *     },
+ *     () => 'Okay',
+ *   ),
+ *   icon: () => h(resolveComponent('GeneralIcon'), { icon: 'settings', class: 'text-2xl text-red-500' }),
+ * });
+ * ```
+ */
+
+const ncMessage = {
+  success: (params: NcMessageProps = '', duration?: number, ncMessageExtraProps?: NcMessageExtraProps) => {
+    return showMessage('success', params, duration, ncMessageExtraProps)
+  },
+
+  error: (params: NcMessageProps = '', duration?: number, ncMessageExtraProps?: NcMessageExtraProps) => {
+    return showMessage('error', params, duration, ncMessageExtraProps)
+  },
+
+  info: (params: NcMessageProps = '', duration?: number, ncMessageExtraProps?: NcMessageExtraProps) => {
+    return showMessage('info', params, duration, ncMessageExtraProps)
+  },
+
+  warn: (params: NcMessageProps = '', duration?: number, ncMessageExtraProps?: NcMessageExtraProps) => {
+    return showMessage('warning', params, duration, ncMessageExtraProps)
+  },
+
+  warning: (params: NcMessageProps = '', duration?: number, ncMessageExtraProps?: NcMessageExtraProps) => {
+    return showMessage('warning', params, duration, ncMessageExtraProps)
+  },
+
+  toast: (
+    params:
+      | (Omit<NcMessageObjectProps, 'content'> & {
+          content: string | number | null | undefined
+        })
+      | string
+      | number
+      | null
+      | undefined = '',
+    duration?: number,
+    ncMessageExtraProps?: NcMessageExtraProps,
+  ) => {
+    return showMessage('toast', params, duration, ncMessageExtraProps)
+  },
+}
+
+export { ncMessage }

@@ -1,0 +1,1236 @@
+import type { ComputedRef, Ref } from 'vue'
+import { UITypes, ViewLockType, ViewTypes, isOrderCol } from 'nocodb-sdk'
+import type {
+  Api,
+  ColumnType,
+  DataPayload,
+  FilterType,
+  KanbanType,
+  SelectOptionType,
+  SelectOptionsType,
+  TableType,
+  ViewType,
+} from 'nocodb-sdk'
+import { validateRowFilters } from '~/utils/dataUtils'
+import type { InterfacePageDataApi } from '~/lib/interfaceData'
+import { isInterfaceSyntheticViewId } from '~/lib/interfaceData'
+import { dataEventSubscriptionKey } from '~/utils/realtimeUtils'
+
+type GroupingFieldColOptionsType = SelectOptionType & { collapsed: boolean }
+
+const [useProvideKanbanViewStore, useKanbanViewStore] = useInjectionState(
+  (
+    meta: Ref<TableType | KanbanType | undefined>,
+    viewMeta: Ref<ViewType | KanbanType | undefined> | ComputedRef<(ViewType & { id: string }) | undefined>,
+    shared = false,
+    providedInterfaceDataApi?: InterfacePageDataApi,
+  ) => {
+    if (!meta) {
+      throw new Error('Table meta is not available')
+    }
+
+    const addNewStackId = 'addNewStack'
+
+    const uncategorizedStackId = 'uncategorized'
+
+    const { t } = useI18n()
+
+    const { api } = useApi()
+
+    const baseStore = useBase()
+
+    const { base } = storeToRefs(baseStore)
+
+    const { getBaseType } = baseStore
+
+    const { $e, $api, $ncSocket } = useNuxtApp()
+
+    const { sorts, nestedFilters, eventBus, xWhere, rowMatchesSearchAndUrl } = useSmartsheetStoreOrThrow()
+
+    const { sharedView, fetchSharedViewData, fetchSharedViewGroupedData } = useSharedView()
+
+    const { isUIAllowed } = useRoles()
+
+    const { user } = useGlobal()
+
+    /**
+     * In shared view mode, `isPublic` will still be false because both
+     * `useProvideSmartsheetStore` and `provide(IsPublicInj)` are called at the same
+     * component level, so the inject doesn't see the provided value.
+     */
+    const isPublic = shared ? ref(shared) : inject(IsPublicInj, ref(false))
+
+    /**
+     * Present when mounted inside an interface page — grouped/list/CRUD calls
+     * are routed through the adapter and view-meta writes are kept local-only
+     * (the synthetic interface view is never persisted). Like `shared` above,
+     * the interface wrapper provides the adapter at the SAME component level
+     * it calls this provider, so inject can't see it — it passes the adapter
+     * as an argument instead.
+     */
+    const interfaceDataApi = providedInterfaceDataApi ?? inject(InterfacePageDataInj, undefined)
+
+    /** Embedded as a dashboard view-widget card — space-adaptive behavior below. */
+    const isEmbeddedViz = inject(IsEmbeddedVizInj, ref(false))
+
+    const password = ref<string | null>(null)
+
+    const { getEvaluatedRowMetaRowColorInfo } = useViewRowColorRender()
+
+    const { setMeta, metas } = useMetas()
+
+    const { blockButtonVisibility } = useEeConfig()
+
+    const buttonFilterColumns = computed(() => {
+      // Conditional button visibility is a paid feature (FEATURE_BUTTON_VISIBILITY) — unavailable in
+      // CE/OSS and on plans without it. When blocked, ignore any persisted filters so buttons always render.
+      if (blockButtonVisibility.value) return []
+      if (!meta.value?.columns) return []
+      return (meta.value as TableType).columns!.filter(
+        (col) => col.uidt === UITypes.Button && (col.colOptions as any)?.filters?.length,
+      )
+    })
+
+    const evaluateButtonVisibility = (row: Record<string, any>): Record<string, boolean> | undefined => {
+      if (!buttonFilterColumns.value.length) return undefined
+
+      const columns = (meta.value as TableType)?.columns as ColumnType[]
+      if (!columns) return undefined
+
+      const client = getBaseType((meta.value as TableType)?.source_id)
+      const result: Record<string, boolean> = {}
+
+      for (const col of buttonFilterColumns.value) {
+        const filters = (col.colOptions as any)?.filters as FilterType[]
+        if (!filters?.length) continue
+
+        const isValid = validateRowFilters(filters, row, columns, client, metas.value, (meta.value as TableType)?.base_id, {
+          currentUser: user.value?.id ? { id: user.value.id, email: user.value.email } : undefined,
+        })
+
+        if (!isValid) {
+          result[col.id!] = true
+        }
+      }
+
+      return Object.keys(result).length ? result : undefined
+    }
+
+    const viewStore = useViewsStore()
+
+    const { updateViewMeta } = viewStore
+
+    provide(SharedViewPasswordInj, password)
+
+    // kanban view meta data
+    const kanbanMetaData = computed(() => {
+      if (isPublic.value) {
+        return sharedView.value?.view as KanbanType
+      } else {
+        return viewMeta.value?.view
+      }
+    })
+
+    // formattedData structure
+    // {
+    //   [val1] : [
+    //     {row: {...}, oldRow: {...}, rowMeta: {...}},
+    //     {row: {...}, oldRow: {...}, rowMeta: {...}},
+    //     ...
+    //   ],
+    //   [val2] : [
+    //     {row: {...}, oldRow: {...}, rowMeta: {...}},
+    //     {row: {...}, oldRow: {...}, rowMeta: {...}},
+    //     ...
+    //   ],
+    // }
+    const formattedData = ref<Map<string | null, Row[]>>(new Map<string | null, Row[]>())
+
+    // countByStack structure
+    // {
+    //   "uncategorized": 0,
+    //   [val1]: 10,
+    //   [val2]: 20
+    // }
+    const countByStack = ref<Map<string | null, number>>(new Map<string | null, number>())
+
+    // Windowed loading is the default: the Kanban board loads grouped data one visible window of
+    // stacks at a time via loadKanbanDataForStacks() instead of fetching every group upfront, so the
+    // `watch(groupingFieldColumn)` below never fires a bulk load before the board mounts.
+    // KanbanOptimized flips it off for public/shared boards (the shared-view endpoint can't filter
+    // groups). Stores provided dormantly by non-kanban views never load either way — their view has
+    // no `fk_grp_col_id`, so that watcher has nothing to fire on.
+    const useWindowedKanbanLoad = ref(true)
+
+    // Stack titles whose grouped data (rows + count) has been fetched, so windowed loads can skip them.
+    const loadedStacks = ref<Set<string | null>>(new Set<string | null>())
+
+    const groupingFieldColumn = computed(() => {
+      if (!meta.value?.columns || !kanbanMetaData.value?.fk_grp_col_id) return undefined
+
+      // Interface mounts (including anonymous public shares, where the public
+      // route provides `IsPublicInj=true` and VizWrapper's own same-level
+      // `provide(IsPublicInj, false)` can't override it) carry the grouping
+      // column on the synthetic meta with `fk_grp_col_id` on the view — NOT the
+      // classic shared-view embedded `groupingFieldColumn` meta (the synthetic
+      // view's `meta` is `{}`). Resolve via the columns lookup, mirroring
+      // `loadKanbanData`'s `interfaceDataApi`-first branch.
+      if (isPublic.value && !interfaceDataApi) {
+        return parseProp(sharedView.value?.meta).groupingFieldColumn as ColumnType
+      } else {
+        return (meta.value.columns as ColumnType[]).find((f) => f.id === kanbanMetaData.value.fk_grp_col_id)
+      }
+    })
+
+    const groupingField = computed(() => groupingFieldColumn.value?.title ?? '')
+
+    /**
+     * Interface mounts: stack meta (incl. collapse state) is per-viewer ephemeral. The synthetic
+     * interface view is rebuilt from the page config on every recompute and is never persisted,
+     * so meta written onto it (or through the views store) is lost/no-op. This store-scoped ref
+     * survives those recomputes; it resets on remount by design.
+     */
+    const interfaceLocalStackMeta = ref<Record<string, GroupingFieldColOptionsType[]>>({})
+
+    // stack meta in object format
+    const stackMetaObj = computed(() => {
+      const metaObj = parseProp(kanbanMetaData.value?.meta) || {}
+
+      // overlay the ephemeral per-viewer stack meta over whatever the synthetic view carries
+      if (interfaceDataApi) {
+        return { ...metaObj, ...interfaceLocalStackMeta.value }
+      }
+
+      return metaObj
+    })
+
+    // grouping field column options - e.g. title, fk_column_id, color etc
+    const groupingFieldColOptions = computed(() => {
+      if (!groupingFieldColumn.value?.id) return []
+
+      const columnId = groupingFieldColumn.value.id
+      const columnOptions = (groupingFieldColumn.value.colOptions as SelectOptionsType)?.options ?? []
+
+      // Check if we have valid stack meta
+      const stackMeta = stackMetaObj.value[columnId]
+
+      if (!Array.isArray(stackMeta) || stackMeta.length === 0) {
+        // Missing or invalid stack meta - rebuild locally
+        const rebuiltOptions: GroupingFieldColOptionsType[] = []
+
+        // Add uncategorized stack first
+        rebuiltOptions.push({
+          id: uncategorizedStackId,
+          title: null,
+          order: 0,
+          color: '#6A7184',
+          collapsed: false,
+        })
+
+        // Add column options
+        columnOptions.forEach((option, index) => {
+          rebuiltOptions.push({
+            ...option,
+            order: index + 1,
+            collapsed: false,
+          })
+        })
+
+        // Try to persist if user has permissions (fire and forget)
+        if (!isPublic.value && !interfaceDataApi && isUIAllowed('viewCreateOrEdit', { skipSourceCheck: true })) {
+          nextTick(() => {
+            updateKanbanMeta({
+              meta: {
+                ...stackMetaObj.value,
+                [columnId]: rebuiltOptions,
+              },
+            }).catch(() => {
+              // Silently fail - continue with local rebuild
+            })
+          })
+        }
+
+        return rebuiltOptions.sort((a, b) => (a.order || 0) - (b.order || 0))
+      }
+
+      // Valid stack meta exists - sync with column options
+      // Use Map/Set lookups instead of findIndex/includes so this stays O(n) — high-cardinality
+      // grouping fields (e.g. a SingleSelect with thousands of options) would otherwise make this
+      // computed O(n²) and freeze the main thread on every recompute.
+      const syncedOptions = [...stackMeta]
+      let needsSync = false
+
+      const idxById = new Map<string, number>()
+      let maxOrder = 0
+      syncedOptions.forEach((stack, idx) => {
+        idxById.set(stack.id, idx)
+        if ((stack.order || 0) > maxOrder) maxOrder = stack.order || 0
+      })
+
+      // Update existing options with latest column data
+      for (const option of columnOptions) {
+        const idx = idxById.get(option.id)
+        if (idx !== undefined) {
+          // Check if select option properties changed
+          const existing = syncedOptions[idx]
+          if (existing.title !== option.title || existing.color !== option.color) {
+            syncedOptions[idx] = {
+              ...existing,
+              title: option.title,
+              color: option.color,
+            }
+            needsSync = true
+          }
+        } else {
+          // New option - add with proper order
+          maxOrder += 1
+          syncedOptions.push({
+            ...option,
+            order: maxOrder,
+            collapsed: false,
+          })
+          idxById.set(option.id, syncedOptions.length - 1)
+          needsSync = true
+        }
+      }
+
+      // Remove deleted options (except uncategorized)
+      const columnOptionIds = new Set(columnOptions.map((opt) => opt.id))
+      const filteredOptions = syncedOptions.filter((stack) => stack.id === uncategorizedStackId || columnOptionIds.has(stack.id))
+
+      if (filteredOptions.length !== syncedOptions.length) {
+        needsSync = true
+      }
+
+      // Persist changes if needed and allowed
+      if (needsSync && !isPublic.value && !interfaceDataApi && isUIAllowed('viewCreateOrEdit', { skipSourceCheck: true })) {
+        nextTick(() => {
+          updateKanbanMeta({
+            meta: {
+              ...stackMetaObj.value,
+              [columnId]: filteredOptions,
+            },
+          }).catch(() => {
+            // Silently fail
+          })
+        })
+      }
+
+      return filteredOptions.sort((a, b) => (a.order || 0) - (b.order || 0))
+    })
+
+    const shouldScrollToRight = ref(false)
+
+    const formatData = (
+      list: Record<string, any>[],
+      evaluateRowMetaRowColorInfoCallback?: (row: Record<string, any>) => RowMetaRowColorInfo,
+      evaluateButtonVisibilityCallback?: (row: Record<string, any>) => Record<string, boolean> | undefined,
+    ) =>
+      list.map((row) => {
+        const buttonDisabled = evaluateButtonVisibilityCallback?.(row)
+        return {
+          row: { ...row },
+          oldRow: { ...row },
+          rowMeta: {
+            ...(evaluateRowMetaRowColorInfoCallback?.(row) ?? {}),
+            ...(buttonDisabled ? { buttonDisabled } : {}),
+          },
+        }
+      })
+
+    async function loadKanbanData() {
+      // In windowed mode the optimised Kanban drives loading per visible stack window via
+      // loadKanbanDataForStacks(), so the bulk "fetch every group" load is intentionally skipped.
+      // Interface mounts never enable windowed mode (the adapter has no per-stack grouped fetch),
+      // so they always fall through to the full load below.
+      if (useWindowedKanbanLoad.value) return
+
+      if (
+        (!base?.value?.id || !meta.value?.id || !viewMeta?.value?.id || !groupingFieldColumn?.value?.id) &&
+        !isPublic.value &&
+        !interfaceDataApi
+      )
+        return
+
+      const newFormattedData = new Map<string | null, Row[]>()
+      const newCountByStack = new Map<string | null, number>()
+
+      let groupData
+
+      if (interfaceDataApi) {
+        // Stacking column is resolved server-side from the viz config
+        groupData = await interfaceDataApi.fetchGroupedData({
+          sortsArr: sorts.value,
+          filtersArr: nestedFilters.value,
+          where: xWhere.value,
+        })
+      } else if (isPublic.value) {
+        groupData = await fetchSharedViewGroupedData(groupingFieldColumn!.value!.id!, {
+          sortsArr: sorts.value,
+          filtersArr: nestedFilters.value,
+          include_row_color: true,
+          where: xWhere.value,
+        })
+      } else {
+        groupData = await api.dbViewRow.groupedDataList(
+          'noco',
+          base.value.id!,
+          meta.value!.id!,
+          viewMeta.value!.id!,
+          groupingFieldColumn!.value!.id!,
+          { where: xWhere.value, include_row_color: true, include_button_filter_columns: true },
+          {},
+        )
+      }
+
+      for (const data of groupData ?? []) {
+        const key = typeof data.key === 'string' ? (data.key?.length ? data.key : null) : null
+        newFormattedData.set(key, formatData(data.value.list, getEvaluatedRowMetaRowColorInfo, evaluateButtonVisibility))
+        newCountByStack.set(key, data.value.pageInfo.totalRows || 0)
+      }
+
+      formattedData.value = newFormattedData
+      countByStack.value = newCountByStack
+
+      autoCollapseEmptyStacks()
+    }
+
+    /**
+     * Embedded view widgets (dashboard cards) — space is scarce, so ANY stack
+     * with no records starts COLLAPSED, not just Uncategorized. One-shot per
+     * binding and interface-only, where stack meta is store-local + ephemeral
+     * (`updateKanbanMeta`'s interface branch): a viewer's manual expand is
+     * never re-collapsed by later reloads, and nothing persists for others.
+     */
+    let hasAutoCollapsedEmptyStacks = false
+    function autoCollapseEmptyStacks() {
+      if (!isEmbeddedViz.value || !interfaceDataApi || hasAutoCollapsedEmptyStacks) return
+
+      const options = groupingFieldColOptions.value
+      // Counts and the grouping options resolve independently (the synthetic
+      // meta is async) — the watcher below re-runs this until both are ready.
+      if (!options.length || !countByStack.value.size) return
+      hasAutoCollapsedEmptyStacks = true
+
+      const stackMeta = options.map((stack) => {
+        const key = stack.id === uncategorizedStackId ? null : stack.title
+        const count = countByStack.value.get(key) ?? 0
+
+        return !stack.collapsed && count === 0 ? { ...stack, collapsed: true } : stack
+      })
+
+      if (stackMeta.every((stack, i) => stack === options[i])) return
+
+      updateKanbanMeta({
+        meta: {
+          ...stackMetaObj.value,
+          [kanbanMetaData.value.fk_grp_col_id!]: stackMeta,
+        },
+      })
+    }
+
+    watch([countByStack, () => groupingFieldColOptions.value.length], () => autoCollapseEmptyStacks())
+
+    // Optimised Kanban: load grouped data (rows + count) for only the given stacks, merging into the
+    // existing maps. `optionsArrJson` restricts the server-side group-by to just these titles (the
+    // backend already honours it for both data and count under opt=true), so a board with thousands
+    // of stacks fetches a handful at a time as the user scrolls instead of all of them upfront.
+    async function loadKanbanDataForStacks(stackTitles: (string | null)[], { reset = false }: { reset?: boolean } = {}) {
+      // Interface mounts never take this path — the adapter's fetchGroupedData has no per-stack
+      if (
+        (!base?.value?.id || !meta.value?.id || !viewMeta?.value?.id || !groupingFieldColumn?.value?.id) &&
+        !isPublic.value &&
+        !interfaceDataApi
+      )
+        return
+
+      if (reset) {
+        formattedData.value = new Map<string | null, Row[]>()
+        countByStack.value = new Map<string | null, number>()
+        loadedStacks.value = new Set<string | null>()
+      }
+
+      // De-duplicate and skip stacks already fetched (or in-flight, since we mark them eagerly below).
+      const toLoad = [...new Set(stackTitles)].filter((title) => !loadedStacks.value.has(title))
+      if (!toLoad.length) return
+
+      // Mark eagerly so overlapping scroll-driven calls don't refetch the same stacks.
+      toLoad.forEach((title) => loadedStacks.value.add(title))
+
+      const optionsArrJson = JSON.stringify(toLoad)
+
+      try {
+        let groupData
+
+        if (interfaceDataApi) {
+          // Stacking column is resolved server-side from the viz config; `stackTitles`
+          // narrows the group-by to this window (same role as `optionsArrJson` below).
+          groupData = await interfaceDataApi.fetchGroupedData({
+            sortsArr: sorts.value,
+            filtersArr: nestedFilters.value,
+            where: xWhere.value,
+            stackTitles: toLoad,
+          })
+        } else if (isPublic.value) {
+          groupData = await fetchSharedViewGroupedData(groupingFieldColumn!.value!.id!, {
+            sortsArr: sorts.value,
+            filtersArr: nestedFilters.value,
+            include_row_color: true,
+            where: xWhere.value,
+            optionsArrJson,
+          })
+        } else {
+          groupData = await api.dbViewRow.groupedDataList(
+            'noco',
+            base.value.id!,
+            meta.value!.id!,
+            viewMeta.value!.id!,
+            groupingFieldColumn!.value!.id!,
+            { where: xWhere.value, include_row_color: true, include_button_filter_columns: true, opt: 'true', optionsArrJson },
+            {},
+          )
+        }
+
+        const newFormattedData = new Map(formattedData.value)
+        const newCountByStack = new Map(countByStack.value)
+
+        for (const data of groupData ?? []) {
+          const key = typeof data.key === 'string' ? (data.key?.length ? data.key : null) : null
+          newFormattedData.set(key, formatData(data.value.list, getEvaluatedRowMetaRowColorInfo, evaluateButtonVisibility))
+          newCountByStack.set(key, data.value.pageInfo.totalRows || 0)
+        }
+
+        formattedData.value = newFormattedData
+        countByStack.value = newCountByStack
+      } catch (e) {
+        // Allow a retry on the next scroll if the fetch failed.
+        toLoad.forEach((title) => loadedStacks.value.delete(title))
+        throw e
+      }
+    }
+
+    const filerDuplicateRecords = (existingRecords: Row[], newRecords: Row[]) => {
+      const existingRecordsMap = (existingRecords || []).reduce((acc, curr) => {
+        const primaryKey = extractPkFromRow(curr.row, meta!.value!.columns as ColumnType[])
+        if (primaryKey) {
+          acc[primaryKey] = curr
+        }
+        return acc
+      }, {} as Record<string, Row>)
+
+      return (newRecords || []).filter(({ row }) => {
+        const primaryKey = extractPkFromRow(row, meta!.value!.columns as ColumnType[])
+        if (primaryKey && existingRecordsMap[primaryKey]) {
+          return false
+        }
+        return true
+      })
+    }
+
+    async function loadMoreKanbanData(stackTitle: string | null, params: Parameters<Api<any>['dbViewRow']['list']>[4] = {}) {
+      if ((!base?.value?.id || !meta.value?.id || !viewMeta.value?.id) && !isPublic.value && !interfaceDataApi) return
+      let where = `(${groupingField.value},eq,${stackTitle})`
+      if (stackTitle === null) {
+        where = `(${groupingField.value},is,blank)`
+      }
+
+      if (xWhere.value) {
+        where = `${where} and ${xWhere.value}`
+      }
+
+      const response = interfaceDataApi
+        ? await interfaceDataApi.fetchList({
+            offset: params.offset,
+            where,
+            sortsArr: sorts.value,
+            filtersArr: nestedFilters.value,
+          })
+        : !isPublic.value
+        ? await api.dbViewRow.list('noco', base.value.id!, meta.value!.id!, viewMeta.value!.id!, {
+            ...params,
+            ...(isUIAllowed('sortSync') ? {} : { sortArrJson: JSON.stringify(sorts.value) }),
+            ...(isUIAllowed('filterSync') ? {} : { filterArrJson: JSON.stringify(nestedFilters.value) }),
+            where,
+            include_row_color: true,
+            include_button_filter_columns: true,
+          })
+        : await fetchSharedViewData({
+            ...params,
+            sortsArr: sorts.value,
+            filtersArr: nestedFilters.value,
+            offset: params.offset,
+            where,
+          })
+
+      formattedData.value.set(stackTitle, [
+        ...formattedData.value.get(stackTitle)!,
+        ...filerDuplicateRecords(
+          formattedData.value.get(stackTitle)!,
+          formatData(response!.list!, getEvaluatedRowMetaRowColorInfo, evaluateButtonVisibility),
+        ),
+      ])
+    }
+
+    async function updateKanbanMeta(updateObj: Partial<KanbanType>) {
+      if (!viewMeta?.value?.id) return
+
+      // interface mode: the views store can't reach the synthetic view (it isn't registered there,
+      // and it is rebuilt from the page config on every recompute), so hold stack meta in the
+      // store-local ref instead — per-viewer, ephemeral, never persisted over the network
+      if (interfaceDataApi) {
+        if (updateObj.meta !== undefined) {
+          interfaceLocalStackMeta.value = { ...interfaceLocalStackMeta.value, ...parseProp(updateObj.meta) }
+        }
+        return
+      }
+
+      // Check if user can update based on role OR personal view ownership
+      const isPersonalViewOwner = viewMeta.value.lock_type === ViewLockType.Personal && viewMeta.value.owned_by === user.value?.id
+
+      const canUpdate = isUIAllowed('viewCreateOrEdit', { skipSourceCheck: true }) || isPersonalViewOwner
+
+      await updateViewMeta(viewMeta.value.id, ViewTypes.KANBAN, updateObj, {
+        skipNetworkCall: isPublic.value || !canUpdate,
+      })
+    }
+
+    const updateStackProperty = async (stackIdx: number, updates: Partial<GroupingFieldColOptionsType>) => {
+      const stackMeta = [...groupingFieldColOptions.value]
+      stackMeta[stackIdx] = { ...stackMeta[stackIdx], ...updates }
+
+      const updatedStackMetaObj = {
+        ...stackMetaObj.value,
+        [kanbanMetaData.value.fk_grp_col_id!]: stackMeta,
+      }
+
+      await updateKanbanMeta({
+        meta: updatedStackMetaObj,
+      })
+    }
+
+    const updateAllStacksProperty = async (
+      updates: (stack: GroupingFieldColOptionsType, index: number) => Partial<GroupingFieldColOptionsType> | null,
+    ) => {
+      const stackMeta = groupingFieldColOptions.value.map((stack, index) => {
+        const stackUpdates = updates(stack, index)
+        return stackUpdates ? { ...stack, ...stackUpdates } : stack
+      })
+
+      const updatedStackMetaObj = {
+        ...stackMetaObj.value,
+        [kanbanMetaData.value.fk_grp_col_id!]: stackMeta,
+      }
+
+      await updateKanbanMeta({
+        meta: updatedStackMetaObj,
+      })
+    }
+
+    async function insertRow(row: Record<string, any>, rowIndex = formattedData.value.get(null)!.length) {
+      try {
+        const insertObj = (meta?.value?.columns as ColumnType[]).reduce((o: Record<string, any>, col) => {
+          if (!col.ai && row?.[col.title as string] !== null) {
+            o[col.title!] = row?.[col.title as string]
+          }
+          return o
+        }, {})
+
+        const insertedData = interfaceDataApi
+          ? await interfaceDataApi.insertRow(insertObj)
+          : await $api.dbViewRow.create(
+              NOCO,
+              metaValue?.base_id ?? (base?.value.id as string),
+              meta.value?.id as string,
+              viewMeta?.value?.id as string,
+              insertObj,
+            )
+
+        formattedData.value.get(null)?.splice(rowIndex ?? 0, 1, {
+          row: insertedData,
+          rowMeta: {
+            ...getEvaluatedRowMetaRowColorInfo(insertedData),
+            buttonDisabled: evaluateButtonVisibility(insertedData),
+          },
+          oldRow: { ...insertedData },
+        })
+
+        return insertedData
+      } catch (error: any) {
+        message.error(await extractSdkResponseErrorMsg(error))
+      }
+    }
+
+    async function updateRowProperty(toUpdate: Row, property: string) {
+      try {
+        const id = extractPkFromRow(toUpdate.row, meta?.value?.columns as ColumnType[])
+
+        const updatedRowData = interfaceDataApi
+          ? await interfaceDataApi.updateRow(id, { [property]: toUpdate.row[property] })
+          : await $api.dbViewRow.update(
+              NOCO,
+              meta.value?.base_id ?? (base?.value.id as string),
+              meta.value?.id as string,
+              viewMeta?.value?.id as string,
+              encodeURIComponent(id),
+              {
+                [property]: toUpdate.row[property],
+              },
+              // todo:
+              // {
+              //   query: { ignoreWebhook: !saved }
+              // }
+            )
+
+        /** update row data(to sync formula and other related columns) */
+        Object.assign(toUpdate.row, updatedRowData)
+        Object.assign(toUpdate.oldRow, updatedRowData)
+        Object.assign(toUpdate.rowMeta, getEvaluatedRowMetaRowColorInfo(updatedRowData))
+        toUpdate.rowMeta.buttonDisabled = evaluateButtonVisibility(updatedRowData)
+
+        return updatedRowData
+      } catch (e: any) {
+        message.error(`${t('msg.error.rowUpdateFailed')} ${await extractSdkResponseErrorMsg(e)}`)
+      }
+    }
+
+    async function updateOrSaveRow(row: Row) {
+      if (row.rowMeta.new) {
+        await insertRow(row.row, formattedData.value.get(row.row.title!)!.indexOf(row))
+      } else {
+        await updateRowProperty(row, groupingField.value)
+      }
+    }
+
+    /**
+     * Persist a card's position (writes the table's `nc_order` column) so a within-stack drag
+     * survives a reload. `beforeRow` is the card the dragged card should sit
+     * before, or null to move it to the end. Skipped when the order can't be manually controlled
+     * (interface/public views, or an active sort re-sorts on the next fetch anyway).
+     */
+    async function updateRecordOrder(row: Row, beforeRow: Row | null) {
+      if (interfaceDataApi || isPublic.value || sorts.value?.length) return
+      if (!base.value?.id || !meta.value?.id) return
+      // moveRecord needs an order column (absent on e.g. external-source tables).
+      if (!meta.value.columns?.some((c) => isOrderCol(c))) return
+
+      try {
+        const rowId = extractPkFromRow(row.row, meta.value?.columns as ColumnType[])
+        const beforeRowId = beforeRow ? extractPkFromRow(beforeRow.row, meta.value?.columns as ColumnType[]) : null
+
+        await $api.internal.postOperation(
+          base.value.fk_workspace_id!,
+          meta.value?.base_id ?? (base.value.id as string),
+          {
+            operation: 'dataMove',
+            tableId: meta.value.id as string,
+            rowId,
+            before: beforeRowId,
+          } as any,
+          undefined,
+        )
+      } catch (e: any) {
+        message.error(await extractSdkResponseErrorMsg(e))
+      }
+    }
+
+    async function deleteStack(stackTitle: string, _stackIdx: number) {
+      if (!viewMeta?.value?.id || !groupingFieldColumn.value) return
+      try {
+        // merge the to-be-deleted stack into the uncategorized stack
+        formattedData.value.set(null, [...formattedData.value.get(null)!, ...formattedData.value.get(stackTitle)!])
+        countByStack.value.set(null, (countByStack.value.get(null) || 0) + (countByStack.value.get(stackTitle) || 0))
+        formattedData.value.delete(stackTitle)
+        countByStack.value.delete(stackTitle)
+
+        const newOptions = (groupingFieldColumn.value.colOptions as SelectOptionsType).options.filter(
+          (o) => o.title !== stackTitle,
+        )
+        const cdf = groupingFieldColumn.value.cdf ? groupingFieldColumn.value.cdf.replace(/^'/, '').replace(/'$/, '') : null
+        const newMeta = await $api.internal.postOperation(
+          base.value!.fk_workspace_id!,
+          meta.value?.base_id ?? (base.value!.id as string),
+          {
+            operation: 'columnUpdate',
+            columnId: groupingFieldColumn.value.id as string,
+          },
+          {
+            ...groupingFieldColumn.value,
+            colOptions: {
+              options: newOptions,
+            },
+            cdf: cdf === stackTitle ? null : cdf,
+          },
+        )
+        await setMeta(newMeta)
+
+        $e('a:kanban:delete-stack')
+      } catch (e: any) {
+        message.error(await extractSdkResponseErrorMsg(e))
+      }
+    }
+
+    function addEmptyRow(addAfter = formattedData.value.get(null)!.length) {
+      formattedData.value.get(null)!.splice(addAfter, 0, {
+        row: {},
+        oldRow: {},
+        rowMeta: { new: true },
+      })
+      return formattedData.value.get(null)![addAfter]
+    }
+
+    function addOrEditStackRow(row: Row, isNewRow: boolean, rowIndex?: number) {
+      const stackTitle = row.row[groupingField.value]
+      const oldStackTitle = row.oldRow[groupingField.value]
+
+      // if the update happen on linked table, do not attempt to update stack
+      if (!stackTitle || oldStackTitle) {
+        return
+      }
+      if (isNewRow) {
+        // add a new record
+        if (stackTitle) {
+          // push the row to target stack
+          if (rowIndex !== undefined) {
+            formattedData.value.get(stackTitle)!.splice(rowIndex, 0, row)
+          } else {
+            formattedData.value.get(stackTitle)!.push(row)
+          }
+          // increase the current count in the target stack by 1
+          countByStack.value.set(stackTitle, countByStack.value.get(stackTitle)! + 1)
+          // clear the one under uncategorized since we don't reload the view
+          removeRowFromUncategorizedStack()
+        } else {
+          // data will be still in Uncategorized stack
+          // no action is required
+        }
+      } else {
+        // update existing record
+        const targetPrimaryKey = extractPkFromRow(row.row, meta!.value!.columns as ColumnType[])
+        const idxToUpdateOrDelete = formattedData.value
+          .get(oldStackTitle)!
+          .findIndex((ele) => extractPkFromRow(ele.row, meta!.value!.columns as ColumnType[]) === targetPrimaryKey)
+        if (idxToUpdateOrDelete !== -1) {
+          if (stackTitle !== oldStackTitle) {
+            // remove old row from countByStack & formattedData
+            countByStack.value.set(oldStackTitle, countByStack.value.get(oldStackTitle)! - 1)
+            const updatedRow = formattedData.value.get(oldStackTitle)!
+            updatedRow.splice(idxToUpdateOrDelete, 1)
+            formattedData.value.set(oldStackTitle, updatedRow)
+
+            // add new row to countByStack & formattedData
+            countByStack.value.set(stackTitle, countByStack.value.get(stackTitle)! + 1)
+
+            if (rowIndex !== undefined) {
+              const targetStack = formattedData.value.get(stackTitle)!
+              targetStack.splice(rowIndex, 0, row)
+              formattedData.value.set(stackTitle, targetStack)
+            } else {
+              formattedData.value.set(stackTitle, [...formattedData.value.get(stackTitle)!, row])
+            }
+          } else {
+            // update the row in formattedData
+            const updatedRow = formattedData.value.get(stackTitle)!
+
+            if (rowIndex !== undefined) {
+              updatedRow.splice(idxToUpdateOrDelete, 1)
+              updatedRow.splice(rowIndex, 0, row)
+            } else {
+              updatedRow[idxToUpdateOrDelete] = row
+            }
+
+            formattedData.value.set(oldStackTitle, updatedRow)
+          }
+        }
+      }
+    }
+
+    function removeRowFromTargetStack(row: Row) {
+      // primary key of Row to be deleted
+      const targetPrimaryKey = extractPkFromRow(row.row, meta!.value!.columns as ColumnType[])
+      // stack title of Row to be deleted
+      const stackTitle = row.row[groupingField.value]
+      // remove target row from formattedData
+      formattedData.value.set(
+        stackTitle,
+        formattedData.value
+          .get(stackTitle)!
+          .filter((ele) => extractPkFromRow(ele.row, meta!.value!.columns as ColumnType[]) !== targetPrimaryKey),
+      )
+      // decrease countByStack of target stack by 1
+      countByStack.value.set(stackTitle, countByStack.value.get(stackTitle)! - 1)
+    }
+
+    function removeRowFromUncategorizedStack() {
+      // interface adapter mode supports CRUD — only bail in plain public shared views
+      if (isPublic.value && !interfaceDataApi) return
+      // remove the last record
+      formattedData.value.get(null)!.pop()
+      // decrease total count by 1
+      countByStack.value.set(null, countByStack.value.get(null)! - 1)
+    }
+
+    async function deleteRow(row: Row) {
+      try {
+        if (!row.rowMeta.new) {
+          const id = extractPkFromRow(row.row, meta?.value?.columns)
+
+          const deleted = await deleteRowById(id as string)
+          if (!deleted) {
+            return
+          }
+        }
+
+        // remove deleted row from state
+        removeRowFromTargetStack(row)
+      } catch (e: any) {
+        message.error(`${t('msg.error.deleteRowFailed')}: ${await extractSdkResponseErrorMsg(e)}`)
+      }
+    }
+
+    async function deleteRowById(id: string) {
+      if (!id) {
+        throw new Error("Delete not allowed for table which doesn't have primary Key")
+      }
+
+      const res: any = interfaceDataApi
+        ? await interfaceDataApi.deleteRow(id)
+        : await $api.dbViewRow.delete(
+            'noco',
+            meta.value?.base_id ?? (base.value.id as string),
+            meta.value?.id as string,
+            viewMeta.value?.id as string,
+            encodeURIComponent(id),
+          )
+
+      if (res.message) {
+        message.info(
+          `Record delete failed: ${`Unable to delete record with ID ${id} because of the following:
+              \n${res.message.join('\n')}.\n
+              Clear the data first & try again`})}`,
+        )
+        return false
+      }
+      return true
+    }
+
+    /**
+     * This is used to update the rowMeta color info when the row colour info is updated
+     */
+    const smartsheetStoreEventHandler = (event: SmartsheetStoreEvents) => {
+      if (![SmartsheetStoreEvents.TRIGGER_RE_RENDER, SmartsheetStoreEvents.ON_ROW_COLOUR_INFO_UPDATE].includes(event)) {
+        return
+      }
+
+      const groupKeys = Array.from(formattedData.value.keys())
+
+      groupKeys.forEach((key) => {
+        const formattedDataCopy = formattedData.value.get(key) ?? []
+
+        if (!formattedDataCopy.length) return
+
+        formattedDataCopy.forEach((row) => {
+          Object.assign(row.rowMeta, getEvaluatedRowMetaRowColorInfo(row.row))
+          row.rowMeta.buttonDisabled = evaluateButtonVisibility(row.row)
+        })
+
+        formattedData.value.set(key, formattedDataCopy)
+      })
+    }
+
+    eventBus.on(smartsheetStoreEventHandler)
+
+    watch([groupingFieldColumn], () => {
+      loadKanbanData()
+    })
+
+    const activeDataListener = ref<string | null>(null)
+
+    // Saved view filters → trust the server's matchedViewIds. Ad-hoc URL `where` + toolbar search
+    // → server can't know them, so AND them in client-side via rowMatchesSearchAndUrl.
+    const recordPassesViewFilter = (data: DataPayload) => {
+      if (
+        !isInterfaceSyntheticViewId(viewMeta.value?.id) &&
+        Array.isArray(data.matchedViewIds) &&
+        !data.matchedViewIds.includes(viewMeta.value?.id as string)
+      ) {
+        return false
+      }
+      return rowMatchesSearchAndUrl(data.payload)
+    }
+
+    const handleDataEvent = (data: DataPayload) => {
+      const { id, action, payload, before } = data
+
+      if (action === 'bulk') {
+        if (Array.isArray(data.rows)) {
+          for (const row of data.rows) handleDataEvent(row)
+        }
+        return
+      }
+
+      // TODO: @mertmit handle filters and sort for newly added and updated records
+      if (action === 'add') {
+        try {
+          const isValidationFailed = !recordPassesViewFilter(data)
+
+          if (isValidationFailed) {
+            return
+          }
+
+          const stackKey =
+            typeof payload[groupingField.value] === 'string'
+              ? payload[groupingField.value]?.length
+                ? payload[groupingField.value]
+                : null
+              : null
+
+          const newRow: Row = {
+            row: payload,
+            oldRow: { ...payload },
+            rowMeta: {
+              new: false,
+              ...getEvaluatedRowMetaRowColorInfo(payload),
+              buttonDisabled: evaluateButtonVisibility(payload),
+            },
+          }
+
+          if (!formattedData.value.has(stackKey)) {
+            formattedData.value.set(stackKey, [])
+            countByStack.value.set(stackKey, 0)
+          }
+
+          const stackRows = formattedData.value.get(stackKey)!
+
+          if (before) {
+            const beforeIndex = stackRows.findIndex((row) => {
+              const pk = extractPkFromRow(row.row, meta?.value?.columns as ColumnType[])
+              return pk && `${pk}` === `${before}`
+            })
+            if (beforeIndex !== -1) {
+              stackRows.splice(beforeIndex, 0, newRow)
+            } else {
+              stackRows.push(newRow)
+            }
+          } else {
+            stackRows.push(newRow)
+          }
+
+          countByStack.value.set(stackKey, (countByStack.value.get(stackKey) || 0) + 1)
+          formattedData.value.set(stackKey, [...stackRows])
+        } catch (e) {
+          console.error('Failed to add row to kanban on socket event', e)
+        }
+      } else if (action === 'update') {
+        try {
+          const isValidationFailed = !recordPassesViewFilter(data)
+
+          if (isValidationFailed) {
+            handleDataEvent({ ...data, action: 'delete' })
+            return
+          }
+
+          let found = null
+          let foundStackKey = null
+          let foundIndex = -1
+
+          // Find the row across all stacks
+          for (const [stackKey, rows] of formattedData.value.entries()) {
+            const index = rows.findIndex((row) => {
+              const pk = extractPkFromRow(row.row, meta?.value?.columns as ColumnType[])
+              return pk && `${pk}` === `${id}`
+            })
+            if (index !== -1) {
+              found = rows[index]
+              foundStackKey = stackKey
+              foundIndex = index
+              break
+            }
+          }
+
+          if (!found) {
+            handleDataEvent({ ...data, action: 'add' })
+            return
+          }
+
+          const oldStackKey = foundStackKey
+          const newStackKey =
+            typeof payload[groupingField.value] === 'string'
+              ? payload[groupingField.value]?.length
+                ? payload[groupingField.value]
+                : null
+              : null
+
+          // Update row data
+          Object.assign(found.row, payload)
+          Object.assign(found.oldRow, payload)
+          Object.assign(found.rowMeta, getEvaluatedRowMetaRowColorInfo(payload))
+          found.rowMeta.buttonDisabled = evaluateButtonVisibility(payload)
+          found.rowMeta.changed = false
+
+          // Handle stack change
+          if (oldStackKey !== newStackKey) {
+            // Remove from old stack
+            const oldStackRows = formattedData.value.get(oldStackKey)!
+            oldStackRows.splice(foundIndex, 1)
+            formattedData.value.set(oldStackKey, [...oldStackRows])
+            countByStack.value.set(oldStackKey, (countByStack.value.get(oldStackKey) || 0) - 1)
+
+            // Add to new stack
+            if (!formattedData.value.has(newStackKey)) {
+              formattedData.value.set(newStackKey, [])
+              countByStack.value.set(newStackKey, 0)
+            }
+
+            const newStackRows = formattedData.value.get(newStackKey)!
+            newStackRows.push(found)
+            formattedData.value.set(newStackKey, [...newStackRows])
+            countByStack.value.set(newStackKey, (countByStack.value.get(newStackKey) || 0) + 1)
+          } else {
+            // Row stays in same stack
+            const stackRows = formattedData.value.get(foundStackKey)!
+            stackRows[foundIndex] = found
+            formattedData.value.set(foundStackKey, [...stackRows])
+          }
+        } catch (e) {
+          console.error('Failed to update row in kanban on socket event', e)
+        }
+      } else if (action === 'delete') {
+        try {
+          for (const [stackKey, rows] of formattedData.value.entries()) {
+            const index = rows.findIndex((row) => {
+              const pk = extractPkFromRow(row.row, meta?.value?.columns as ColumnType[])
+              return pk && `${pk}` === `${id}`
+            })
+            if (index !== -1) {
+              const stackRows = formattedData.value.get(stackKey)!
+              stackRows.splice(index, 1)
+              formattedData.value.set(stackKey, [...stackRows])
+              countByStack.value.set(stackKey, Math.max((countByStack.value.get(stackKey) || 0) - 1, 0))
+              break
+            }
+          }
+        } catch (e) {
+          console.error('Failed to delete row from kanban on socket event', e)
+        }
+      } else if (action === 'reorder') {
+        // A sort decides the order, not nc_order.
+        if (sorts.value?.length) return
+
+        try {
+          const pkOf = (row: Row) => `${extractPkFromRow(row.row, meta?.value?.columns as ColumnType[])}`
+          const reload = (stackKey: string | null) =>
+            reloadStack(stackKey).catch((e) => console.error('Failed to reload kanban stack on reorder', e))
+
+          for (const [stackKey, rows] of formattedData.value.entries()) {
+            const index = rows.findIndex((row) => pkOf(row) === `${id}`)
+            if (index === -1) continue
+
+            const stackRows = [...rows]
+            const [moved] = stackRows.splice(index, 1)
+            const beforeIndex = before ? stackRows.findIndex((row) => pkOf(row) === `${before}`) : -1
+
+            if (beforeIndex !== -1) {
+              stackRows.splice(beforeIndex, 0, moved!)
+              formattedData.value.set(stackKey, stackRows)
+            } else if (!before && rows.length >= (countByStack.value.get(stackKey) ?? 0)) {
+              stackRows.push(moved!)
+              formattedData.value.set(stackKey, stackRows)
+            } else {
+              // `before` is in another stack or not loaded, so the slot within this stack is unknown.
+              reload(stackKey)
+            }
+            return
+          }
+
+          // The card isn't loaded, but it now sits before a loaded card of its stack, so it's inside the window.
+          const stackKey =
+            typeof payload?.[groupingField.value] === 'string' && payload[groupingField.value].length
+              ? payload[groupingField.value]
+              : null
+          if (before && formattedData.value.get(stackKey)?.some((row) => pkOf(row) === `${before}`)) reload(stackKey)
+        } catch (e) {
+          console.error('Failed to reorder row in kanban on socket event', e)
+        }
+      }
+    }
+
+    async function reloadStack(stackKey: string | null) {
+      if (!useWindowedKanbanLoad.value) return loadKanbanData()
+
+      // Refetching resets the stack to its first page; top it back up so scrolled-in cards stay.
+      const loadedCount = formattedData.value.get(stackKey)?.length ?? 0
+      loadedStacks.value.delete(stackKey)
+      await loadKanbanDataForStacks([stackKey])
+
+      const reloadedCount = formattedData.value.get(stackKey)?.length ?? 0
+      if (loadedCount > reloadedCount) {
+        await loadMoreKanbanData(stackKey, { offset: reloadedCount, limit: loadedCount - reloadedCount })
+      }
+    }
+
+    watch(
+      meta,
+      (newMeta, oldMeta) => {
+        if (newMeta?.fk_workspace_id && newMeta?.base_id && newMeta?.id) {
+          if (oldMeta?.id && oldMeta.id === newMeta.id) return
+
+          // Clean up existing listeners
+          if (activeDataListener.value) {
+            $ncSocket.offMessage(activeDataListener.value)
+          }
+
+          // Set up data event listener
+          activeDataListener.value = $ncSocket.onMessage(dataEventSubscriptionKey(newMeta, interfaceDataApi), handleDataEvent)
+        }
+      },
+      { immediate: true },
+    )
+
+    onBeforeUnmount(() => {
+      eventBus.off(smartsheetStoreEventHandler)
+
+      if (activeDataListener.value) {
+        $ncSocket.offMessage(activeDataListener.value)
+      }
+    })
+
+    return {
+      loadKanbanData,
+      loadKanbanDataForStacks,
+      useWindowedKanbanLoad,
+      loadedStacks,
+      loadMoreKanbanData,
+      updateKanbanMeta,
+      kanbanMetaData,
+      formattedData,
+      countByStack,
+      groupingField,
+      groupingFieldColOptions,
+      groupingFieldColumn,
+      updateOrSaveRow,
+      updateRecordOrder,
+      addEmptyRow,
+      addOrEditStackRow,
+      deleteStack,
+      removeRowFromUncategorizedStack,
+      shouldScrollToRight,
+      deleteRow,
+      stackMetaObj,
+      addNewStackId,
+      updateStackProperty,
+      updateAllStacksProperty,
+      uncategorizedStackId,
+    }
+  },
+  'kanban-view-store',
+)
+
+export { useProvideKanbanViewStore, useKanbanViewStore }
+
+export function useKanbanViewStoreOrThrow() {
+  const kanbanViewStore = useKanbanViewStore()
+
+  if (kanbanViewStore == null) throw new Error('Please call `useProvideKanbanViewStore` on the appropriate parent component')
+
+  return kanbanViewStore
+}

@@ -1,0 +1,99 @@
+import { Injectable } from '@nestjs/common';
+import { PassportStrategy } from '@nestjs/passport';
+import { extractRolesObj, ProjectRoles } from 'nocodb-sdk';
+import { Strategy } from 'passport-custom';
+import type { NcRequest } from '~/interface/config';
+import { ApiToken, User } from '~/models';
+import { sanitiseUserObj } from '~/utils';
+import { getApiTokenFromHeader } from '~/helpers';
+
+@Injectable()
+export class AuthTokenStrategy extends PassportStrategy(Strategy, 'authtoken') {
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  async validate(req: NcRequest, callback: Function) {
+    try {
+      let user;
+
+      // Extract token from either xc-token header or Authorization Bearer header
+      const token = getApiTokenFromHeader(req);
+
+      if (token) {
+        const apiToken = await ApiToken.getByToken(token);
+        if (!apiToken) {
+          return callback({ msg: 'Invalid token' });
+        }
+
+        // `enabled`/`expiry` were surfaced to the UI as revocation controls but
+        // never consulted here, so disabling or expiring a token did nothing.
+        // Same checks the EE strategy already applies.
+        if (!apiToken.enabled) {
+          return callback({ msg: 'Token is disabled' });
+        }
+
+        if (apiToken.expiry && new Date(apiToken.expiry) < new Date()) {
+          return callback({ msg: 'Token has expired' });
+        }
+
+        // Enforce the token's base scope. A token minted through a base-scoped
+        // endpoint carries a `base_id` and must only operate within that base;
+        // reject any request that targets a different base. Account-wide
+        // tokens leave `base_id` null and are unaffected. Requests with no
+        // resolved base (workspace/org-level routes) carry no target base to
+        // mismatch, so they are left to the normal role-based ACL.
+        if (
+          apiToken.base_id &&
+          req['ncBaseId'] &&
+          apiToken.base_id !== req['ncBaseId']
+        ) {
+          return callback({ msg: 'Invalid token' });
+        }
+
+        user = {
+          is_api_token: true,
+        };
+
+        // old auth tokens will not have fk_user_id, so we return editor role
+        if (!apiToken.fk_user_id) {
+          user.base_roles = extractRolesObj(ProjectRoles.EDITOR);
+          return callback(null, user);
+        }
+
+        const dbUser: Record<string, any> = await User.getWithRoles(
+          req.context,
+          apiToken.fk_user_id,
+          {
+            baseId: req['ncBaseId'],
+            ...(req['ncWorkspaceId']
+              ? { workspaceId: req['ncWorkspaceId'] }
+              : {}),
+          },
+        );
+        if (!dbUser) {
+          return callback({ msg: 'User not found' });
+        }
+
+        User.assertNotBlocked(dbUser);
+
+        Object.assign(user, {
+          id: dbUser.id,
+          email: dbUser.email,
+          display_name: dbUser.display_name,
+          roles: extractRolesObj(dbUser.roles),
+          base_roles: extractRolesObj(dbUser.base_roles),
+          is_new_user: dbUser.is_new_user,
+          ...(dbUser.workspace_roles
+            ? { workspace_roles: extractRolesObj(dbUser.workspace_roles) }
+            : {}),
+          ...(dbUser.org_roles
+            ? { org_roles: extractRolesObj(dbUser.org_roles) }
+            : {}),
+          // Add SSO client information from the API token if available
+          extra: await apiToken.getExtraForUserPayload(),
+        });
+      }
+      return callback(null, sanitiseUserObj(user));
+    } catch (error) {
+      return callback(error);
+    }
+  }
+}

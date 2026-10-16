@@ -1,0 +1,1240 @@
+import { colors as unoColors } from '@unocss/preset-mini/colors'
+import { enumColors as enumColor } from 'nocodb-sdk'
+import tinycolor from 'tinycolor2'
+export { enumColors as enumColor } from 'nocodb-sdk'
+
+// UnoCSS ships shorthand (1-9), 950 and DEFAULT keys alongside the 50-900 shades.
+// Callers iterate palette values, so keep only the shades WindiCSS exposed.
+const WINDI_SHADES = ['50', '100', '200', '300', '400', '500', '600', '700', '800', '900']
+
+const canonicalShades = (palette: Record<string, string>) =>
+  Object.fromEntries(WINDI_SHADES.filter((shade) => shade in palette).map((shade) => [shade, palette[shade]]))
+
+export const theme = {
+  light: ['#ffdce5', '#fee2d5', '#ffeab6', '#d1f7c4', '#ede2fe', '#eee', '#cfdffe', '#d0f1fd', '#c2f5e8', '#ffdaf6'],
+  dark: [
+    '#f82b6099',
+    '#ff6f2c99',
+    '#fcb40099',
+    '#20c93399',
+    '#8b46ff99',
+    '#666',
+    '#2d7ff999',
+    '#18bfff99',
+    '#20d9d299',
+    '#ff08c299',
+  ],
+}
+
+export const themeColors = {
+  'background': '#FFFFFF',
+  'surface': '#FFFFFF',
+  'primary': '#4351e8',
+  'primary-selected': 'var(--color-brand-50)',
+  'primary-selected-sidebar': 'var(--color-brand-50)',
+  'hover': '#E1E3E6',
+  'scrollbar': '#d7d7d7',
+  'scrollbar-hover': '#cbcbcb',
+  'border': '#F3F4F6',
+  'secondary': '#F2F4F7',
+  'secondary-darken-1': '#018786',
+  'error': '#B00020',
+  'info': '#2196F3',
+  'success': '#4CAF50',
+  'warning': '#FB8C00',
+}
+
+export const themeV2Colors = {
+  /** Primary shades */
+  'royal-blue': {
+    'DEFAULT': '#4351E8',
+    '50': '#E7E8FC',
+    '100': '#D4D8FA',
+    '200': '#B0B6F5',
+    '300': '#8C94F1',
+    '400': '#6773EC',
+    '500': '#4351E8',
+    '600': '#1A2BD8',
+    '700': '#1421A6',
+    '800': '#0E1774',
+    '900': '#080D42',
+  },
+
+  /** Accent shades */
+  'pink': canonicalShades(unoColors.pink),
+}
+
+// @deprecated
+// Use CSS variables from variables.css directly in future like:
+// color: var(--nc-content-brand)
+// background: var(--nc-bg-brand)
+// The above values map 1:1 directly with Figma CSS variables.
+export const themeV3Colors = {
+  base: {
+    white: '#FFFFFF',
+    black: '#000000',
+  },
+  brand: {
+    50: '#EBF0FF',
+    100: '#D6E0FF',
+    200: '#ADC2FF',
+    300: '#85A3FF',
+    400: '#5C85FF',
+    500: '#3366FF',
+    600: '#2952CC',
+    700: '#1F3D99',
+    800: '#142966',
+    900: '#0A1433',
+  },
+  gray: {
+    10: '#FCFCFC',
+    50: '#F9F9FA',
+    100: '#F4F4F5',
+    200: '#E7E7E9',
+    300: '#D5D5D9',
+    400: '#9AA2AF',
+    500: '#6A7184',
+    600: '#4A5268',
+    700: '#374151',
+    800: '#1F293A',
+    900: '#101015',
+  },
+  red: {
+    50: '#FFF2F1',
+    100: '#FFDBD9',
+    200: '#FFB7B2',
+    300: '#FF928C',
+    400: '#FF6E65',
+    500: '#FF4A3F',
+    600: '#E8463C',
+    700: '#CB3F36',
+    800: '#B23830',
+    900: '#7D2721',
+  },
+  pink: {
+    50: '#FFEEFB',
+    100: '#FED8F4',
+    200: '#FEB0E8',
+    300: '#FD89DD',
+    400: '#FD61D1',
+    500: '#FC3AC6',
+    600: '#CA2E9E',
+    700: '#972377',
+    800: '#65174F',
+    900: '#320C28',
+  },
+  orange: {
+    50: '#FFF5EF',
+    100: '#FEE6D6',
+    200: '#FDCDAD',
+    300: '#FCB483',
+    400: '#FB9B5A',
+    500: '#FA8231',
+    600: '#E1752C',
+    700: '#C86827',
+    800: '#964E1D',
+    900: '#4B270F',
+  },
+  purple: {
+    50: '#F3ECFA',
+    100: '#E5D4F5',
+    200: '#CBA8EB',
+    300: '#B17DE1',
+    400: '#9751D7',
+    500: '#7D26CD',
+    600: '#641EA4',
+    700: '#4B177B',
+    800: '#320F52',
+    900: '#190829',
+  },
+  blue: {
+    50: '#EDF9FF',
+    100: '#D7F2FF',
+    200: '#AFE5FF',
+    300: '#86D9FF',
+    400: '#5ECCFF',
+    500: '#36BFFF',
+    600: '#2B99CC',
+    700: '#207399',
+    800: '#164C66',
+    900: '#0B2633',
+  },
+  yellow: {
+    50: '#fffbf2',
+    100: '#fff0d1',
+    200: '#fee5b0',
+    300: '#fdd889',
+    400: '#fdcb61',
+    500: '#fcbe3a',
+    600: '#ca982e',
+    700: '#977223',
+    800: '#654c17',
+    900: '#32260c',
+  },
+  maroon: {
+    50: '#FFF0F7',
+    100: '#FFCFE6',
+    200: '#FFABD2',
+    300: '#EC7DB1',
+    400: '#D45892',
+    500: '#B33771',
+    600: '#9D255D',
+    700: '#801044',
+    800: '#690735',
+    900: '#42001F',
+  },
+  // Built on the mean lightness/saturation profile of the other ramps at hue 178,
+  // so it behaves like a native family rather than a bolted-on one. Fills the only
+  // gap in the hue wheel — the picker previously had nothing between green and blue.
+  teal: {
+    50: '#E2FCFB',
+    100: '#CAF8F7',
+    200: '#A4F4F1',
+    300: '#7DECE8',
+    400: '#57E5E0',
+    500: '#2FDFD9',
+    600: '#2EB0AB',
+    700: '#258783',
+    800: '#195F5D',
+    900: '#0C2F2E',
+  },
+  green: {
+    50: '#ECFFF2',
+    100: '#D4F7E0',
+    200: '#A9EFC1',
+    300: '#7DE6A3',
+    400: '#52DE84',
+    500: '#27D665',
+    600: '#1FAB51',
+    700: '#17803D',
+    800: '#105628',
+    900: '#082B14',
+  },
+}
+
+type ThemeV3ColorKeys = Exclude<keyof typeof themeV3Colors, 'base'>
+type Shade = keyof (typeof themeV3Colors)[ThemeV3ColorKeys]
+
+/**
+ * Get a random color from the themeV3Colors
+ * @param randomNumber - The random number to use to get the color
+ * @param shade - The shade of the color to get
+ * @returns The color
+ */
+export function getThemeV3RandomColor(randomNumber = 1, shade: Shade = 600): string {
+  const colorGroups = Object.keys(themeV3Colors).filter((key) => key !== 'base') as ThemeV3ColorKeys[]
+
+  const groupIndex = Math.floor(Math.random() * 1000 * randomNumber) % colorGroups.length
+  const colorGroup = colorGroups[groupIndex]!
+
+  const selectedGroup = themeV3Colors[colorGroup]
+  return selectedGroup[shade]
+}
+
+const isValidHex = (hex: string) => /^#([A-Fa-f0-9]{3,4}){1,2}$/.test(hex)
+
+const getChunksFromString = (st: string, chunkSize: number) => st.match(new RegExp(`.{${chunkSize}}`, 'g'))
+
+const convertHexUnitTo256 = (hexStr: string) => parseInt(hexStr.repeat(2 / hexStr.length), 16)
+
+export const hexToRGB = (hex: string) => {
+  if (!isValidHex(hex)) {
+    throw new Error('Invalid HEX')
+  }
+
+  const chunkSize = Math.floor((hex.length - 1) / 3)
+
+  const hexArr = getChunksFromString(hex.slice(1), chunkSize)!
+
+  const [r, g, b] = hexArr.map(convertHexUnitTo256)
+
+  return `${r}, ${g}, ${b}`
+}
+
+export const baseThemeColors = [
+  themeV2Colors['royal-blue'].DEFAULT,
+  '#2D7FF9',
+  '#18BFFF',
+  '#0C4E65',
+  '#EC2CBD',
+  '#F82B60',
+  '#F57134',
+  '#1BAF2C',
+  '#8B46FF',
+  '#1B51A2',
+  '#146C8E',
+  '#24716E',
+  '#8A2170',
+  '#941737',
+  '#B94915',
+  '#0E4C15',
+  '#381475',
+  '#333333',
+]
+
+export const baseIconColors = ['#36BFFF', '#FA8231', '#FCBE3A', '#27D665', '#6A7184', '#FF4A3F', '#FC3AC6', '#7D26CD']
+
+const designSystem = {
+  light: [
+    // '#EBF0FF',
+    // '#D6E0FF',
+    // '#ADC2FF',
+    // '#85A3FF',
+    // '#5C85FF',
+    '#3366FF',
+    '#2952CC',
+    '#1F3D99',
+    '#142966',
+    '#0A1433',
+    // '#FCFCFC',
+    // '#F9F9FA',
+    // '#F4F4F5',
+    // '#E7E7E9',
+    // '#D5D5D9',
+    // '#9AA2AF',
+    // '#6A7184',
+    '#4A5268',
+    '#374151',
+    '#1F293A',
+    '#101015',
+    // '#FFF2F1',
+    // '#FFDBD9',
+    // '#FFB7B2',
+    // '#FF928C',
+    // '#FF6E65',
+    // '#FF4A3F',
+    '#E8463C',
+    '#CB3F36',
+    '#B23830',
+    '#7D2721',
+    // '#FFEEFB',
+    // '#FED8F4',
+    // '#FEB0E8',
+    // '#FD89DD',
+    // '#FD61D1',
+    '#FC3AC6',
+    '#CA2E9E',
+    '#972377',
+    '#65174F',
+    '#320C28',
+    // '#FFF5EF',
+    // '#FEE6D6',
+    // '#FDCDAD',
+    // '#FCB483',
+    // '#FB9B5A',
+    '#FA8231',
+    '#E1752C',
+    '#C86827',
+    '#964E1D',
+    '#4B270F',
+
+    // '#F3ECFA',
+    // '#E5D4F5',
+    // '#CBA8EB',
+    // '#B17DE1',
+    // '#9751D7',
+    '#7D26CD',
+    '#641EA4',
+    '#4B177B',
+    '#320F52',
+    '#190829',
+
+    // '#EDF9FF',
+    // '#D7F2FF',
+    // '#AFE5FF',
+    // '#86D9FF',
+    // '#5ECCFF',
+    '#36BFFF',
+    '#2B99CC',
+    '#207399',
+    '#164C66',
+    '#0B2633',
+    // '#fffbf2',
+    // '#fff0d1',
+    // '#fee5b0',
+    // '#fdd889',
+    // '#fdcb61',
+    // '#fcbe3a',
+    '#ca982e',
+    '#977223',
+    '#654c17',
+    '#32260c',
+  ],
+  dark: [],
+}
+
+// convert string into a unique color
+export const stringToColor = (input: string, colorArray = designSystem.light) => {
+  // Calculate a numeric hash value from the input string
+  let hash = 0
+  for (let i = 0; i < input.length; i++) {
+    hash = input.charCodeAt(i) + ((hash << 5) - hash)
+  }
+
+  // Ensure the hash value is within the array length
+  const index = Math.abs(hash) % colorArray.length
+
+  // Return the selected color
+  return colorArray[index]
+}
+
+// Function to convert hex color to RGB
+function hexToRGBObject(hexColor: string) {
+  // Remove '#' if present in the hexColor
+  hexColor = hexColor.replace(/^#/, '')
+
+  // Split the hexColor into red, green, and blue components
+  const r = parseInt(hexColor.substring(0, 2), 16)
+  const g = parseInt(hexColor.substring(2, 4), 16)
+  const b = parseInt(hexColor.substring(4, 6), 16)
+
+  return { r, g, b }
+}
+
+export function isColorDark(hexColor: string, threshold = 128) {
+  const rgbColor = hexToRGBObject(hexColor)
+
+  const luminance = 0.299 * rgbColor.r + 0.587 * rgbColor.g + 0.114 * rgbColor.b
+  return luminance < threshold
+}
+
+export function getEnumColorByIndex(i: number, mode: 'light' | 'dark' = 'light') {
+  return enumColor[mode][i % enumColor[mode].length]
+}
+
+export function hexToRgb(hex: string) {
+  const cleaned = hex.replace('#', '')
+  const bigint = parseInt(cleaned, 16)
+  const r = (bigint >> 16) & 255
+  const g = (bigint >> 8) & 255
+  const b = bigint & 255
+  return `${r}, ${g}, ${b}`
+}
+
+export function flattenColors(colors: Record<string, any>, prefix = ''): Record<string, string> {
+  const result: Record<string, string> = {}
+
+  Object.entries(colors).forEach(([key, value]) => {
+    const newKey = prefix ? (key === 'DEFAULT' ? prefix : `${prefix}-${key}`) : key
+
+    if (typeof value === 'string') {
+      result[newKey] = value
+    } else {
+      Object.assign(result, flattenColors(value, newKey))
+    }
+  })
+
+  return result
+}
+
+export function ncBuildColorsWithOpacity(colors: Record<string, any>, prefix: string = ''): Record<string, any> {
+  const flat = flattenColors(colors, prefix)
+
+  const result: Record<string, any> = {}
+
+  Object.entries(flat).forEach(([key, value]) => {
+    const rgb = value.startsWith('#') ? hexToRgb(value) : `var(${value})`
+
+    // UnoCSS substitutes <alpha-value> with the utility's alpha (1 when unspecified),
+    // replacing WindiCSS's opacityVariable/opacityValue callback form.
+    result[key] = `rgba(${rgb}, <alpha-value>)`
+  })
+
+  return result
+}
+
+export const themeV4Colors = {
+  base: { white: '--rgb-color-base-white', black: '--rgb-color-base-black' },
+  brand: {
+    inverted: '--rgb-nc-bg-brand-inverted',
+    20: '--rgb-color-brand-20',
+    50: '--rgb-color-brand-50',
+    100: '--rgb-color-brand-100',
+    200: '--rgb-color-brand-200',
+    300: '--rgb-color-brand-300',
+    400: '--rgb-color-brand-400',
+    500: '--rgb-color-brand-500',
+    600: '--rgb-color-brand-600',
+    700: '--rgb-color-brand-700',
+    800: '--rgb-color-brand-800',
+    900: '--rgb-color-brand-900',
+  },
+  gray: {
+    10: '#FCFCFC',
+    20: '--rgb-color-gray-20',
+    50: '--rgb-color-gray-50',
+    100: '--rgb-color-gray-100',
+    200: '--rgb-color-gray-200',
+    300: '--rgb-color-gray-300',
+    400: '--rgb-color-gray-400',
+    500: '--rgb-color-gray-500',
+    600: '--rgb-color-gray-600',
+    700: '--rgb-color-gray-700',
+    800: '--rgb-color-gray-800',
+    900: '--rgb-color-gray-900',
+  },
+  red: {
+    20: '--rgb-color-red-20',
+    50: '--rgb-color-red-50',
+    100: '--rgb-color-red-100',
+    200: '--rgb-color-red-200',
+    300: '--rgb-color-red-300',
+    400: '--rgb-color-red-400',
+    500: '--rgb-color-red-500',
+    600: '--rgb-color-red-600',
+    700: '--rgb-color-red-700',
+    800: '--rgb-color-red-800',
+    900: '--rgb-color-red-900',
+  },
+  pink: {
+    20: '--rgb-color-pink-20',
+    50: '--rgb-color-pink-50',
+    100: '--rgb-color-pink-100',
+    200: '--rgb-color-pink-200',
+    300: '--rgb-color-pink-300',
+    400: '--rgb-color-pink-400',
+    500: '--rgb-color-pink-500',
+    600: '--rgb-color-pink-600',
+    700: '--rgb-color-pink-700',
+    800: '--rgb-color-pink-800',
+    900: '--rgb-color-pink-900',
+  },
+  orange: {
+    20: '--rgb-color-orange-20',
+    50: '--rgb-color-orange-50',
+    100: '--rgb-color-orange-100',
+    200: '--rgb-color-orange-200',
+    300: '--rgb-color-orange-300',
+    400: '--rgb-color-orange-400',
+    500: '--rgb-color-orange-500',
+    600: '--rgb-color-orange-600',
+    700: '--rgb-color-orange-700',
+    800: '--rgb-color-orange-800',
+    900: '--rgb-color-orange-900',
+  },
+  purple: {
+    20: '--rgb-color-purple-20',
+    50: '--rgb-color-purple-50',
+    100: '--rgb-color-purple-100',
+    200: '--rgb-color-purple-200',
+    300: '--rgb-color-purple-300',
+    400: '--rgb-color-purple-400',
+    500: '--rgb-color-purple-500',
+    600: '--rgb-color-purple-600',
+    700: '--rgb-color-purple-700',
+    800: '--rgb-color-purple-800',
+    900: '--rgb-color-purple-900',
+  },
+  blue: {
+    20: '--rgb-color-blue-20',
+    50: '--rgb-color-blue-50',
+    100: '--rgb-color-blue-100',
+    200: '--rgb-color-blue-200',
+    300: '--rgb-color-blue-300',
+    400: '--rgb-color-blue-400',
+    500: '--rgb-color-blue-500',
+    600: '--rgb-color-blue-600',
+    700: '--rgb-color-blue-700',
+    800: '--rgb-color-blue-800',
+    900: '--rgb-color-blue-900',
+  },
+  yellow: {
+    20: '--rgb-color-yellow-20',
+    50: '--rgb-color-yellow-50',
+    100: '--rgb-color-yellow-100',
+    200: '--rgb-color-yellow-200',
+    300: '--rgb-color-yellow-300',
+    400: '--rgb-color-yellow-400',
+    500: '--rgb-color-yellow-500',
+    600: '--rgb-color-yellow-600',
+    700: '--rgb-color-yellow-700',
+    800: '--rgb-color-yellow-800',
+    900: '--rgb-color-yellow-900',
+  },
+  maroon: {
+    20: '--rgb-color-maroon-20',
+    50: '--rgb-color-maroon-50',
+    100: '--rgb-color-maroon-100',
+    200: '--rgb-color-maroon-200',
+    300: '--rgb-color-maroon-300',
+    400: '--rgb-color-maroon-400',
+    500: '--rgb-color-maroon-500',
+    600: '--rgb-color-maroon-600',
+    700: '--rgb-color-maroon-700',
+    800: '--rgb-color-maroon-800',
+    900: '--rgb-color-maroon-900',
+  },
+  green: {
+    20: '--rgb-color-green-20',
+    50: '--rgb-color-green-50',
+    100: '--rgb-color-green-100',
+    200: '--rgb-color-green-200',
+    300: '--rgb-color-green-300',
+    400: '--rgb-color-green-400',
+    500: '--rgb-color-green-500',
+    600: '--rgb-color-green-600',
+    700: '--rgb-color-green-700',
+    800: '--rgb-color-green-800',
+    900: '--rgb-color-green-900',
+  },
+}
+
+/**
+ * In our WindiCSS config, we already added `themeV3Colors`.
+ * To add `themeV4Colors` without conflicts, we create a new object
+ * with all top-level keys prefixed by `nc-` (e.g., `gray` → `nc-gray`).
+ *
+ * This keeps both V3 and V4 colors available in the theme without overwriting each other.
+ */
+export const themeV4ColorsWithNcPrefix: {
+  [K in keyof typeof themeV4Colors as `nc-${K}`]: (typeof themeV4Colors)[K]
+} = Object.entries(themeV4Colors).reduce((acc, [key, value]) => {
+  acc[`nc-${key}` as `nc-${string}`] = value
+  return acc
+}, {} as any)
+
+/**
+ * ### Light Theme Configuration
+ * In this project, we've integrated a custom WindiCSS configuration that aligns with our Figma design system.
+ * This setup introduces shorthand class names for various UI elements like text color, border color,
+ * background color, and more. The goal is to ensure design consistency and streamline the development
+ * process by directly reflecting Figma styles in our codebase.
+ *
+ * #### Why We Introduced This
+ *
+ * The light theme was introduced to:
+ * - **Maintain Consistency**: Ensures that the color scheme used in the design (Figma) is reflected accurately in the codebase.
+ * - **Ease of Use**: Simplifies the application of colors by using intuitive, design-referenced class names.
+ *
+ * #### Usage
+ *
+ * The configuration extends WindiCSS with custom screens, font sizes, font weights, colors, and other utilities.
+ * These can be used directly in files through class names.
+ *
+ * ###### Text Color
+ * To apply a text color, you can use:
+ * ```html
+ * <p class="text-nc-content-gray-subtle">This is subtle gray text.</p>
+ * ```
+ *
+ * ###### Border Color
+ * To apply a border color, you can use:
+ * ```html
+ * <div class="border-nc-border-gray-light">This div has a light gray border.</div>
+ * ```
+ *
+ * ###### Background Color
+ * To apply a background color, you can use:
+ * ```html
+ * <div class="bg-nc-bg-brand">This div has a brand color background.</div>
+ * <div class="bg-nc-bg-blue-dark">This div has a blue dark color background.</div>
+ * ```
+ *
+ * ###### Fill Color
+ * light theme fill colors are globally extended in WindiCSS and can be used for various purposes such as:
+ * - **SVG Fill**:
+ * ```html
+ * <svg class="fill-nc-fill-primary">...</svg>
+ * ```
+ * - **Text Color**:
+ * ```html
+ * <p class="text-nc-fill-red-dark">...</p>
+ * ```
+ * - **Border Color**:
+ * ```html
+ * <div class="border-nc-fill-primary">...</div>
+ * ```
+ * - **Background Color**:
+ * ```html
+ * <div class="bg-nc-fill-primary-hover">...</div>
+ * ```
+ * This setup ensures that your styles are consistent with your design specifications and easily maintainable across the project.
+ */
+export const themeVariables = {
+  content: {
+    'nc-content-gray': {
+      extreme: themeV4Colors.base.black,
+      emphasis: themeV4Colors.gray[900],
+      DEFAULT: themeV4Colors.gray[800],
+      subtle: themeV4Colors.gray[700],
+      subtle2: themeV4Colors.gray[600],
+      muted: themeV4Colors.gray[500],
+      disabled: themeV4Colors.gray[400],
+    },
+    'nc-content-brand': {
+      DEFAULT: themeV4Colors.brand[500],
+      disabled: themeV4Colors.brand[600],
+      hover: themeV4Colors.gray[300],
+    },
+    'nc-content-inverted-primary': {
+      DEFAULT: themeV4Colors.base.white,
+      hover: themeV4Colors.base.white,
+      disabled: themeV4Colors.gray[500],
+    },
+    'nc-content-inverted-secondary': {
+      DEFAULT: themeV4Colors.gray[700],
+      hover: themeV4Colors.gray[700],
+      disabled: themeV4Colors.gray[500],
+    },
+    'nc-content-red': {
+      dark: themeV4Colors.red[700],
+      medium: themeV4Colors.red[500],
+      light: themeV4Colors.red[300],
+    },
+    'nc-content-green': {
+      dark: themeV4Colors.green[700],
+      medium: themeV4Colors.green[500],
+      light: themeV4Colors.green[300],
+    },
+    'nc-content-yellow': {
+      dark: themeV4Colors.yellow[700],
+      medium: themeV4Colors.yellow[500],
+      light: themeV4Colors.yellow[300],
+    },
+    'nc-content-blue': {
+      dark: themeV4Colors.blue[700],
+      medium: themeV4Colors.blue[500],
+      light: themeV4Colors.blue[300],
+    },
+    'nc-content-purple': {
+      dark: themeV4Colors.purple[700],
+      medium: themeV4Colors.purple[500],
+      light: themeV4Colors.purple[300],
+    },
+    'nc-content-pink': {
+      dark: themeV4Colors.pink[700],
+      medium: themeV4Colors.pink[500],
+      light: themeV4Colors.pink[300],
+    },
+    'nc-content-orange': {
+      dark: themeV4Colors.orange[700],
+      medium: themeV4Colors.orange[500],
+      light: themeV4Colors.orange[300],
+    },
+    'nc-content-maroon': {
+      dark: themeV4Colors.maroon[700],
+      medium: themeV4Colors.maroon[500],
+      light: themeV4Colors.maroon[300],
+    },
+  },
+  background: {
+    'nc-bg-default': themeV4Colors.base.white,
+    // Dedicated surface tokens — chrome and overlays no longer share the gray ramp
+    'nc-bg-elevated': '--rgb-nc-bg-elevated',
+    'nc-bg-canvas': '--rgb-nc-bg-canvas',
+    // hover twin is a derived color-mix in dark, so it has no rgb triplet and no
+    // utility — consume it as raw var(--nc-bg-card-hover)
+    'nc-bg-card': '--rgb-nc-bg-card',
+    'nc-bg-brand': {
+      DEFAULT: themeV4Colors.brand[50],
+      inverted: themeV4Colors.brand.inverted,
+    },
+    'nc-bg-gray': {
+      extralight: themeV4Colors.gray[50],
+      sidebar: '--rgb-color-sidebar-bg',
+      minisidebar: '--rgb-color-minisidebar-bg',
+      light: themeV4Colors.gray[100],
+      medium: themeV4Colors.gray[200],
+      dark: themeV4Colors.gray[300],
+      extradark: themeV4Colors.gray[400],
+    },
+    'nc-bg-red': {
+      light: themeV4Colors.red[50],
+      dark: themeV4Colors.red[100],
+    },
+    'nc-bg-green': {
+      light: themeV4Colors.green[50],
+      dark: themeV4Colors.green[100],
+    },
+    'nc-bg-yellow': {
+      light: themeV4Colors.yellow[50],
+      dark: themeV4Colors.yellow[100],
+    },
+    'nc-bg-blue': {
+      light: themeV4Colors.blue[50],
+      dark: themeV4Colors.blue[100],
+    },
+    'nc-bg-purple': {
+      light: themeV4Colors.purple[50],
+      dark: themeV4Colors.purple[100],
+    },
+    'nc-bg-pink': {
+      light: themeV4Colors.pink[50],
+      dark: themeV4Colors.pink[100],
+    },
+    'nc-bg-orange': {
+      light: themeV4Colors.orange[50],
+      dark: themeV4Colors.orange[100],
+    },
+    'nc-bg-maroon': {
+      light: themeV4Colors.maroon[50],
+      dark: themeV4Colors.maroon[100],
+    },
+  },
+  border: {
+    'nc-border-brand': {
+      DEFAULT: themeV4Colors.brand[500],
+      medium: themeV4Colors.brand[200],
+    },
+    'nc-border-gray': {
+      extralight: themeV4Colors.gray[50],
+      light: themeV4Colors.gray[100],
+      medium: themeV4Colors.gray[200],
+      dark: themeV4Colors.gray[300],
+      extradark: themeV4Colors.gray[400],
+      underline: themeV4Colors.gray[600],
+    },
+    'nc-border-red': {
+      DEFAULT: themeV4Colors.red[500],
+    },
+    'nc-border-green': {
+      DEFAULT: themeV4Colors.green[500],
+    },
+    'nc-border-yellow': {
+      DEFAULT: themeV4Colors.yellow[500],
+    },
+    'nc-border-blue': {
+      DEFAULT: themeV4Colors.blue[500],
+    },
+    'nc-border-purple': {
+      DEFAULT: themeV4Colors.purple[500],
+      medium: themeV4Colors.purple[200],
+      light: themeV4Colors.purple[100],
+    },
+    'nc-border-pink': {
+      DEFAULT: themeV4Colors.pink[500],
+    },
+    'nc-border-orange': {
+      DEFAULT: themeV4Colors.orange[500],
+    },
+    'nc-border-maroon': {
+      DEFAULT: themeV4Colors.maroon[500],
+    },
+  },
+  fill: {
+    'nc-fill-primary': {
+      DEFAULT: themeV4Colors.brand[500],
+      hover: themeV4Colors.brand[600],
+      disabled: themeV4Colors.gray[300],
+      disabled2: themeV4Colors.brand[200],
+    },
+    'nc-fill-secondary': {
+      DEFAULT: themeV4Colors.base.white,
+      hover: themeV4Colors.gray[50],
+      disabled: themeV4Colors.base.white,
+    },
+    'nc-fill-warning': {
+      DEFAULT: themeV4Colors.red[500],
+      hover: themeV4Colors.red[600],
+      disabled: themeV4Colors.gray[50],
+    },
+    'nc-fill-success': {
+      DEFAULT: themeV4Colors.green[500],
+      hover: themeV4Colors.green[600],
+      disabled: themeV4Colors.gray[50],
+    },
+    'nc-fill-red': {
+      dark: themeV4Colors.red[700],
+      medium: themeV4Colors.red[500],
+      light: themeV4Colors.red[300],
+    },
+    'nc-fill-green': {
+      dark: themeV4Colors.green[700],
+      medium: themeV4Colors.green[500],
+      light: themeV4Colors.green[300],
+    },
+    'nc-fill-yellow': {
+      dark: themeV4Colors.yellow[700],
+      medium: themeV4Colors.yellow[500],
+      light: themeV4Colors.yellow[300],
+    },
+    'nc-fill-blue': {
+      dark: themeV4Colors.blue[700],
+      medium: themeV4Colors.blue[500],
+      light: themeV4Colors.blue[300],
+    },
+    'nc-fill-purple': {
+      dark: themeV4Colors.purple[700],
+      medium: themeV4Colors.purple[500],
+      light: themeV4Colors.purple[300],
+    },
+    'nc-fill-pink': {
+      dark: themeV4Colors.pink[700],
+      medium: themeV4Colors.pink[500],
+      light: themeV4Colors.pink[300],
+    },
+    'nc-fill-orange': {
+      dark: themeV4Colors.orange[700],
+      medium: themeV4Colors.orange[500],
+      light: themeV4Colors.orange[300],
+    },
+    'nc-fill-maroon': {
+      dark: themeV4Colors.maroon[700],
+      medium: themeV4Colors.maroon[500],
+      light: themeV4Colors.maroon[300],
+    },
+  },
+}
+
+/** Tinted identity tile derived from a brand swatch — a glyph on a tinted surface. */
+export interface IconTileTint {
+  /** Tile background — the swatch hue at ~94% lightness. */
+  bg: string
+  /** Tile border — one step deeper than the background. */
+  border: string
+  /** Glyph tone — the swatch darkened (and slightly desaturated) ~15%. */
+  glyph: string
+}
+
+/**
+ * Derive an identity tile tint from a swatch colour:
+ * bg ≈ 92–94% lightness of the swatch hue, border one step deeper,
+ * glyph the swatch darkened ~15% (e.g. sky → #E5F4FC / #C9E8F7 / #2E9FD6).
+ *
+ * With `isDark`, the pastel flips to a deep tinted surface (same hue,
+ * desaturated and compressed to ~16% lightness — mirroring `getAdaptiveTint`'s
+ * dark treatment) with the glyph lightened instead of darkened, so the tile
+ * sits above a dark card (#1d1d1f) instead of glowing on it. Callers derive
+ * the tint inside a computed over `useTheme().isDark` to stay theme-reactive.
+ */
+export function getIconTileTint(color: string, isDark = false): IconTileTint {
+  const hsl = tinycolor(color).toHsl()
+
+  if (isDark) {
+    return {
+      bg: tinycolor({ h: hsl.h, s: hsl.s * 0.45, l: 0.16 }).toHexString(),
+      border: tinycolor({ h: hsl.h, s: hsl.s * 0.45, l: 0.24 }).toHexString(),
+      glyph: tinycolor(color).lighten(10).desaturate(10).toHexString(),
+    }
+  }
+
+  return {
+    bg: tinycolor({ h: hsl.h, s: hsl.s, l: 0.94 }).toHexString(),
+    border: tinycolor({ h: hsl.h, s: hsl.s, l: 0.88 }).toHexString(),
+    glyph: tinycolor(color).darken(15).desaturate(15).toHexString(),
+  }
+}
+
+/**
+ * Hue families offered in the "Default colours" grid, in spectrum order.
+ *
+ * `maroon` is not offered: its 500 sits 15° from pink's, so the two columns read as
+ * one colour twice. It stays in `themeV3Colors` for its ~175 existing usages. Teal
+ * takes the slot — nothing else in the palette lands within 21° of it.
+ */
+const DEFAULT_PALETTE_HUES = ['gray', 'red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink'] as const
+
+/** Ramp stops for the three light rows: wash, tint, vivid. 500 is peak chroma in every ramp. */
+const DEFAULT_PALETTE_TONES = ['100', '300', '500'] as const
+
+/** The surface a dark-mode chip sits on, and the separation the deep row has to keep from it. */
+const DARK_CHIP_SURFACE = '#171717'
+const DEEP_TILE_MIN_CONTRAST = 1.5
+
+/**
+ * The "Default colours" swatch grid — one row per tier, one column per hue.
+ *
+ * The full 50–900 ramps offered 90 swatches resolving to far fewer colours anyone
+ * can tell apart: adjacent shades sit ΔE2000 0–4 apart, and in dark mode all 90
+ * collapsed into 15 groups. Four tiers keep every swatch distinct.
+ *
+ * The vivid row is deliberately NOT levelled by luminance. A luminance-levelled row
+ * has to drag yellow down to an olive and green to a forest to match how dark a
+ * saturated blue is — the row goes level and every colour in it goes dull. Chroma is
+ * what the row has in common; brightness is not, and shouldn't be: vivid luminance
+ * runs 0.10 (purple) to 0.58 (yellow), and that spread is the point.
+ *
+ * Colours no longer offered still render wherever they were already saved — the
+ * picker routes an unrecognised value to its Custom colours tab.
+ */
+export const chipPaletteColors: string[][] = [
+  ...DEFAULT_PALETTE_TONES.map((tone) => DEFAULT_PALETTE_HUES.map((hue) => themeV3Colors[hue][tone])),
+  // Deep row: as low as each ramp goes while the tile still separates from the dark
+  // surface. A flat 800 sinks gray and purple to 1.13:1 there — a chip you cannot see.
+  DEFAULT_PALETTE_HUES.map((hue) => {
+    const stops = Object.values(themeV3Colors[hue]) as string[]
+    const legible = stops.filter((hex) => tinycolor.readability(hex, DARK_CHIP_SURFACE) >= DEEP_TILE_MIN_CONTRAST)
+
+    return legible[legible.length - 1] ?? stops[stops.length - 1]
+  }),
+]
+
+/** Hue order of the untrimmed grid — as it shipped, with teal slotted beside green. */
+const FULL_PALETTE_HUES = ['gray', 'red', 'green', 'teal', 'yellow', 'orange', 'pink', 'maroon', 'purple', 'blue'] as const
+
+/**
+ * Every stop of every ramp — one row per hue, 50 through 900.
+ *
+ * Still the right set wherever a swatch becomes a foreground (a checkbox tick, a
+ * rating star, a Colour cell's value): those paint on a normal surface, where all
+ * ten shades stay distinct. `chipPaletteColors` is for swatches that become chips.
+ */
+export const fullPaletteColors: string[][] = FULL_PALETTE_HUES.map((hue) =>
+  // gray carries an extra ultra-light 10 step — drop it so every row is 10 cells
+  (Object.values(themeV3Colors[hue]) as string[]).slice(hue === 'gray' ? 1 : 0),
+)
+
+/** HSV chroma — how colourful, independent of how light. */
+const chromaOf = (color: tinycolor.Instance) => {
+  const { s, v } = color.toHsv()
+
+  return s * v
+}
+
+export const getAdaptiveTint = (
+  color: string,
+  opts?: {
+    isDarkMode?: boolean
+    saturationMod?: number
+    brightnessMod?: number
+    shade?: number // darker
+    tint?: number // lighter
+  },
+) => {
+  const { isDarkMode, shade = 0, tint = 0 } = opts || {}
+
+  const { saturationMod = 0, brightnessMod = 0 } = opts || {}
+
+  const base = tinycolor(color)
+  const hsv = base.toHsv()
+
+  const isGray = hsv.s < 0.01
+  let s = hsv.s
+  let v = hsv.v
+
+  //
+  // --- STEP 1: ORIGINAL BASE LOGIC (unchanged for light mode) ---
+  //
+  if (!isDarkMode) {
+    // LIGHT MODE — keep exactly your original behavior (no extra dark/light here)
+    const safeS = isGray ? 0 : Math.min(100, 5 + saturationMod)
+    const safeV = Math.min(100, (isGray ? 97 : 100) + brightnessMod)
+    s = safeS
+    v = safeV
+  } else {
+    //
+    // 🌙 DARK MODE — softer, not too dark
+    //
+
+    // Reduce saturation (avoid neon). Target ~40–55%
+    s = isGray ? 0 : hsv.s * 0.45
+
+    // Deep darkness curve — compress v to ~0.08–0.14
+    v = hsv.v * 0.25 + 0.06 + brightnessMod * 0.005
+
+    // Hard clamp for reliable ultra-dark look
+    v = Math.max(0.08, Math.min(0.14, v))
+
+    // gentle shade/tint
+    if (shade) v = Math.max(0.06, v - shade * 0.004)
+    if (tint) v = Math.min(0.16, v + tint * 0.004)
+  }
+
+  return tinycolor({ h: hsv.h, s, v }).toHexString()
+}
+
+/** Contrast a chip label aims for. Not every background can reach it — see getReadableInkColor. */
+const INK_CONTRAST_TARGET = 7
+
+/** Lightness bounds for the solved ink — pure #000/#fff is reserved for the fallback. */
+const INK_L_BOUNDS = { min: 0.05, max: 0.985 }
+
+const inkColorCache = new Map<string, string>()
+
+/**
+ * Label colour for a coloured chip: the option's own hue, pushed along lightness
+ * until it clears the contrast target against the background it will sit on.
+ *
+ * Replaces a pass/fail flip between the option colour and pure white, which fired
+ * at a different shade in every hue family — across the 90 default options that
+ * spanned 3.2:1–17.5:1 in dark and left seven of them below AA. Solving instead of
+ * flipping puts every chip on the same weight.
+ *
+ * The target is deliberately mode-independent: it depends on the background, not the
+ * theme, so a swatch whose background survives `getAdaptiveChipTint` untouched renders
+ * identically in light and dark.
+ *
+ * `hueSource` is the raw option colour — an inverted dark background is a deep tint
+ * that has lost most of the hue, so the label has to take it from the option. Where a
+ * mid-tone background can't reach the target with its own hue, the ink desaturates in
+ * steps and finally falls back to white / near-black — no worse than the flip it
+ * replaces.
+ */
+export const getReadableInkColor = (background: string, hueSource?: string): string => {
+  const cacheKey = `${background}|${hueSource ?? ''}`
+
+  const cached = inkColorCache.get(cacheKey)
+  if (cached) return cached
+
+  const bg = tinycolor(background)
+  const { h, s } = tinycolor(hueSource || background).toHsl()
+  const bgL = bg.toHsl().l
+  const target = INK_CONTRAST_TARGET
+
+  // Which way the ink has to travel — lighter on a dark chip, darker on a light one.
+  const up = tinycolor.readability(bg, '#ffffff') >= tinycolor.readability(bg, '#000000')
+  const baseS = Math.min(s * (up ? 0.72 : 0.9), 0.62)
+
+  let ink = up ? '#ffffff' : '#0b0b0e'
+
+  for (const satScale of [1, 0.7, 0.45, 0.2, 0]) {
+    const inkS = baseS * satScale
+
+    // Contrast is monotonic in lightness, so the extreme tells us whether this
+    // saturation can reach the target at all before we bother searching.
+    if (tinycolor.readability(bg, tinycolor({ h, s: inkS, l: up ? INK_L_BOUNDS.max : INK_L_BOUNDS.min })) < target) continue
+
+    let lo = up ? bgL : INK_L_BOUNDS.min
+    let hi = up ? INK_L_BOUNDS.max : bgL
+    let best = tinycolor({ h, s: inkS, l: up ? INK_L_BOUNDS.max : INK_L_BOUNDS.min })
+
+    // Closest lightness to the background that still clears the target, so the
+    // label stays a tint of the option rather than slamming to the extreme.
+    for (let i = 0; i < 18; i++) {
+      const mid = (lo + hi) / 2
+      const candidate = tinycolor({ h, s: inkS, l: mid })
+
+      if (tinycolor.readability(bg, candidate) >= target) {
+        best = candidate
+        if (up) hi = mid
+        else lo = mid
+      } else if (up) {
+        lo = mid
+      } else {
+        hi = mid
+      }
+    }
+
+    ink = best.toHexString()
+    break
+  }
+
+  // Custom option colours are unbounded — drop the cache rather than grow forever.
+  if (inkColorCache.size > 2000) inkColorCache.clear()
+
+  inkColorCache.set(cacheKey, ink)
+
+  return ink
+}
+
+/**
+ * A colour inverts in dark mode when it is light AND washed out — i.e. a pastel.
+ * Luminance alone is the wrong test: a vivid yellow is lighter than a pastel purple
+ * and still has to carry through, the way a bright swatch does in any dark UI.
+ */
+const CHIP_INVERT_LUMINANCE = 0.24
+const CHIP_INVERT_CHROMA = 0.55
+
+/**
+ * An inverted chip is the dark surface lifted with a little white, carrying only a
+ * trace of its hue — roughly a 6–10% white overlay. The colour does not stay in the
+ * background; it moves into the label. Tinting the background with the hue instead
+ * produced a muddy tile that read as a disabled chip.
+ *
+ * These are the luminances the lift lands on, solved rather than set as a lightness
+ * so the rows stay level across hues. The gap between them is wide on purpose: at a
+ * narrower one the two pastel rows landed within ΔE 1.3 of each other for four hues
+ * and read as a single row. Depth normalises over `CHIP_PASTEL_SPAN`, not over the
+ * whole 0–1 range — normalising over the latter meant the wash target was only
+ * reachable at a luminance no real colour has, so the row settled mid-range.
+ */
+const CHIP_LIFT_TARGET = { tint: 0.075, wash: 0.022 }
+const CHIP_LIFT_HUE_STRENGTH = 0.22
+
+/** Luminance range the pastel tiers actually occupy — what the lift depth normalises over. */
+const CHIP_PASTEL_SPAN = 0.68
+
+/**
+ * The label on a lifted chip is the option's own colour at full strength, lightened
+ * only as far as the floor demands — the least-light value that clears it, which is
+ * also the most colourful. Solving to a high contrast target instead washes the
+ * label out to a pastel and loses the one place the colour still lives.
+ */
+const CHIP_SOLID_INK_FLOOR = 5
+const CHIP_SOLID_INK_SATURATION = 0.8
+
+const chipCache = new Map<string, { bg: string; ink: string }>()
+
+/** Bisect HSL lightness for the lowest value satisfying a predicate monotonic in l. */
+const solveLightness = (predicate: (l: number) => boolean, lo: number, hi: number) => {
+  for (let i = 0; i < 18; i++) {
+    const mid = (lo + hi) / 2
+
+    if (predicate(mid)) hi = mid
+    else lo = mid
+  }
+
+  return (lo + hi) / 2
+}
+
+const liftedChipSurface = (color: tinycolor.Instance) => {
+  const { h, s } = color.toHsl()
+  // A near-grey swatch lifts to a grey tile. Our gray ramp carries hue 224, so applying
+  // the tint regardless turns it blue-violet.
+  const tileS = s < 0.05 ? 0 : CHIP_LIFT_HUE_STRENGTH
+  const depth = Math.min(1, (color.getLuminance() - CHIP_INVERT_LUMINANCE) / CHIP_PASTEL_SPAN)
+  const target = CHIP_LIFT_TARGET.tint - (CHIP_LIFT_TARGET.tint - CHIP_LIFT_TARGET.wash) * depth
+  const l = solveLightness((mid) => tinycolor({ h, s: tileS, l: mid }).getLuminance() >= target, 0.02, 0.5)
+
+  return tinycolor({ h, s: tileS, l }).toHexString()
+}
+
+const solidChipInk = (color: tinycolor.Instance, background: string) => {
+  const { h, s } = color.toHsl()
+  const inkS = s < 0.05 ? 0 : Math.max(s, CHIP_SOLID_INK_SATURATION)
+  const l = solveLightness(
+    (mid) => tinycolor.readability(background, tinycolor({ h, s: inkS, l: mid })) >= CHIP_SOLID_INK_FLOOR,
+    0.2,
+    0.95,
+  )
+
+  return tinycolor({ h, s: inkS, l }).toHexString()
+}
+
+/**
+ * Background and label for a coloured option chip, resolved together.
+ *
+ * Three cases, and they have to be decided in one place because the label rule
+ * depends on which one the background took:
+ *
+ *  - light mode — the swatch is the chip, label solved for contrast against it
+ *  - dark, vivid or deep — same, untouched, so the chip is identical in both themes
+ *  - dark, pastel — the surface lifted with white, the colour moved into the label
+ */
+export const getSelectChipColors = (color: string, isDark: boolean): { bg: string; ink: string } => {
+  const cacheKey = `${color}|${isDark ? 'd' : 'l'}`
+
+  const cached = chipCache.get(cacheKey)
+  if (cached) return cached
+
+  const parsed = tinycolor(color)
+  const inverts = isDark && parsed.getLuminance() >= CHIP_INVERT_LUMINANCE && chromaOf(parsed) < CHIP_INVERT_CHROMA
+  const bg = inverts ? liftedChipSurface(parsed) : parsed.toHexString()
+  const resolved = { bg, ink: inverts ? solidChipInk(parsed, bg) : getReadableInkColor(bg, color) }
+
+  // Custom option colours are unbounded — drop the cache rather than grow forever.
+  if (chipCache.size > 2000) chipCache.clear()
+
+  chipCache.set(cacheKey, resolved)
+
+  return resolved
+}
+
+export const getOppositeColorOfBackground = (
+  background?: string,
+  preferredText?: string,
+  fallbackColors: string[] = ['#1f293a', '#101015', '#ffffff'],
+) => {
+  const bg = background || '#cccccc'
+  const txt = preferredText || '#ffffff'
+
+  // If preferred text color is readable on this background
+  if (tinycolor.isReadable(bg, txt, { level: 'AA', size: 'large' })) {
+    return tinycolor(txt).toHex8String()
+  }
+
+  // Else choose best fallback between white & black
+  const fallback = tinycolor.mostReadable(bg, fallbackColors)
+
+  return fallback.toHex8String()
+}

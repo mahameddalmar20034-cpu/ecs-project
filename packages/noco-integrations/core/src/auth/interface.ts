@@ -1,0 +1,150 @@
+import { IntegrationWrapper } from '../integration';
+import { RateLimitOptions } from '../utils/axios';
+import { TokenData, TestConnectionResponse, AuthType, MaskableAuthConfig } from './types'
+
+/**
+ * Abstract base class for authenticated integrations.
+ */
+export abstract class AuthIntegration<TConfig = any, TClient = any> extends IntegrationWrapper<TConfig> {
+  /** The authenticated API client instance */
+  public client: TClient | null = null;
+
+  /** Whether a token refresh is currently in progress */
+  private refreshingPromise: Promise<void> | null = null;
+
+  /** Optional callback for persisting refreshed tokens (e.g., update DB) */
+  protected tokenRefreshCallback?: (tokens: TokenData) => Promise<void>;
+
+  /**
+   * Override in subclass to define per-integration rate limit behavior.
+   */
+  protected getRateLimitConfig(): RateLimitOptions | null {
+    return null; // No rate limiting by default
+  }
+
+  /**
+   * Register a callback to persist refreshed tokens.
+   */
+  public setTokenRefreshCallback(callback: (tokens: TokenData) => Promise<void>) {
+    this.tokenRefreshCallback = callback;
+  }
+
+  /**
+   * REQUIRED: the response-safe view of a config. Every auth integration owns
+   * its own masking — explicitly name your secret fields and replace their
+   * values with CREDENTIAL_MASK (see the `maskSecret` helper); drop transient
+   * material like an un-exchanged `oauth` payload. Hosts run configs through
+   * this before serialising them into any API response, and restore echoed
+   * sentinels from the stored config on update — never persist the result.
+   */
+  public abstract maskConfig(
+    config?: MaskableAuthConfig<TConfig>,
+  ): Partial<MaskableAuthConfig<TConfig>>;
+
+  /**
+   * Authenticate and initialize the API client.
+   */
+  public abstract authenticate(): Promise<TClient>;
+
+  /**
+   * Verifies that current credentials and connection are valid.
+   */
+  public abstract testConnection(): Promise<TestConnectionResponse>;
+
+  /**
+   * Optional: Exchange OAuth authorization code for tokens.
+   */
+  public exchangeToken?(oauthPayload: Record<string, any>): Promise<Record<string, any>>;
+
+  /**
+   * Optional: Refresh an expired OAuth token.
+   */
+  public refreshToken?(payload: { refresh_token: string }): Promise<Record<string, any>>;
+
+  /**
+   * Optional: Clean up client resources.
+   */
+  public destroy?(): Promise<void>;
+
+  /**
+   * Wraps a client call with token refresh & retry support.
+   * Automatically reauthenticates if needed. A given `signal` is only checked
+   * between steps; `fn` must forward it to its own request to abort mid-call.
+   */
+  public async use<T>(
+    fn: (client: TClient) => Promise<T>,
+    options?: { signal?: AbortSignal },
+  ): Promise<T> {
+    if (!this.client) {
+      this.client = await this.authenticate();
+    }
+
+    options?.signal?.throwIfAborted();
+    try {
+      return await fn(this.client);
+    } catch (err: any) {
+      if (this.shouldRefreshToken(err)) {
+        await this.refreshTokenIfNeeded();
+        if (!this.client) this.client = await this.authenticate();
+        options?.signal?.throwIfAborted();
+        return await fn(this.client);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Determines whether a given error indicates an expired/invalid token.
+   */
+  protected shouldRefreshToken(err: any): boolean {
+    const config = this.config as any;
+
+    if (config.type !== AuthType.OAuth) {
+      return false;
+    }
+
+    const status = err?.response?.status || err?.status;
+    const message = (err?.message || '').toLowerCase();
+    return (
+      [401, 403].includes(status) ||
+      message.includes('token expired') ||
+      message.includes('invalid_grant') ||
+      message.includes('unauthorized')
+    );
+  }
+
+  /**
+   * Ensures only one token refresh happens at a time.
+   */
+  private async refreshTokenIfNeeded(): Promise<void> {
+    if (this.refreshingPromise) {
+      await this.refreshingPromise; // Wait for the existing one
+      return;
+    }
+
+    if (!this.refreshToken || !(this.config as any)?.refresh_token) {
+      throw new Error('Refresh token not available for this integration');
+    }
+
+    this.refreshingPromise = (async () => {
+      try {
+        const newTokens = await this.refreshToken!({
+          refresh_token: (this.config as any).refresh_token!,
+        });
+
+        // Persist the refreshed tokens if needed
+        if (this.tokenRefreshCallback) {
+          await this.tokenRefreshCallback(newTokens as TokenData);
+        }
+
+        // Merge tokens into local config
+        Object.assign(this._config, newTokens);
+        this.client = null;
+      } finally {
+        this.refreshingPromise = null;
+      }
+    })();
+
+    await this.refreshingPromise;
+  }
+}

@@ -1,0 +1,470 @@
+import { barcodeCache } from '../components/smartsheet/grid/canvas/utils/canvas'
+import { isSharedViewRoute } from '~/utils/routeUtils'
+
+export type ThemeMode = 'system' | 'light' | 'dark'
+
+export const useTheme = createSharedComposable(() => {
+  const selectedTheme = ref<ThemeMode>('system')
+  const systemPreference = ref<'light' | 'dark'>('light')
+
+  /**
+   * Surface-scoped override: a published interface can pin its own
+   * appearance (meta.theme.mode) — the interface shell sets this while
+   * mounted and clears it on leave. Wins over the user's selection so the
+   * whole document (including body-portaled popups) follows the app.
+   */
+  const forcedTheme = ref<'light' | 'dark' | null>(null)
+
+  const router = useRouter()
+  const route = router.currentRoute
+
+  /**
+   * Some pages are used in iframe which don't support dark theme yet, so disable dark theme for them.
+   * The app-embed page is always light: it renders inside a published app's own
+   * theme, where the console's dark palette would clash with any app look.
+   */
+  const disabledDarkThemeRouteNames = [
+    'index-typeOrId-pricing',
+    'index-typeOrId-checkout-planId',
+    'interface-embed-interfaceId-pageId',
+  ]
+
+  const isThemeEnabled = computed(() => {
+    return !disabledDarkThemeRouteNames.includes(route.value.name as string)
+  })
+
+  const isDark = computed(() => {
+    if (!isThemeEnabled.value) {
+      return false
+    }
+    if (forcedTheme.value) {
+      return forcedTheme.value === 'dark'
+    }
+    if (selectedTheme.value === 'system') {
+      return systemPreference.value === 'dark'
+    }
+    return selectedTheme.value === 'dark'
+  })
+
+  const applyTheme = (dark: boolean) => {
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.add('theme-transition-off')
+
+      if (dark) {
+        document.documentElement.setAttribute('theme', 'dark')
+        document.documentElement.style.colorScheme = 'dark'
+
+        /**
+         * WindiCSS config uses `darkMode: 'class'`, so we add the `dark` class
+         * to `<html>` to enable `dark:` prefix-based utilities.
+         *
+         * We support dark mode globally using CSS variables defined for both
+         * `:root` (light theme) and `[theme='dark']` (dark theme).
+         *
+         * The `dark:` prefixed classes are used to selectively override the
+         * globally applied styles in dark mode, making it possible to combine
+         * global theme variables (`var(...)`) with per-component dark overrides.
+         */
+
+        if (!document.documentElement.classList.contains('dark')) {
+          document.documentElement.classList.add('dark')
+        }
+      } else {
+        document.documentElement.removeAttribute('theme')
+        document.documentElement.classList.remove('dark')
+        document.documentElement.style.colorScheme = 'light'
+      }
+
+      forcedNextTick(() => {
+        document.documentElement.classList.remove('theme-transition-off')
+      })
+    }
+  }
+
+  const setTheme = (theme: ThemeMode) => {
+    selectedTheme.value = theme
+
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('nc-theme', theme)
+    }
+  }
+
+  const toggleTheme = () => {
+    const nextTheme = {
+      system: 'light',
+      light: 'dark',
+      dark: 'system',
+    }
+
+    setTheme((nextTheme[selectedTheme.value] as ThemeMode) ?? 'light')
+  }
+
+  /**
+   * Cached version for better performance in canvas rendering
+   */
+  const colorCache = new Map<string, string>()
+
+  /**
+   * Converts any color format to rgba with specified opacity
+   * @param color - Color in hex, rgb, or rgba format
+   * @param opacity - Opacity value between 0 and 1
+   * @returns Color in rgba format
+   */
+  const convertToRgba = (color: string, opacity: number): string => {
+    // If already rgba, extract rgb values and apply new opacity
+    if (color.startsWith('rgba')) {
+      const rgbaMatch = color.match(/rgba?\(([^)]+)\)/)
+      if (rgbaMatch) {
+        const values = rgbaMatch[1].split(',').map((v) => v.trim())
+        const r = values[0]
+        const g = values[1]
+        const b = values[2]
+        return `rgba(${r}, ${g}, ${b}, ${opacity})`
+      }
+    }
+
+    // If rgb, extract values and add opacity
+    if (color.startsWith('rgb')) {
+      const rgbMatch = color.match(/rgb\(([^)]+)\)/)
+      if (rgbMatch) {
+        const values = rgbMatch[1].split(',').map((v) => v.trim())
+        const r = values[0]
+        const g = values[1]
+        const b = values[2]
+        return `rgba(${r}, ${g}, ${b}, ${opacity})`
+      }
+    }
+
+    // If hex, convert to rgba
+    if (color.startsWith('#')) {
+      const hex = color.replace('#', '')
+      let r: number, g: number, b: number
+
+      if (hex.length === 3) {
+        r = parseInt(hex[0] + hex[0], 16)
+        g = parseInt(hex[1] + hex[1], 16)
+        b = parseInt(hex[2] + hex[2], 16)
+      } else if (hex.length === 6) {
+        r = parseInt(hex.slice(0, 2), 16)
+        g = parseInt(hex.slice(2, 4), 16)
+        b = parseInt(hex.slice(4, 6), 16)
+      } else {
+        console.warn(`Invalid hex color format: ${color}`)
+        return `rgba(0, 0, 0, ${opacity})`
+      }
+
+      return `rgba(${r}, ${g}, ${b}, ${opacity})`
+    }
+
+    // Fallback for unrecognized formats
+    console.warn(`Unrecognized color format: ${color}`)
+    return `rgba(0, 0, 0, ${opacity})`
+  }
+
+  /**
+   * Gets the computed color value from a CSS variable string with optional opacity
+   * @param cssVariableValue - The CSS variable string like 'var(--color-brand-50)'
+   * @param opacity - Optional opacity value between 0 and 1
+   * @returns The actual color value (hex, rgb, or rgba)
+   */
+  const getColor: GetColorType = (cssVariableValue, darkCssVariableValue, opacity, options = {}) => {
+    // In some case we want different dark mode color which does not have mapping in css variable.
+    if (isDark.value) {
+      cssVariableValue = darkCssVariableValue ?? cssVariableValue
+    }
+
+    // bypass option is used only to toggle color based on isDark value
+    if (options.bypass) {
+      return cssVariableValue
+    }
+
+    const cacheKey = opacity !== undefined ? `${cssVariableValue}:${opacity}` : cssVariableValue
+
+    if (colorCache.has(cacheKey)) {
+      return colorCache.get(cacheKey)!
+    }
+
+    let baseColor = cssVariableValue
+
+    // Handle CSS variables
+    if (cssVariableValue.startsWith('var(')) {
+      const variableName = cssVariableValue.match(/var\((--[^)]+)\)/)?.[1]
+
+      if (!variableName) {
+        console.warn(`Invalid CSS variable format: ${cssVariableValue}`)
+        baseColor = cssVariableValue
+      } else {
+        // Get the computed value from the document root
+        const computedValue = getComputedStyle(document.documentElement).getPropertyValue(variableName).trim()
+
+        if (!computedValue) {
+          console.warn(`CSS variable ${variableName} not found or has no value`)
+          baseColor = '#000000' // Fallback color
+        } else {
+          baseColor = computedValue
+        }
+      }
+    } else if (cssVariableValue.startsWith('--rgb-')) {
+      // Get the computed value from the document root
+      const computedValue = getComputedStyle(document.documentElement).getPropertyValue(cssVariableValue).trim()
+
+      if (!computedValue) {
+        console.warn(`CSS variable ${cssVariableValue} not found or has no value`)
+        baseColor = '#000000' // Fallback color
+      } else {
+        // Clamp opacity between 0 and 1
+        const clampedOpacity = Math.max(0, Math.min(1, opacity ?? 1))
+
+        baseColor = `rgba(${computedValue}, ${clampedOpacity})`
+
+        colorCache.set(cacheKey, baseColor)
+        return baseColor
+      }
+    }
+
+    // If no opacity specified, return the base color
+    if (opacity === undefined) {
+      colorCache.set(cacheKey, baseColor)
+      return baseColor
+    }
+
+    // Clamp opacity between 0 and 1
+    const clampedOpacity = Math.max(0, Math.min(1, opacity))
+
+    // Convert color to rgba format with opacity
+    const colorWithOpacity = convertToRgba(baseColor, clampedOpacity)
+
+    colorCache.set(cacheKey, colorWithOpacity)
+    return colorWithOpacity
+  }
+
+  const clearColorCache = () => {
+    colorCache.clear()
+  }
+
+  /** ————— dark palette (presets + per-token overrides) ————— */
+
+  const DARK_PALETTE_STORAGE_KEY = 'nc-dark-palette'
+
+  const isThemeConfigOpen = ref(false)
+
+  /** bumped whenever resolved theme colors change (mode toggle or palette change) — canvas renderers watch this to repaint */
+  const themeRepaintVersion = ref(0)
+
+  const darkPalette = ref<DarkPaletteState>({ preset: DEFAULT_DARK_PRESET, overrides: {} })
+
+  // beta-gated; read off `features` because `isFeatureEnabled` pulls useEeConfig (and the workspace store) in with it
+  const isDarkPaletteConfigurable = computed(
+    () => useBetaFeatureToggle().features.value.find((f) => f.id === FEATURE_FLAG.THEME_SETTINGS)?.enabled ?? false,
+  )
+
+  /** what renders: the stored choice while the flag is on, the shipped default otherwise (the choice is kept, not cleared) */
+  const effectiveDarkPalette = computed<DarkPaletteState>(() =>
+    isDarkPaletteConfigurable.value ? darkPalette.value : { preset: DEFAULT_DARK_PRESET, overrides: {} },
+  )
+
+  /** preset values with any per-token overrides applied on top */
+  const activeDarkPaletteValues = computed(() => resolveDarkPalette(effectiveDarkPalette.value))
+
+  /**
+   * `default` (classic) IS variables.css, so it needs no injected block. This is
+   * deliberately not the same question as "is this the app default" — since the
+   * shipped default became cobalt the two answers differ, and conflating them
+   * would drop the stored value of anyone who picked classic.
+   */
+  const isVariablesCssPalette = computed(
+    () =>
+      effectiveDarkPalette.value.preset === VARIABLES_CSS_DARK_PRESET &&
+      !Object.keys(effectiveDarkPalette.value.overrides).length,
+  )
+
+  /** nothing worth persisting when the state already matches the shipped default */
+  const isDefaultDarkPalette = computed(
+    () => darkPalette.value.preset === DEFAULT_DARK_PRESET && !Object.keys(darkPalette.value.overrides).length,
+  )
+
+  /**
+   * Applies the palette as a `<style>` scoped to `[theme='dark']` so light mode
+   * is never touched. The default preset with no overrides removes the style
+   * entirely (pure variables.css values).
+   */
+  const applyDarkPalette = () => {
+    if (typeof document === 'undefined') return
+
+    let styleEl = document.getElementById('nc-dark-palette') as HTMLStyleElement | null
+
+    if (isVariablesCssPalette.value) {
+      styleEl?.remove()
+    } else {
+      const values = activeDarkPaletteValues.value
+      const lines: string[] = []
+      for (const token of DARK_PALETTE_TOKENS) {
+        const value = values[token.key]
+        if (!value) continue
+        lines.push(`${token.cssVar}: ${value};`)
+        if (token.rgb && value.startsWith('#')) {
+          lines.push(`--rgb-${token.cssVar.slice(2)}: ${hexToRgb(value)};`)
+        }
+      }
+      if (!styleEl) {
+        styleEl = document.createElement('style')
+        styleEl.id = 'nc-dark-palette'
+        document.head.appendChild(styleEl)
+      }
+      styleEl.textContent = `[theme='dark'] {\n  ${lines.join('\n  ')}\n}`
+    }
+
+    // canvas grid resolves CSS vars through cached getColor() — flush + repaint
+    barcodeCache.clear()
+    clearColorCache()
+    themeRepaintVersion.value++
+  }
+
+  const persistDarkPalette = () => {
+    if (typeof localStorage === 'undefined') return
+    if (isDefaultDarkPalette.value) {
+      localStorage.removeItem(DARK_PALETTE_STORAGE_KEY)
+    } else {
+      localStorage.setItem(DARK_PALETTE_STORAGE_KEY, JSON.stringify({ v: DARK_PALETTE_STATE_VERSION, ...darkPalette.value }))
+    }
+  }
+
+  const setDarkPreset = (presetId: string) => {
+    darkPalette.value = { preset: presetId, overrides: {} }
+    applyDarkPalette()
+    persistDarkPalette()
+  }
+
+  const setDarkPaletteToken = (key: string, value: string) => {
+    darkPalette.value = {
+      ...darkPalette.value,
+      overrides: { ...darkPalette.value.overrides, [key]: value },
+    }
+    applyDarkPalette()
+    persistDarkPalette()
+  }
+
+  const resetDarkPalette = () => setDarkPreset(DEFAULT_DARK_PRESET)
+
+  const loadDarkPalette = () => {
+    if (typeof localStorage === 'undefined') return
+    let migrated = false
+    try {
+      const saved = localStorage.getItem(DARK_PALETTE_STORAGE_KEY)
+      const parsed = saved ? JSON.parse(saved) : null
+      if (parsed && typeof parsed.preset === 'string') {
+        // a pre-v2 payload wrote `default` meaning classic — read it as classic,
+        // not as today's default, or the choice silently flips
+        const preset = migratePresetId(parsed.preset, parsed.v)
+        darkPalette.value = { preset, overrides: parsed.overrides ?? {} }
+        if (preset !== parsed.preset) migrated = true
+      }
+    } catch {
+      localStorage.removeItem(DARK_PALETTE_STORAGE_KEY)
+    }
+
+    // Unconditional: the shipped default is no longer the variables.css palette,
+    // so a user with nothing stored still needs the block injected. Bailing
+    // early here left the picker showing Default while classic rendered.
+    applyDarkPalette()
+
+    // rewrite once at the new version so the mapping never runs twice
+    if (migrated) persistDarkPalette()
+  }
+
+  let initialized = false
+
+  const init = () => {
+    if (initialized || typeof window === 'undefined') return
+    initialized = true
+
+    const saved = localStorage.getItem('nc-theme') as ThemeMode
+    if (saved && ['system', 'light', 'dark'].includes(saved)) {
+      selectedTheme.value = saved
+    }
+
+    // Check for theme query parameter on shared views (without persisting to localStorage)
+    // Use 'nc-theme' to avoid conflicts with user form fields named 'theme'
+    const themeParam = route.value.query?.['nc-theme'] || route.value.query?.theme
+    if (isSharedViewRoute(route.value) && themeParam) {
+      const queryTheme = themeParam as string
+      if (['light', 'dark', 'system'].includes(queryTheme)) {
+        selectedTheme.value = queryTheme as ThemeMode
+      }
+    }
+
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    systemPreference.value = mediaQuery.matches ? 'dark' : 'light'
+
+    mediaQuery.addEventListener('change', (e) => {
+      systemPreference.value = e.matches ? 'dark' : 'light'
+    })
+
+    loadDarkPalette()
+  }
+
+  // Update selectedTheme when nc-theme is changed in another tab
+  const handleStorageChange = (event: StorageEvent) => {
+    if (event.key === 'nc-theme' && event.newValue) {
+      const newTheme = event.newValue as ThemeMode
+      if (['system', 'light', 'dark'].includes(newTheme) && newTheme !== selectedTheme.value) {
+        selectedTheme.value = newTheme
+      }
+    }
+
+    if (event.key === DARK_PALETTE_STORAGE_KEY) {
+      try {
+        const parsed = event.newValue ? JSON.parse(event.newValue) : { preset: DEFAULT_DARK_PRESET, overrides: {} }
+        if (parsed && typeof parsed.preset === 'string') {
+          darkPalette.value = { preset: parsed.preset, overrides: parsed.overrides ?? {} }
+          applyDarkPalette()
+        }
+      } catch {
+        // ignore malformed cross-tab payloads
+      }
+    }
+  }
+
+  useEventListener(window, 'storage', handleStorageChange)
+
+  watch(isDark, applyTheme, { immediate: true })
+
+  // toggling the beta flag swaps the rendered palette without touching the stored choice
+  watch(isDarkPaletteConfigurable, (enabled) => {
+    if (!enabled) isThemeConfigOpen.value = false
+    applyDarkPalette()
+  })
+
+  watch(isDark, () => {
+    barcodeCache.clear()
+
+    clearColorCache()
+
+    themeRepaintVersion.value++
+  })
+
+  init()
+
+  onMounted(init)
+
+  return {
+    selectedTheme,
+    forcedTheme,
+    isDark,
+    setTheme,
+    toggleTheme,
+    init,
+    isThemeEnabled,
+    getColor,
+    clearColorCache,
+    isThemeConfigOpen,
+    themeRepaintVersion,
+    darkPalette,
+    activeDarkPaletteValues,
+    isDefaultDarkPalette,
+    isVariablesCssPalette,
+    setDarkPreset,
+    setDarkPaletteToken,
+    resetDarkPalette,
+  }
+})

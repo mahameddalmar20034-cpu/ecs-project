@@ -1,0 +1,63 @@
+<script lang="ts" setup>
+interface Props {
+  /** Interface surfaces render the compact (record-peek sized) card. */
+  compact?: boolean
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  compact: false,
+})
+
+const isMiniSidebar = inject(IsMiniSidebarInj, undefined)
+
+const notificationStore = useNotification()
+
+const { unreadCount } = toRefs(notificationStore)
+
+const isDropdownOpen = ref(false)
+</script>
+
+<template>
+  <div class="cursor-pointer flex items-center">
+    <NcDropdown
+      v-model:visible="isDropdownOpen"
+      overlay-class-name="!shadow-none"
+      :placement="isMiniSidebar ? 'rightBottom' : 'bottomRight'"
+      :overlay-style="isMiniSidebar ? { marginLeft: '8px' } : {}"
+      :trigger="['click']"
+    >
+      <div
+        :class="{
+          'nc-mini-sidebar-btn-full-width': isMiniSidebar,
+          'flex': !isMiniSidebar,
+        }"
+      >
+        <NcButton
+          :size="isMiniSidebar ? 'xs' : 'small'"
+          class="!border-none nc-mini-sidebar-btn"
+          :class="{
+            hovered: isDropdownOpen,
+          }"
+          type="text"
+          data-testid="nc-sidebar-notification-btn"
+        >
+          <span
+            v-if="unreadCount"
+            :key="unreadCount"
+            class="bg-nc-red-500 w-2 h-2 border-1 border-nc-bg-gray-minisidebar rounded-[6px] absolute top-[5px] left-[15px]"
+          ></span>
+          <GeneralIcon
+            icon="notification"
+            :class="{
+              'h-4 w-4': isMiniSidebar,
+            }"
+          />
+        </NcButton>
+      </div>
+
+      <template #overlay>
+        <NotificationCard :compact="props.compact" @close="isDropdownOpen = false" />
+      </template>
+    </NcDropdown>
+  </div>
+</template>

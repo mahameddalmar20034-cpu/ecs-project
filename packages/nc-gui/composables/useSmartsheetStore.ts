@@ -1,0 +1,409 @@
+import type { ColumnType, FilterType, KanbanType, SortType, TableType, ViewType } from 'nocodb-sdk'
+import { NcApiVersion, ViewLockType, ViewTypes, extractFilterFromXwhere, getFirstNonPersonalView } from 'nocodb-sdk'
+import type { Ref } from 'vue'
+import type { CanvasEditEnabledType } from '~/lib/types'
+import { validateRowFilters } from '~/utils/dataUtils'
+import { flattenFiltersForEval } from '~/utils/realtimeUtils'
+
+const [useProvideSmartsheetStore, useSmartsheetStore] = useInjectionState(
+  (
+    // _view is deprecated, we use viewsStore instead
+    _view: Ref<ViewType | undefined>,
+    meta: Ref<TableType | KanbanType | undefined>,
+    shared = false,
+    initialSorts?: Ref<SortType[]>,
+    initialFilters?: Ref<FilterType[]>,
+    /**
+     * Interface LTAR "Show as = View" embeds mount a smartsheet tree INSIDE
+     * another (the table page behind the record sheet). The bus is app-global
+     * by default, so the embed toolbar's reload events (group/filter/search)
+     * would also reload the page behind it. An isolated bus keeps the embed's
+     * own events to itself while still receiving app-wide broadcasts.
+     */
+    isolatedEventBus = false,
+  ) => {
+    /**
+     * In shared view mode, `isPublic` will still be false because both
+     * `useProvideSmartsheetStore` and `provide(IsPublicInj)` are called at the same
+     * component level, so the inject doesn't see the provided value.
+     */
+    const isPublic = shared ? ref(shared) : inject(IsPublicInj, ref(false))
+
+    const { $api, $eventBus } = useNuxtApp()
+
+    const { internalGet } = useInternalBatch()
+
+    const router = useRouter()
+    const route = router.currentRoute
+
+    const { user, isMobileMode } = useGlobal()
+
+    const { isUIAllowed } = useRoles()
+
+    const { activeView: globalActiveView, activeNestedFilters, activeSorts, views } = storeToRefs(useViewsStore())
+
+    /**
+     * The store normally resolves its view GLOBALLY (views store / shared-view
+     * hijack) and ignores `_view` — fine while only one view is mounted at a
+     * time. Interface dashboards mount SEVERAL synthetic-view smartsheets at
+     * once, where a single global active view cannot work, so in shared mode
+     * an explicitly passed view wins and scopes this injection tree to it.
+     * Every pre-existing shared caller passes the same object it hijacks into
+     * `sharedView`, so behavior there is unchanged. No consumer writes
+     * `view.value` (writes go through the views store), so read-only is safe.
+     */
+    const view = shared && _view ? computed(() => _view.value ?? globalActiveView.value) : globalActiveView
+
+    const baseStore = useBase()
+
+    const { getBaseType } = baseStore
+
+    const { metas } = useMetas()
+
+    const { sqlUis, base, isSharedBase } = storeToRefs(baseStore)
+
+    const sqlUi = computed(() =>
+      (meta.value as TableType)?.source_id ? sqlUis.value[(meta.value as TableType).source_id!] : Object.values(sqlUis.value)[0],
+    )
+
+    const { search, getValidSearchQueryForColumn } = useFieldQuery()
+
+    // The rows/count requests still running when the search term changes are already superseded —
+    // only the last term's result is ever shown. Hand them a signal so the next term can abort them
+    // instead of leaving each one to finish its full row materialisation server-side.
+    let searchAbortController: AbortController | null = null
+    const searchAbortSignal = ref<AbortSignal | undefined>()
+
+    const abortInflightSearchRequests = () => {
+      searchAbortController?.abort()
+      searchAbortController = new AbortController()
+      searchAbortSignal.value = searchAbortController.signal
+    }
+
+    abortInflightSearchRequests()
+
+    watch(
+      () => [search.value.query, search.value.field] as const,
+      ([query], [prevQuery] = []) => {
+        // With no query the rows don't depend on the field, and no reload follows a field change —
+        // aborting here would kill the view's own initial load. `field` moves on every view open:
+        // loadFieldQuery swaps in an empty object and the displayColumn computed writes the PV id.
+        if (!query?.trim() && !prevQuery?.trim()) return
+
+        abortInflightSearchRequests()
+      },
+      // onSelectOption sets `field` and triggers the reload in the same tick, so the new controller
+      // has to exist before any caller can read the signal.
+      { flush: 'sync' },
+    )
+
+    onScopeDispose(() => searchAbortController?.abort())
+
+    const globalEventBus = $eventBus.smartsheetStoreEventBus
+    const eventBus = isolatedEventBus ? useEventBus<SmartsheetStoreEvents>(Symbol('nc-smartsheet-store')) : globalEventBus
+
+    if (isolatedEventBus) {
+      const forward = (event: SmartsheetStoreEvents, payload?: any) => eventBus.emit(event, payload)
+      globalEventBus.on(forward)
+      onScopeDispose(() => globalEventBus.off(forward))
+    }
+
+    const isLocked = computed(
+      () =>
+        (view.value?.lock_type === ViewLockType.Personal && user.value?.id !== view.value?.owned_by) ||
+        view.value?.lock_type === ViewLockType.Locked,
+    )
+    const isPkAvail = computed(() => (meta.value as TableType)?.columns?.some((c) => c.pk))
+    const isGrid = computed(() => view.value?.type === ViewTypes.GRID)
+    const isForm = computed(() => view.value?.type === ViewTypes.FORM)
+    const isGallery = computed(() => view.value?.type === ViewTypes.GALLERY)
+    const isCalendar = computed(() => view.value?.type === ViewTypes.CALENDAR)
+    const isTimeline = computed(() => view.value?.type === ViewTypes.TIMELINE)
+    const isGantt = computed(() => view.value?.type === ViewTypes.GANTT)
+    const isKanban = computed(() => view.value?.type === ViewTypes.KANBAN)
+    const isMap = computed(() => view.value?.type === ViewTypes.MAP)
+    const isList = computed(() => view.value?.type === ViewTypes.LIST)
+    const isSharedForm = computed(() => isForm.value && shared)
+    const isDefaultView = computed(() => {
+      const getFirstGridView = getFirstNonPersonalView(views.value, {
+        includeViewType: ViewTypes.GRID,
+      })
+
+      return getFirstGridView?.id === view.value?.id
+    })
+    const gridEditEnabled = ref<CanvasEditEnabledType>(null)
+
+    const isExternalSource = computed(
+      () => !!base.value?.sources?.some((s) => s.id === (meta.value as TableType)?.source_id && !s.is_meta && !s.is_local),
+    )
+
+    /**
+     * View operations (toolbar, aggregation footer, column reorder, column resize, etc.)
+     */
+    const isViewOperationsAllowed = computed(() => {
+      // Allow view operations in shared base and view
+      if (isPublic.value || isSharedBase.value) return true
+
+      // Allow view operations only for editor and above roles
+      return isUIAllowed('viewOperations')
+    })
+
+    const isAlreadyShownUpgradeModal = ref(false)
+
+    const aliasColObjMap = computed(() => {
+      const colObj = ((meta.value as TableType)?.columns || [])?.reduce((acc, col) => {
+        acc[col.title] = col
+
+        return acc
+      }, {} as Record<string, ColumnType>)
+      return colObj
+    })
+
+    const filtersFromUrlParams = computed(() => {
+      if (route.value.query.where && !ncIsEmptyObject(aliasColObjMap.value)) {
+        return extractFilterFromXwhere(
+          { api_version: NcApiVersion.V1, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+          route.value.query.where as string,
+          aliasColObjMap.value,
+          false,
+        )
+      }
+    })
+
+    const filtersFromUrlParamsReadableErrors = computed(() => {
+      return filtersFromUrlParams.value?.errors
+        ?.map((e: any) => e?.message)
+        .filter(Boolean)
+        .join(',')
+    })
+
+    const validFiltersFromUrlParams = computed(() => {
+      return !filtersFromUrlParams.value?.errors?.length ? filtersFromUrlParams.value?.filters || [] : []
+    })
+
+    const whereQueryFromUrl = computed(() => {
+      if (filtersFromUrlParams.value?.errors?.length) {
+        return
+      }
+
+      return route.value.query.where as string
+    })
+
+    const totalRowsWithSearchQuery = ref(0)
+
+    const totalRowsWithoutSearchQuery = ref(0)
+
+    const fetchTotalRowsWithSearchQuery = computed(() => {
+      return search.value.query?.trim() && !isMobileMode.value && (isGrid.value || isGallery.value)
+    })
+
+    const xWhere = computed(() => {
+      let where
+
+      // if where is already present in the query, use that
+      if (whereQueryFromUrl.value) {
+        where = whereQueryFromUrl.value
+      }
+
+      const col =
+        (meta.value as TableType)?.columns?.find(({ id }) => id === search.value.field) ||
+        (meta.value as TableType)?.columns?.find((v) => v.pv)
+
+      const searchQuery = search.value.query.trim()
+
+      if (!col || !searchQuery) {
+        search.value.isValidFieldQuery = true
+
+        return where
+      }
+
+      const colWhereQuery = getValidSearchQueryForColumn(col, searchQuery, meta.value as TableType, {
+        getWhereQueryAs: 'string',
+      }) as string
+
+      if (!colWhereQuery) {
+        search.value.isValidFieldQuery = false
+        return where
+      }
+
+      search.value.isValidFieldQuery = true
+
+      return `${where ? `${where}~and` : ''}${colWhereQuery}`
+    })
+
+    // The active ad-hoc narrowing (URL `where` + toolbar search) parsed into filters. Unlike
+    // saved view filters, the server can't know these (per-client), so realtime handlers AND
+    // `rowMatchesSearchAndUrl` in client-side on top of the server's matchedViewIds.
+    const xWhereFilters = computed<FilterType[]>(() => {
+      if (!xWhere.value || ncIsEmptyObject(aliasColObjMap.value)) return []
+      const { filters, errors } = extractFilterFromXwhere(
+        { api_version: NcApiVersion.V1, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+        xWhere.value,
+        aliasColObjMap.value,
+        false,
+      )
+      if (errors?.length) return []
+      return (filters ?? []).map((f) => ({
+        ...f,
+        value: f.value ? f.value?.toString().replace(/(^%)(.*?)(%$)/, '$2') : f.value,
+      }))
+    })
+
+    // Present only under an interface page — carries the viewer's ephemeral
+    // narrowing for the realtime gate below.
+    const interfacePageDataApi = inject(InterfacePageDataInj, undefined)
+
+    const isSqlView = computed(() => (meta.value as TableType)?.type === 'view')
+
+    const isSyncedTable = computed(() => !!(meta.value as TableType)?.synced)
+
+    const sorts = ref<SortType[]>(unref(initialSorts) ?? [])
+    const nestedFilters = ref<FilterType[]>(unref(initialFilters) ?? [])
+
+    // Interface pages: the scoped realtime room only enforces the builder
+    // scope — the viewer's ephemeral narrowing (user-filter tab/dropdown
+    // selection + ad-hoc Filter-action filters, which ride `filtersArr` on
+    // fetches) must be AND-ed client-side, exactly like toolbar search.
+    // Flattened for evaluation (`validateRowFilters` wipes pre-nested
+    // `children`) and memoized — realtime handlers evaluate per pushed row.
+    const interfaceViewerFilters = computed<FilterType[]>(() =>
+      interfacePageDataApi
+        ? flattenFiltersForEval([...interfacePageDataApi.viewerScopeFilters(), ...(nestedFilters.value ?? [])])
+        : [],
+    )
+
+    const rowMatchesSearchAndUrl = (rowPayload: Record<string, any>) => {
+      const allFilters = [...xWhereFilters.value, ...interfaceViewerFilters.value]
+      if (!allFilters.length) return true
+      return validateRowFilters(
+        allFilters,
+        rowPayload,
+        (meta.value as TableType)?.columns as ColumnType[],
+        getBaseType((meta.value as TableType)?.source_id),
+        metas.value,
+        (meta.value as TableType)?.base_id,
+        {
+          currentUser: user.value,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        },
+      )
+    }
+
+    const allFilters = ref<FilterType[]>([])
+
+    watch(
+      sorts,
+      () => {
+        activeSorts.value = sorts.value
+      },
+      {
+        immediate: true,
+      },
+    )
+
+    watch(
+      nestedFilters,
+      () => {
+        activeNestedFilters.value = nestedFilters.value
+      },
+      {
+        immediate: true,
+      },
+    )
+
+    const viewColumnsMap = reactive<Record<string, Record<string, any>[]>>({})
+    const pendingRequests = new Map()
+
+    const getViewColumnsKey = (baseId: string, viewId: string) => `${baseId}:${viewId}`
+
+    const getViewColumns = async (baseId: string, viewId: string) => {
+      if (isPublic.value) return []
+
+      const key = getViewColumnsKey(baseId, viewId)
+
+      if (viewColumnsMap[key]) return viewColumnsMap[key]
+
+      if (pendingRequests.has(key)) {
+        return pendingRequests.get(key)
+      }
+
+      const promise = (async () => {
+        try {
+          const workspaceId = base.value?.fk_workspace_id
+          if (!workspaceId) {
+            throw new Error('Workspace ID not found')
+          }
+          // Always use internal API for consistency and cross-base support
+          const result = await internalGet(workspaceId, baseId, {
+            operation: 'viewColumnList',
+            viewId,
+          })
+          viewColumnsMap[key] = result?.list ?? []
+          pendingRequests.delete(key)
+          return result?.list ?? []
+        } catch (error) {
+          pendingRequests.delete(key)
+          throw error
+        }
+      })()
+
+      pendingRequests.set(key, promise)
+
+      return promise
+    }
+
+    return {
+      view,
+      meta,
+      isLocked,
+      $api,
+      xWhere,
+      isPkAvail,
+      isForm,
+      isGrid,
+      isGallery,
+      isKanban,
+      isMap,
+      isList,
+      isCalendar,
+      isTimeline,
+      isGantt,
+      isSharedForm,
+      sorts,
+      nestedFilters,
+      isSqlView,
+      eventBus,
+      sqlUi,
+      allFilters,
+      isDefaultView,
+      viewColumnsMap,
+      getViewColumns,
+      isExternalSource,
+      isAlreadyShownUpgradeModal,
+      filtersFromUrlParams,
+      filtersFromUrlParamsReadableErrors,
+      whereQueryFromUrl,
+      validFiltersFromUrlParams,
+      rowMatchesSearchAndUrl,
+      isSyncedTable,
+      totalRowsWithSearchQuery,
+      totalRowsWithoutSearchQuery,
+      fetchTotalRowsWithSearchQuery,
+      gridEditEnabled,
+      getValidSearchQueryForColumn,
+      searchAbortSignal,
+      isViewOperationsAllowed,
+    }
+  },
+  'smartsheet-store',
+)
+
+export { useProvideSmartsheetStore, useSmartsheetStore }
+
+export function useSmartsheetStoreOrThrow() {
+  const state = useSmartsheetStore()
+
+  if (!state) throw new Error('Please call `useProvideSmartsheetStore` on the appropriate parent component')
+
+  return state
+}

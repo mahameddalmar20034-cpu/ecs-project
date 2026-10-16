@@ -1,0 +1,797 @@
+<script lang="ts" setup>
+import type { VNodeRef } from '@vue/runtime-core'
+import { PermissionEntity, PermissionKey, UITypes } from 'nocodb-sdk'
+import dayjs from 'dayjs'
+
+const props = defineProps<{
+  visible: boolean
+}>()
+
+const emit = defineEmits(['expandRecord', 'newRecord'])
+
+const INFINITY_SCROLL_THRESHOLD = 100
+
+const { isUIAllowed } = useRoles()
+
+const { appInfo, isMobileMode, user } = useGlobal()
+
+const { height } = useWindowSize()
+
+const meta = inject(MetaInj, ref())
+
+const fields = inject(FieldsInj, ref())
+
+const { t } = useI18n()
+
+const {
+  pageDate,
+  displayField,
+  selectedDate,
+  selectedTime,
+  selectedMonth,
+  calendarRange,
+  selectedDateRange,
+  activeDates,
+  activeCalendarView,
+  isSidebarLoading,
+  formattedSideBarData,
+  calDataType,
+  loadMoreSidebarData,
+  searchQuery,
+  sideBarFilterOption,
+  updateFormat,
+  timezone,
+  timezoneDayjs,
+  isDayAnchoredMode,
+  dayAnchoredSpan,
+  weeksInRange,
+  isMultiWeekRange,
+  isAddDeleteInlineEnabled,
+} = useCalendarViewStoreOrThrow()
+
+const { isSyncedTable, isViewOperationsAllowed } = useSmartsheetStoreOrThrow()
+
+// Interface editor: the side-panel "New record" button selects the calendar
+// element (opens `Page › Calendar`) instead of adding a record. Null in the
+// published view and outside interface pages.
+const interfaceEditSelect = inject(InterfaceVizEditSelectInj, ref<(() => void) | null>(null))
+
+// Interface pages: the side panel is the RECORD LIST only — the toolbar's
+// date navigation already covers moving around, so the date/month/year
+// pickers are dropped. Core calendar keeps them.
+const interfacePageDataApi = inject(InterfacePageDataInj, undefined)
+
+// Day-anchored modes ('3day', custom + day-unit) anchor on a single day; the picker
+// selects the first visible day and the window spans that day + (N-1). Mirrors the
+// calendar toolbar header so the side-panel selector navigates the same canonical cursors.
+const dayAnchoredDate = computed<dayjs.Dayjs>({
+  get: () => timezoneDayjs.timezonize(selectedDateRange.value.start),
+  set: (date: dayjs.Dayjs) => {
+    const start = date.startOf('day')
+    selectedDate.value = start
+    if (pageDate.value.month() !== start.month()) pageDate.value = start
+    selectedDateRange.value = {
+      start,
+      end: start.add(dayAnchoredSpan.value - 1, 'day').endOf('day'),
+    }
+  },
+})
+
+const sideBarListRef = ref<VNodeRef | null>(null)
+
+const pushToArray = (arr: Array<Row>, record: Row, range) => {
+  arr.push({
+    ...record,
+    rowMeta: {
+      ...record.rowMeta,
+      range,
+    },
+  })
+}
+
+const dragElement = ref<HTMLElement | null>(null)
+
+const dragStart = (event: DragEvent, record: Row) => {
+  dragElement.value = event.target as HTMLElement
+
+  const eventRect = dragElement.value.getBoundingClientRect()
+
+  const initialClickOffsetX = event.clientX - eventRect.left
+  const initialClickOffsetY = event.clientY - eventRect.top
+
+  event.dataTransfer?.setData(
+    'text/plain',
+    JSON.stringify({
+      record,
+      isWithoutDates: sideBarFilterOption.value === 'withoutDates',
+      initialClickOffsetY,
+      initialClickOffsetX,
+    }),
+  )
+}
+
+const renderData = computed<Array<Row>>(() => {
+  if (!calendarRange.value) return []
+
+  const rangedData: Array<Row> = []
+
+  calendarRange.value.forEach((range) => {
+    const fromCol = range.fk_from_col
+    const toCol = range.fk_to_col
+    formattedSideBarData.value.forEach((record) => {
+      if (fromCol && toCol) {
+        const hasFrom = !!record.row[fromCol.title!] && dayjs(record.row[fromCol.title!]).isValid()
+        const hasTo = !!record.row[toCol.title!] && dayjs(record.row[toCol.title!]).isValid()
+        const from = hasFrom ? timezoneDayjs.timezonize(record.row[fromCol.title!]) : null
+        const to = hasTo ? timezoneDayjs.timezonize(record.row[toCol.title!]) : null
+        // For records with partial dates, use the available date as both start and end (single-day event)
+        const effectiveFrom = from ?? to
+        const effectiveTo = to ?? from
+
+        if (sideBarFilterOption.value === 'withoutDates') {
+          if (!hasFrom || !hasTo) {
+            pushToArray(rangedData, record, range)
+          }
+        } else if (sideBarFilterOption.value === 'allRecords') {
+          pushToArray(rangedData, record, range)
+        } else if (
+          sideBarFilterOption.value === 'month' ||
+          sideBarFilterOption.value === 'year' ||
+          sideBarFilterOption.value === 'selectedDate' ||
+          sideBarFilterOption.value === 'selectedHours' ||
+          sideBarFilterOption.value === 'week' ||
+          sideBarFilterOption.value === '3day' ||
+          sideBarFilterOption.value === '2week' ||
+          sideBarFilterOption.value === '6week' ||
+          sideBarFilterOption.value === 'custom' ||
+          sideBarFilterOption.value === 'day'
+        ) {
+          let fromDate: dayjs.Dayjs | null = null
+          let toDate: dayjs.Dayjs | null = null
+
+          switch (sideBarFilterOption.value) {
+            case 'month':
+              fromDate = timezoneDayjs.dayjsTz(selectedMonth.value).startOf('month')
+              toDate = timezoneDayjs.dayjsTz(selectedMonth.value).endOf('month')
+              break
+            case '3day':
+              fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('day')
+              toDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).add(2, 'day').endOf('day')
+              break
+            case 'custom':
+              if (isDayAnchoredMode.value) {
+                fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('day')
+                toDate = timezoneDayjs
+                  .dayjsTz(selectedDateRange.value.start)
+                  .add(dayAnchoredSpan.value - 1, 'day')
+                  .endOf('day')
+              } else {
+                fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('week')
+                toDate = fromDate
+                  .clone()
+                  .add(weeksInRange.value * 7 - 1, 'day')
+                  .endOf('day')
+              }
+              break
+            case 'year':
+              fromDate = timezoneDayjs.dayjsTz(selectedDate.value).startOf('year')
+              toDate = timezoneDayjs.dayjsTz(selectedDate.value).endOf('year')
+              break
+            case 'selectedDate':
+              fromDate = timezoneDayjs.dayjsTz(selectedDate.value).startOf('day')
+              toDate = timezoneDayjs.dayjsTz(selectedDate.value).endOf('day')
+              break
+            case 'week':
+            case '2week':
+            case '6week': {
+              const weeks = sideBarFilterOption.value === '2week' ? 2 : sideBarFilterOption.value === '6week' ? 6 : 1
+              fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('week')
+              toDate = fromDate
+                .clone()
+                .add(weeks * 7 - 1, 'day')
+                .endOf('day')
+              break
+            }
+            case 'day':
+              fromDate = timezoneDayjs.dayjsTz(selectedDate.value).startOf('day')
+              toDate = timezoneDayjs.dayjsTz(selectedDate.value).endOf('day')
+              break
+            case 'selectedHours':
+              fromDate = timezoneDayjs.dayjsTz(selectedTime.value).startOf('hour')
+              toDate = timezoneDayjs.dayjsTz(selectedTime.value).endOf('hour')
+              break
+          }
+
+          if (effectiveFrom && effectiveTo) {
+            if (
+              (effectiveFrom.isSameOrAfter(fromDate) && effectiveTo.isSameOrBefore(toDate)) ||
+              (effectiveFrom.isSameOrBefore(fromDate) && effectiveTo.isSameOrAfter(toDate)) ||
+              (effectiveFrom.isSameOrBefore(fromDate) && effectiveTo.isSameOrAfter(fromDate)) ||
+              (effectiveFrom.isSameOrBefore(toDate) && effectiveTo.isSameOrAfter(toDate))
+            ) {
+              pushToArray(rangedData, record, range)
+            }
+          }
+        }
+      } else if (fromCol) {
+        const from = timezoneDayjs.timezonize(record.row[fromCol.title!])
+        if (sideBarFilterOption.value === 'withoutDates') {
+          if (!dayjs(record.row[fromCol.title!]).isValid()) {
+            pushToArray(rangedData, record, range)
+          }
+        } else if (sideBarFilterOption.value === 'allRecords') {
+          pushToArray(rangedData, record, range)
+        } else if (sideBarFilterOption.value === 'selectedDate' || sideBarFilterOption.value === 'day') {
+          if (from.isSame(selectedDate.value, 'day')) {
+            pushToArray(rangedData, record, range)
+          }
+        } else if (sideBarFilterOption.value === 'selectedHours') {
+          if (from.isSame(selectedTime.value, 'hour')) {
+            pushToArray(rangedData, record, range)
+          }
+        } else if (
+          sideBarFilterOption.value === 'week' ||
+          sideBarFilterOption.value === '3day' ||
+          sideBarFilterOption.value === '2week' ||
+          sideBarFilterOption.value === '6week' ||
+          sideBarFilterOption.value === 'custom' ||
+          sideBarFilterOption.value === 'month' ||
+          sideBarFilterOption.value === 'year'
+        ) {
+          let fromDate: dayjs.Dayjs
+          let toDate: dayjs.Dayjs
+
+          switch (sideBarFilterOption.value) {
+            case '3day':
+              fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('day')
+              toDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).add(2, 'day').endOf('day')
+              break
+            case 'custom':
+              if (isDayAnchoredMode.value) {
+                fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('day')
+                toDate = timezoneDayjs
+                  .dayjsTz(selectedDateRange.value.start)
+                  .add(dayAnchoredSpan.value - 1, 'day')
+                  .endOf('day')
+              } else {
+                fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('week')
+                toDate = fromDate
+                  .clone()
+                  .add(weeksInRange.value * 7 - 1, 'day')
+                  .endOf('day')
+              }
+              break
+            case 'week':
+            case '2week':
+            case '6week': {
+              const weeks = sideBarFilterOption.value === '2week' ? 2 : sideBarFilterOption.value === '6week' ? 6 : 1
+              fromDate = timezoneDayjs.dayjsTz(selectedDateRange.value.start).startOf('week')
+              toDate = fromDate
+                .clone()
+                .add(weeks * 7 - 1, 'day')
+                .endOf('day')
+              break
+            }
+            case 'month':
+              fromDate = timezoneDayjs.dayjsTz(selectedMonth.value).startOf('month')
+              toDate = timezoneDayjs.dayjsTz(selectedMonth.value).endOf('month')
+              break
+            case 'year':
+              fromDate = timezoneDayjs.dayjsTz(selectedDate.value).startOf('year')
+              toDate = timezoneDayjs.dayjsTz(selectedDate.value).endOf('year')
+              break
+          }
+
+          if (from.isSameOrAfter(fromDate) && from.isSameOrBefore(toDate)) {
+            pushToArray(rangedData, record, range)
+          }
+        }
+      }
+    })
+  })
+
+  return rangedData
+})
+
+const options = computed(() => {
+  switch (activeCalendarView.value) {
+    case 'day' as const:
+      if (calDataType.value === UITypes.Date) {
+        return [
+          { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+          { label: t('labels.calendarFilter.inThisDay'), value: 'day' },
+          { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+        ]
+      } else {
+        return [
+          { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+          { label: t('labels.calendarFilter.inThisDay'), value: 'day' },
+          { label: t('labels.calendarFilter.inSelectedHours'), value: 'selectedHours' },
+          { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+        ]
+      }
+    case '3day' as const:
+      if (calDataType.value === UITypes.Date) {
+        return [
+          { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+          { label: t('labels.calendarFilter.inSelectedRange'), value: '3day' },
+          { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+          { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+        ]
+      } else {
+        return [
+          { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+          { label: t('labels.calendarFilter.inSelectedRange'), value: '3day' },
+          { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+          { label: t('labels.calendarFilter.inSelectedHours'), value: 'selectedHours' },
+          { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+        ]
+      }
+    case 'week' as const:
+      if (calDataType.value === UITypes.Date) {
+        return [
+          { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+          { label: t('labels.calendarFilter.inSelectedWeek'), value: 'week' },
+          { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+          { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+        ]
+      } else {
+        return [
+          { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+          { label: t('labels.calendarFilter.inSelectedWeek'), value: 'week' },
+          { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+          { label: t('labels.calendarFilter.inSelectedHours'), value: 'selectedHours' },
+          { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+        ]
+      }
+    case '2week' as const:
+      return [
+        { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+        { label: t('labels.calendarFilter.inSelectedRange'), value: '2week' },
+        { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+        { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+      ]
+    case '6week' as const:
+      return [
+        { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+        { label: t('labels.calendarFilter.inSelectedRange'), value: '6week' },
+        { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+        { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+      ]
+    case 'custom' as const: {
+      const customOptions = [
+        { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+        { label: t('labels.calendarFilter.inSelectedRange'), value: 'custom' },
+        { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+      ]
+      // Day-anchored DateTime windows expose the hour filter, mirroring 3-day/week.
+      if (isDayAnchoredMode.value && calDataType.value !== UITypes.Date) {
+        customOptions.push({ label: t('labels.calendarFilter.inSelectedHours'), value: 'selectedHours' })
+      }
+      customOptions.push({ label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' })
+      return customOptions
+    }
+    case 'month' as const:
+      return [
+        { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+        { label: t('labels.calendarFilter.inThisMonth'), value: 'month' },
+        { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+        { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+      ]
+    case 'year' as const:
+      return [
+        { label: t('labels.calendarFilter.allRecords'), value: 'allRecords' },
+        { label: t('labels.calendarFilter.inThisYear'), value: 'year' },
+        { label: t('labels.calendarFilter.inSelectedDate'), value: 'selectedDate' },
+        { label: t('labels.calendarFilter.withoutDates'), value: 'withoutDates' },
+      ]
+  }
+})
+
+const sideBarListScrollHandle = useDebounceFn(async (e: Event) => {
+  const target = e.target as HTMLElement
+  if (target.clientHeight + target.scrollTop + INFINITY_SCROLL_THRESHOLD >= target.scrollHeight) {
+    const pageSize = appInfo.value?.defaultLimit ?? 25
+    const page = Math.ceil(formattedSideBarData.value.length / pageSize)
+
+    await loadMoreSidebarData({
+      offset: page * pageSize,
+    })
+  }
+})
+
+const newRecord = () => {
+  if (interfaceEditSelect.value) return interfaceEditSelect.value()
+  if (!isUIAllowed('dataEdit') || !isAddDeleteInlineEnabled.value) return
+
+  const row = {
+    ...rowDefaultData(meta.value?.columns, user.value ?? undefined),
+  }
+
+  let fromDate
+  if (activeCalendarView.value === 'day') {
+    fromDate = selectedDate.value
+  } else if (
+    activeCalendarView.value === 'week' ||
+    activeCalendarView.value === '3day' ||
+    activeCalendarView.value === '2week' ||
+    activeCalendarView.value === '6week' ||
+    activeCalendarView.value === 'custom'
+  ) {
+    // 3-day / custom are day-anchored or week-aligned, so selectedDateRange.start is
+    // their first visible day (same source the header/today/store use) — week-family
+    // modes use it too.
+    fromDate = selectedDateRange.value.start
+  } else if (activeCalendarView.value === 'month') {
+    fromDate = selectedDate.value ?? selectedMonth.value
+  } else if (activeCalendarView.value === 'year') {
+    fromDate = selectedDate.value
+  }
+
+  if (!fromDate) {
+    // Unhandled calendar view (e.g. a future mode not wired up here) — surface a toast and
+    // bail instead of throwing on fromDate.format() below.
+    message.error(t('msg.error.unableToCreateRecordInThisView'))
+    return
+  }
+
+  // Set the from date
+  if (calendarRange.value[0]?.fk_from_col) {
+    row[calendarRange.value[0].fk_from_col.title!] = fromDate.format(updateFormat.value)
+  }
+
+  // Set the to date if to_col is configured (same as from date + 1 hour)
+  if (calendarRange.value[0]?.fk_to_col) {
+    const toDate = fromDate.endOf('hour')
+    row[calendarRange.value[0].fk_to_col.title!] = toDate.format(updateFormat.value)
+  }
+
+  emit('newRecord', { row, oldRow: {}, rowMeta: { new: true } })
+}
+
+const showSearch = ref(false)
+const searchRef = ref()
+
+const clickSearch = () => {
+  if (showSearch.value) {
+    searchQuery.value = ''
+    showSearch.value = false
+  } else {
+    showSearch.value = true
+    nextTick(() => {
+      searchRef.value?.focus()
+    })
+  }
+}
+
+const toggleSearch = (e) => {
+  if (hasAncestorWithClass(e.target, 'nc-calendar-sidebar-search-btn')) return
+
+  if (!searchQuery.value.length) {
+    showSearch.value = false
+  } else {
+    searchRef.value?.blur()
+  }
+}
+
+useEventListener(document, 'keydown', async (e: KeyboardEvent) => {
+  const cmdOrCtrl = isMac() ? e.metaKey : e.ctrlKey
+  if (cmdOrCtrl) {
+    switch (e.key.toLowerCase()) {
+      case 'f':
+        e.preventDefault()
+        clickSearch()
+        break
+    }
+  }
+})
+
+onClickOutside(searchRef, toggleSearch)
+
+const isDropdownOpen = ref(false)
+
+const selectOption = (option) => {
+  isDropdownOpen.value = false
+  sideBarFilterOption.value = option.value
+}
+</script>
+
+<template>
+  <div
+    :class="{
+      '!min-w-[100svw]': props.visible && isMobileMode,
+      'nc-calendar-side-menu-open': props.visible,
+    }"
+    class="h-full flex flex-col relative border-l-1 min-w-[288px] border-nc-border-gray-medium transition transition-all"
+    data-testid="nc-calendar-side-menu"
+  >
+    <div v-if="!interfacePageDataApi" class="flex min-w-[288px] flex-col">
+      <NcDateWeekSelector
+        v-if="activeCalendarView === ('day' as const)"
+        v-model:active-dates="activeDates"
+        v-model:page-date="pageDate"
+        v-model:selected-date="selectedDate"
+        :timezone="timezone"
+        size="medium"
+        header="v2"
+        :hide-calendar="height < 700"
+      />
+      <NcDateWeekSelector
+        v-else-if="isDayAnchoredMode"
+        v-model:active-dates="activeDates"
+        v-model:page-date="pageDate"
+        v-model:selected-date="dayAnchoredDate"
+        :timezone="timezone"
+        size="medium"
+        header="v2"
+        :hide-calendar="height < 700"
+      />
+      <NcDateWeekSelector
+        v-else-if="activeCalendarView === ('week' as const) || isMultiWeekRange"
+        v-model:active-dates="activeDates"
+        v-model:page-date="pageDate"
+        v-model:selected-week="selectedDateRange"
+        :hide-calendar="height < 700"
+        is-week-picker
+        size="medium"
+        header="v2"
+        :timezone="timezone"
+      />
+      <NcMonthYearSelector
+        v-else-if="activeCalendarView === ('month' as const)"
+        v-model:page-date="pageDate"
+        v-model:selected-date="selectedMonth"
+        :hide-calendar="height < 700"
+        header="v2"
+        :timezone="timezone"
+        size="medium"
+      />
+      <NcMonthYearSelector
+        v-else-if="activeCalendarView === ('year' as const)"
+        v-model:page-date="pageDate"
+        v-model:selected-date="selectedDate"
+        :hide-calendar="height < 700"
+        header="v2"
+        is-year-picker
+        size="medium"
+      />
+    </div>
+
+    <div
+      :class="{
+        '!border-t-0 ': height < 700 || !!interfacePageDataApi,
+        'pt-6': height >= 700 && !interfacePageDataApi,
+      }"
+      class="border-t-1 !pt-3 border-nc-border-gray-medium relative flex flex-1 min-h-0 flex-col gap-y-3"
+    >
+      <div class="flex px-4 h-8 items-center gap-3">
+        <NcDropdown v-model:visible="isDropdownOpen">
+          <div
+            class="font-medium text-nc-content-gray cursor-pointer gap-2 flex items-center font-bold leading-6"
+            data-testid="nc-calendar-sidebar-filter"
+          >
+            <div class="truncate">
+              <span class="capitalize">
+                {{ sideBarFilterOption !== 'allRecords' ? $t('objects.records') : '' }}
+              </span>
+              {{ options?.find((o) => o.value === sideBarFilterOption)?.label || '' }}
+            </div>
+
+            <GeneralIcon :icon="isDropdownOpen ? 'ncChevronUp' : 'ncChevronDown'" />
+          </div>
+          <template #overlay>
+            <NcMenu class="w-56" variant="small">
+              <NcMenuItem v-for="option in options" :key="option.value" @click="selectOption(option)">
+                <NcTooltip class="capitalize" :title="option.label" placement="left" show-on-truncate-only>
+                  <template #title>{{ option.label }}</template>
+                  {{ option.label }}
+                </NcTooltip>
+                <div class="flex-1" />
+
+                <GeneralIcon
+                  v-if="sideBarFilterOption === option.value"
+                  id="nc-selected-item-icon"
+                  class="text-primary w-4 h-4"
+                  icon="check"
+                />
+              </NcMenuItem>
+            </NcMenu>
+          </template>
+        </NcDropdown>
+
+        <div class="flex-1" />
+        <NcButton
+          data-testid="nc-calendar-sidebar-search-btn"
+          size="small"
+          :class="{
+            '!bg-nc-brand-50 nc-calendar-sidebar-search-active !text-nc-content-brand': showSearch,
+          }"
+          :shadow="false"
+          class="!h-7 !rounded-md nc-calendar-sidebar-search-btn !border-0"
+          type="secondary"
+          @click="clickSearch"
+        >
+          <GeneralIcon icon="ncSearch" />
+        </NcButton>
+      </div>
+      <div
+        :class="{
+          hidden: !showSearch,
+        }"
+        class="mx-4"
+      >
+        <a-input
+          ref="searchRef"
+          v-model:value="searchQuery.value"
+          :class="{
+            '!hidden': !showSearch,
+          }"
+          class="!rounded-lg !h-8 !placeholder:text-nc-content-gray-muted !px-4"
+          data-testid="nc-calendar-sidebar-search"
+          :placeholder="$t('placeholder.searchRecords')"
+          @keydown.esc="toggleSearch"
+        >
+          <template #prefix>
+            <component :is="iconMap.search" class="h-4 w-4 mr-1 text-nc-content-gray-muted" />
+          </template>
+          <template v-if="searchQuery.value?.trim() && !searchQuery.isValidFieldQuery" #suffix>
+            <NcTooltip :title="$t('msg.error.invalidSearchQueryForDisplayField')" class="flex" placement="topRight">
+              <GeneralIcon icon="ncInfo" class="flex-noneh-4 w-4 text-nc-content-red-medium" />
+            </NcTooltip>
+          </template>
+        </a-input>
+      </div>
+      <div
+        v-if="isViewOperationsAllowed || (isUIAllowed('dataEdit') && isAddDeleteInlineEnabled && props.visible && !isSyncedTable)"
+        class="mx-4 gap-2 flex items-center"
+      >
+        <LazySmartsheetToolbarSortListMenu v-if="isViewOperationsAllowed" />
+
+        <div class="flex-1" />
+
+        <PermissionsTooltip
+          v-if="isUIAllowed('dataEdit') && isAddDeleteInlineEnabled && props.visible && !isSyncedTable"
+          :entity="PermissionEntity.TABLE"
+          :entity-id="meta?.id"
+          :permission="PermissionKey.TABLE_RECORD_ADD"
+          placement="left"
+          show-overlay
+        >
+          <NcButton
+            v-e="['c:calendar:calendar-sidemenu-new-record-btn']"
+            data-testid="nc-calendar-side-menu-new-btn"
+            class="!h-7 !rounded-md"
+            size="small"
+            type="secondary"
+            @click="newRecord"
+          >
+            <div class="flex items-center gap-2">
+              <GeneralIcon icon="ncPlus" />
+              {{ $t('general.record') }}
+            </div>
+          </NcButton>
+        </PermissionsTooltip>
+      </div>
+
+      <div
+        v-if="calendarRange?.length"
+        :ref="sideBarListRef"
+        class="nc-scrollbar-md px-4 pb-4 overflow-y-auto flex-1 min-h-0"
+        data-testid="nc-calendar-side-menu-list"
+        @scroll="sideBarListScrollHandle"
+      >
+        <div v-if="renderData.length === 0 || isSidebarLoading" class="flex h-full items-center justify-center">
+          <GeneralLoader v-if="isSidebarLoading" size="large" />
+
+          <div v-else class="text-nc-content-gray-muted">
+            {{ t('msg.noRecordsFound') }}
+          </div>
+        </div>
+        <template v-else-if="renderData.length > 0">
+          <div class="gap-2 flex flex-col">
+            <SmartsheetRow v-for="(record, rowIndex) in renderData" :key="rowIndex" :row="record">
+              <LazySmartsheetCalendarSideRecordCard
+                :draggable="sideBarFilterOption === 'withoutDates' && activeCalendarView !== 'year'"
+                :row="record"
+                :cal-data-type="calDataType"
+                data-testid="nc-sidebar-record-card"
+                @click="emit('expandRecord', record)"
+                @dragstart="dragStart($event, record)"
+                @dragover.prevent
+              >
+                <template v-if="!isRowEmpty(record, displayField)">
+                  <LazySmartsheetPlainCell v-model="record.row[displayField!.title!]" :column="displayField" />
+                </template>
+                <template v-else-if="fields?.length">
+                  <template v-for="field in fields" :key="field.id">
+                    <LazySmartsheetPlainCell
+                      v-if="!isRowEmpty(record, field!)"
+                      v-model="record.row[field!.title!]"
+                      :column="field"
+                    />
+                  </template>
+                </template>
+                <template v-else>
+                  <span class="text-nc-content-gray-muted"> - </span>
+                </template>
+                <template #tooltip>
+                  <SmartsheetRecordFieldsTooltip :record="record" :fields="fields" />
+                </template>
+              </LazySmartsheetCalendarSideRecordCard>
+            </SmartsheetRow>
+          </div>
+        </template>
+      </div>
+      <div
+        v-else
+        :class="{
+          // Interface: no picker above — `h-full` already fills the flexing panel.
+          '!h-[calc(100svh-22.15rem)]':
+            !interfacePageDataApi &&
+            height > 700 &&
+            (activeCalendarView === 'month' || activeCalendarView === 'year') &&
+            !showSearch,
+          '!h-[calc(100svh-24.9rem)]':
+            !interfacePageDataApi &&
+            height > 700 &&
+            (activeCalendarView === 'month' || activeCalendarView === 'year') &&
+            showSearch,
+          '!h-[calc(100svh-13.85rem)]':
+            !interfacePageDataApi &&
+            height <= 700 &&
+            (activeCalendarView === 'month' || activeCalendarView === 'year') &&
+            !showSearch,
+          '!h-[calc(100svh-16.61rem)]':
+            !interfacePageDataApi &&
+            height <= 700 &&
+            (activeCalendarView === 'month' || activeCalendarView === 'year') &&
+            showSearch,
+          '!h-[calc(100svh-30.15rem)]':
+            !interfacePageDataApi &&
+            height > 700 &&
+            (activeCalendarView === 'day' || activeCalendarView === 'week') &&
+            !showSearch,
+          ' !h-[calc(100svh-32.9rem)]':
+            !interfacePageDataApi &&
+            height > 700 &&
+            (activeCalendarView === 'day' || activeCalendarView === 'week') &&
+            showSearch,
+          '!h-[calc(100svh-13.8rem)]':
+            !interfacePageDataApi &&
+            height <= 700 &&
+            (activeCalendarView === 'day' || activeCalendarView === 'week') &&
+            !showSearch,
+          '!h-[calc(100svh-16.6rem)]':
+            !interfacePageDataApi &&
+            height <= 700 &&
+            (activeCalendarView === 'day' || activeCalendarView === 'week') &&
+            showSearch,
+        }"
+        class="flex items-center justify-center h-full"
+      >
+        {{ $t('activity.noRange') }}
+      </div>
+    </div>
+  </div>
+</template>
+
+<style lang="scss" scoped>
+:deep(.nc-attachment-image) {
+  @apply rounded-md;
+}
+
+:deep(.ant-select-selector) {
+  @apply !h-7;
+}
+
+:deep(.nc-month-picker-pagination) {
+  @apply !border-b-0;
+}
+
+:deep(.nc-date-week-header) {
+  @apply !border-b-0;
+}
+:deep(.nc-menu-item-inner) {
+  @apply !w-full;
+}
+</style>

@@ -1,0 +1,124 @@
+import { Injectable } from '@nestjs/common';
+import { DependencyTableType } from 'nocodb-sdk';
+import type { NcContext } from '~/interface/config';
+import DependencyTracker from '~/models/DependencyTracker';
+import { NcError } from '~/helpers/catchError';
+import {
+  Dashboard,
+  DateDependency,
+  InterfacePage,
+  Model,
+  Widget,
+  Workflow,
+} from '~/models';
+import { processConcurrently } from '~/utils';
+
+@Injectable()
+export class DependencyService {
+  async checkDependency(
+    context: NcContext,
+    params: {
+      entityType: string;
+      entityId: string;
+    },
+  ) {
+    const { entityType, entityId } = params;
+
+    const sourceType = entityType;
+
+    if (!sourceType) {
+      NcError.get(context).badRequest(`Invalid entity type: ${entityType}`);
+    }
+
+    const breakingChanges = await DependencyTracker.checkBreakingChanges(
+      context,
+      {
+        sourceType: sourceType as any,
+        sourceId: entityId,
+      },
+    );
+
+    const dashboardIds = new Set<string>();
+    const workflowIds = new Set<string>();
+    const dateDependencyIds = new Set<string>();
+    const interfacePageIds = new Set<string>();
+
+    for (const dep of breakingChanges.dependents) {
+      if (dep.dependent_type === DependencyTableType.Widget) {
+        const widget = await Widget.get(context, dep.dependent_id);
+        if (widget?.fk_dashboard_id) {
+          dashboardIds.add(widget.fk_dashboard_id);
+        }
+      } else if (dep.dependent_type === DependencyTableType.Workflow) {
+        workflowIds.add(dep.dependent_id);
+      } else if (dep.dependent_type === DependencyTableType.DateDependency) {
+        dateDependencyIds.add(dep.dependent_id);
+      } else if (dep.dependent_type === DependencyTableType.InterfacePage) {
+        interfacePageIds.add(dep.dependent_id);
+      }
+    }
+
+    const [dashboards, workflows, dateDependencyTables, interfacePages] =
+      await Promise.all([
+        processConcurrently(Array.from(dashboardIds), (id) =>
+          Dashboard.get(context, id),
+        ),
+        processConcurrently(Array.from(workflowIds), (id) =>
+          Workflow.get(context, id),
+        ),
+        processConcurrently(Array.from(dateDependencyIds), async (id) => {
+          const rule = await DateDependency.get(context, id);
+          if (rule?.fk_model_id) {
+            return Model.get(context, rule.fk_model_id);
+          }
+          return null;
+        }),
+        processConcurrently(Array.from(interfacePageIds), (id) =>
+          InterfacePage.get(context, id),
+        ),
+      ]);
+
+    const entities: Array<{
+      type: DependencyTableType;
+      entity: Dashboard | Workflow | Model | InterfacePage;
+    }> = [];
+
+    for (const dashboard of dashboards.filter(Boolean)) {
+      entities.push({
+        type: DependencyTableType.Widget,
+        entity: dashboard,
+      });
+    }
+
+    for (const workflow of workflows.filter(Boolean)) {
+      entities.push({
+        type: DependencyTableType.Workflow,
+        entity: workflow,
+      });
+    }
+
+    for (const table of dateDependencyTables.filter(Boolean)) {
+      entities.push({
+        type: DependencyTableType.DateDependency,
+        entity: table,
+      });
+    }
+
+    for (const page of interfacePages.filter(Boolean)) {
+      entities.push({
+        type: DependencyTableType.InterfacePage,
+        entity: page,
+      });
+    }
+
+    // Report a breaking change only for dependents this endpoint can actually
+    // name. The tracker also holds column→column edges (a LastModifiedTime/By
+    // column and the fields it tracks) and rows whose entity has since gone —
+    // neither is bucketed above, so taking the raw flag would answer
+    // "something breaks" while listing nothing.
+    return {
+      hasBreakingChanges: entities.length > 0,
+      entities,
+    };
+  }
+}

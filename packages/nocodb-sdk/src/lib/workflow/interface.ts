@@ -1,0 +1,405 @@
+import { ColumnType } from '~/lib/Api';
+import type { WorkflowNodeRetryPolicy } from '~/lib/workflow/node';
+
+enum VariableType {
+  String = 'string',
+  Number = 'number',
+  Integer = 'integer',
+  Boolean = 'boolean',
+  Object = 'object',
+  Array = 'array',
+  Date = 'date',
+  DateTime = 'datetime',
+}
+
+enum VariableGroupKey {
+  Meta = 'meta', // System fields (id, createdAt, etc.)
+  Fields = 'fields', // User data fields
+  Iteration = 'iteration', // Iteration variables (item, index for loops)
+}
+
+interface VariableDefinition {
+  // Expression reference (e.g., "fields.Title" for use in {{ $("Node").fields.Title }})
+  key: string;
+
+  // Human-readable name for UI (e.g., "Title")
+  name: string;
+
+  // Variable type
+  type: VariableType;
+
+  // UI grouping
+  groupKey?: VariableGroupKey;
+
+  // Is this variable an array?
+  isArray?: boolean;
+
+  // Additional metadata for UI
+  extra?: {
+    // Entity ID for dependency tracking
+    entity_id?: string;
+
+    // Entity type for dependency tracking ('column' | 'table' | 'view')
+    entity?: 'column' | 'table' | 'view';
+
+    // icon for the variable
+    icon?: string;
+
+    // UIType for fields
+    uiType?: string;
+
+    // Available options for SingleSelect / MultiSelect fields, so condition
+    // builders can offer the actual options as coloured chips instead of free
+    // text. `color` is omitted when the column has colour coding turned off.
+    selectOptions?: { title: string; color?: string }[];
+
+    // Table/View names for display
+    tableName?: string;
+    viewName?: string;
+
+    // Description for tooltips
+    description?: string;
+
+    // Value for dynamically generated variables (used in data display)
+    value?: any;
+
+    // Item schema for array variables - defines the structure of each array item
+    // Used to generate "Record 1", "Record 2", etc. when displaying actual data
+    itemSchema?: VariableDefinition[];
+
+    // Entity references for dependency tracking
+    // When a variable is an array of objects, this property is used to track the entities that are referenced by the objects
+    entityReferences?: {
+      entity_id: string;
+      entity: 'column' | 'table' | 'view';
+      title: string;
+      field: string;
+    }[];
+
+    // Port identifier for multi-port nodes (e.g., 'body', 'output' for iterate node)
+    // Used to filter variables based on which port is being accessed
+    port?: string;
+
+    // Upstream node the variable comes from (stamped by the config panel when grouping)
+    sourceNodeId?: string;
+    sourceNodeTitle?: string;
+  };
+
+  // Nested variables for objects/arrays
+  children?: VariableDefinition[];
+}
+
+interface NodeExecutionLog {
+  level: 'info' | 'warn' | 'error';
+  message: string;
+  ts?: number;
+  data?: any;
+}
+
+// One failed try of a step.
+interface NodeExecutionAttempt {
+  startTime: number;
+  endTime?: number;
+  error?: string;
+  output?: any;
+  logs?: NodeExecutionLog[];
+}
+
+interface NodeExecutionResult {
+  testMode?: string;
+  nodeId: string;
+  nodeTitle: string;
+  status: 'pending' | 'running' | 'success' | 'error' | 'skipped';
+  output?: any;
+  input?: any;
+  error?: string;
+  // The error is temporary (timeout, rate limit, server error): a retry may succeed.
+  retryable?: boolean;
+  // Server-requested wait before retrying (e.g. HTTP 429 Retry-After).
+  retryAfterMs?: number;
+  // Earlier failed tries of this step, oldest first; absent when it ran once.
+  attempts?: NodeExecutionAttempt[];
+  startTime: number;
+  endTime?: number;
+  nextNode?: string; // Next node to execute (for conditional branching)
+  logs?: NodeExecutionLog[];
+  metrics?: Record<string, number>;
+  isStale?: boolean;
+
+  // The node was checked, not run. A probe or its declared output produced this.
+  simulated?: boolean;
+
+  // Validate refused: this node can only be checked by doing it. A structured
+  // flag because callers BRANCH on it — publish_workflow has to tell "a person
+  // must run this" apart from "this is broken", and matching on the error text
+  // would break the first time the copy is edited or localised.
+  needsRun?: boolean;
+  inputVariables?: VariableDefinition[];
+  outputVariables?: VariableDefinition[];
+
+  // Loop context: Returned by loop nodes to control iteration
+  loopContext?: LoopContext;
+}
+
+// Loop context for loop nodes (iterate, etc.)
+interface LoopContext {
+  // Serializable state that persists across iterations
+  state: Record<string, any>;
+
+  // Output port IDs
+  bodyPort: string; // Port for loop body (e.g., 'body' for 'For Each Item')
+  exitPort: string; // Port for loop exit (e.g., 'output' for 'After Iterate')
+}
+
+// Loop iteration structure (recursive for nested loops)
+interface LoopIteration {
+  iterationIndex: number;
+  nodeResults: NodeExecutionResult[];
+  childLoops?: {
+    [loopNodeId: string]: LoopData;
+  };
+}
+
+// Loop data structure
+interface LoopData {
+  nodeId: string;
+  nodeTitle: string;
+  totalIterations: number;
+  iterations: {
+    [iterationIndex: number]: LoopIteration;
+  };
+}
+
+type WorkflowExecutionStatus =
+  | 'queued'
+  | 'running'
+  | 'waiting'
+  | 'paused'
+  | 'completed'
+  | 'error'
+  | 'cancelled'
+  | 'skipped';
+
+// Requested by a user; the executor acts on it at the next node boundary.
+type WorkflowExecutionControl = 'cancel' | 'pause';
+
+// Why a run ended without a node error: `error` when its worker died or its
+// schedule couldn't be read, `cancelled` on an app/base/workspace suspension.
+type WorkflowExecutionErrorCode =
+  | 'INTERRUPTED'
+  | 'APP_SUSPENDED'
+  | 'WORKSPACE_SUSPENDED'
+  | 'INVALID_SCHEDULE';
+
+// A `waiting` run held back by something other than its own schedule;
+// rechecked by the resume sweep and continued once it clears.
+interface WorkflowExecutionHold {
+  kind: 'app_suspended';
+  reason: string | null;
+  since: number;
+}
+
+type WorkflowExecutionRetryMode = 'from_failed' | 'from_start';
+
+// Which graph a from_failed retry runs: what originally ran, or the current
+// published workflow (e.g. after fixing the failing node).
+type WorkflowExecutionRetryVersion = 'snapshot' | 'latest';
+
+// Run history filters. Each maps to a column on the executions table, never to execution_data.
+interface WorkflowExecutionListFilter {
+  statuses?: WorkflowExecutionStatus[];
+  // ISO timestamps, matched against created_at.
+  from?: string;
+  to?: string;
+  retriesOnly?: boolean;
+  // Finished runs that took at least this long.
+  minDurationMs?: number;
+  // Failed or cancelled runs that no retry points at yet.
+  needsAttention?: boolean;
+}
+
+// Run counts for a workflow under a date range.
+interface WorkflowExecutionStats {
+  total: number;
+  failed: number;
+}
+
+// Loop position at the time state was saved, so a resume re-enters the loop.
+interface ActiveLoopState {
+  nodeId: string;
+  nodeTitle: string;
+  state: Record<string, any>;
+  bodyPort: string;
+  exitPort: string;
+  bodyStartNodeId: string | null;
+  exitNodeId: string | null;
+}
+
+interface WorkflowExecutionState {
+  id: string;
+  workflowId: string;
+  status: WorkflowExecutionStatus;
+  errorCode?: WorkflowExecutionErrorCode;
+  // Shown with errorCode, e.g. the operator's suspension reason.
+  errorMessage?: string;
+  hold?: WorkflowExecutionHold;
+  startTime: number;
+  endTime?: number;
+  nodeResults: NodeExecutionResult[];
+  currentNodeId?: string;
+  triggerData?: any;
+  triggerNodeTitle?: string; // Optional: which trigger node to start from
+  loops?: {
+    [loopNodeId: string]: LoopData;
+  };
+
+  // Delay/pause support
+  pausedAt?: number; // When workflow was paused
+  resumeAt?: number; // When to resume (timestamp from delay node)
+  nextNodeId?: string; // Which node to execute after resume
+  // The step at nextNodeId already finished before the run stopped: continue
+  // with what follows it instead of running it again.
+  nextNodeFinished?: boolean;
+  activeLoops?: ActiveLoopState[];
+
+  // Failed tries of the step waiting on a long retry backoff (keyed by node id
+  // + loop position), carried across the rest so the policy's count holds.
+  pendingRetry?: {
+    key: string;
+    attempts: NodeExecutionAttempt[];
+  };
+
+  // When the current step started; with no result for it, the step was in
+  // flight when the run stopped.
+  currentNodeStartedAt?: number;
+
+  // Times this run was resumed automatically after its worker died.
+  autoResumes?: number;
+}
+
+interface IWorkflowExecution {
+  id: string;
+
+  fk_workspace_id: string;
+  base_id: string;
+
+  fk_workflow_id: string;
+
+  workflow_data?:
+    | {
+        id: string;
+        title: string;
+        nodes: WorkflowGeneralNode[];
+        edges: WorkflowGeneralEdge[];
+      }
+    | Record<string, any>;
+
+  execution_data?: WorkflowExecutionState;
+
+  created_at?: string;
+  updated_at?: string;
+
+  finished_at?: string;
+  started_at?: string;
+  finished?: boolean;
+
+  status: WorkflowExecutionStatus;
+
+  // When to resume if paused
+  resume_at?: string | Date;
+
+  heartbeat_at?: string;
+  control?: WorkflowExecutionControl | null;
+  fk_retry_of_id?: string | null;
+}
+
+interface NodeConfig {
+  [key: string]: any;
+}
+
+interface WorkflowGeneralNode {
+  id: string;
+  type: string;
+  position: {
+    x: number;
+    y: number;
+  };
+  data: {
+    config: NodeConfig;
+    title: string;
+    description?: string;
+    testResult?: NodeExecutionResult;
+    inputVariables?: VariableDefinition[];
+    outputVariables?: VariableDefinition[];
+    // "On failure" setting; absent = the default for the node's retrySafe.
+    retry?: WorkflowNodeRetryPolicy;
+  };
+  targetPosition: 'top' | 'bottom' | 'left' | 'right';
+  sourcePosition: 'top' | 'bottom' | 'left' | 'right';
+}
+
+interface WorkflowGeneralEdge {
+  id: string;
+  source: string; // Source node ID
+  target: string; // Target node ID
+  animated: boolean;
+  label?: string; // Optional label for display (e.g., "True", "For Each Item")
+  sourcePortId?: string; // Source node's output port ID for routing
+  targetPortId?: string; // Target node's input port ID
+  // Vue Flow's own name for the source port, persisted alongside
+  // `sourcePortId` and kept equal to it (see nc-gui useWorkflow). Routing reads
+  // sourcePortId; the editor renders from sourceHandle, so an edge carrying
+  // only one of the two is either unroutable or invisible.
+  sourceHandle?: string;
+}
+
+/**
+ * Context interface for async operations
+ */
+interface VariableGeneratorContext {
+  getColumn?: (columnId: string) => Promise<ColumnType> | ColumnType;
+  getTableColumns?: (tableId: string) => Promise<ColumnType[]> | ColumnType[];
+  port?: string; // Current port for multi-port nodes (e.g., 'body', 'output' for iterate node)
+  linksAsLtar?: boolean; // When true, Links fields are treated as LTAR (nested record objects instead of counts)
+
+  /**
+   * Infer schema from a workflow expression by analyzing referenced nodes
+   * Extracts itemSchema from array variables in previous nodes
+   *
+   * @param expression - Template expression like "{{ $('NodeName').fieldPath }}"
+   * @returns Promise resolving to inferred schema, or undefined if not found
+   *
+   * @example
+   * const schema = await context.inferSchemaFromExpression?.("{{ $('Get Records').records }}");
+   * // Returns the itemSchema of the 'records' variable from 'Get Records' node
+   */
+  inferSchemaFromExpression?: (
+    expression: string
+  ) => Promise<VariableDefinition[] | undefined>;
+}
+
+export {
+  VariableType,
+  VariableGroupKey,
+  VariableDefinition,
+  WorkflowGeneralEdge,
+  WorkflowGeneralNode,
+  NodeExecutionLog,
+  NodeExecutionAttempt,
+  NodeExecutionResult,
+  WorkflowExecutionState,
+  WorkflowExecutionStatus,
+  WorkflowExecutionControl,
+  WorkflowExecutionErrorCode,
+  WorkflowExecutionHold,
+  WorkflowExecutionRetryMode,
+  WorkflowExecutionRetryVersion,
+  WorkflowExecutionListFilter,
+  WorkflowExecutionStats,
+  ActiveLoopState,
+  IWorkflowExecution,
+  LoopContext,
+  LoopIteration,
+  LoopData,
+  VariableGeneratorContext,
+};

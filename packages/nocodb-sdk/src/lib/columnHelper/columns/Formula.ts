@@ -1,0 +1,66 @@
+import AbstractColumnHelper, {
+  SerializerOrParserFnProps,
+} from '../column.interface';
+import { parseProp } from '~/lib/helperFunctions';
+import { ColumnHelper } from '../column-helper';
+import { getEffectiveDisplayColumn } from '../utils/get-effective-display-column';
+import { ComputedTypePasteError } from '~/lib/error';
+import { FormulaDataTypes } from '~/lib/formula/enums';
+import { isFormulaNonFiniteValue } from '~/lib/formula/non-finite';
+import { ncIsNaN } from '~/lib/is';
+
+export class FormulaHelper extends AbstractColumnHelper {
+  columnDefaultMeta = {
+    display_column_meta: {
+      meta: {},
+      custom: {},
+    },
+    display_type: null,
+  };
+
+  serializeValue(
+    value: any,
+    params: SerializerOrParserFnProps['params']
+  ): string | null {
+    if (params.serializeSearchQuery) {
+      const dataType =
+        (params.col?.colOptions as any)?.parsed_tree?.dataType ??
+        FormulaDataTypes.STRING;
+
+      if (dataType === FormulaDataTypes.NUMERIC) {
+        return ncIsNaN(value) ? '' : value;
+      }
+
+      return value;
+    }
+
+    if (params.isMultipleCellPaste) {
+      return undefined;
+    } else {
+      throw new ComputedTypePasteError();
+    }
+  }
+
+  parseValue(
+    value: any,
+    params: SerializerOrParserFnProps['params']
+  ): string | null {
+    const childColumn = getEffectiveDisplayColumn(parseProp(params.col?.meta));
+
+    return ColumnHelper.parseValue(value, {
+      ...params,
+      col: childColumn,
+    });
+  }
+
+  parsePlainCellValue(
+    value: any,
+    params: SerializerOrParserFnProps['params']
+  ): string {
+    // pg IEEE error values arrive as strings in a NUMERIC formula column; the
+    // display column's parser would mangle them. Governs CSV export too.
+    if (isFormulaNonFiniteValue(value)) return value;
+
+    return this.parseValue(value, params) ?? '';
+  }
+}

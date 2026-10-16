@@ -1,0 +1,870 @@
+import { type ColumnType, type TableType, type ViewType, isVirtualCol } from 'nocodb-sdk'
+import type { ComputedRef, Ref } from 'vue'
+import type { EventHook } from '@vueuse/core'
+import { findGroupByPath } from '../components/smartsheet/grid/canvas/utils/groupby'
+import type { CanvasGroup } from '../lib/types'
+import { useInfiniteGroups } from './useInfiniteGroups'
+import { type CellRange, type Row } from '#imports'
+
+// The server's cap on the interface bulk ops
+const INTERFACE_BULK_CHUNK_SIZE = 500
+
+export function useGridViewData(
+  _meta: Ref<TableType | undefined> | ComputedRef<TableType | undefined>,
+  viewMeta: Ref<ViewType | undefined> | ComputedRef<(ViewType & { id: string }) | undefined>,
+  where?: ComputedRef<string | undefined>,
+  reloadVisibleDataHook?: EventHook<void>,
+) {
+  const tablesStore = useTablesStore()
+  const { activeTable } = storeToRefs(tablesStore)
+  const reloadViewDataHook = inject(ReloadViewDataHookInj, createEventHook())
+
+  const meta = computed(() => _meta.value || activeTable.value)
+
+  const { t } = useI18n()
+
+  const optimisedQuery = useState('optimisedQuery', () => true)
+
+  const isPublic = inject(IsPublicInj, ref(false))
+
+  // Interface pages route bulk row ops through the page-scoped adapter — the
+  // synthetic view id is unknown to the plain data ops.
+  const interfaceDataApi = inject(InterfacePageDataInj, undefined)
+
+  // Ad-hoc toolbar filters (not folded into `where`/xWhere) — the interface
+  // delete-all forwards them so its scope matches the select-all count.
+  const smartsheetStore = useSmartsheetStore()
+
+  const reloadAggregate = inject(ReloadAggregateHookInj)
+
+  const { base } = storeToRefs(useBase())
+
+  const { $api, $ncSocket } = useNuxtApp()
+
+  const isBulkOperationInProgress = ref(false)
+
+  const {
+    cachedGroups,
+    totalGroups,
+    toggleExpand,
+    groupByColumns,
+    isGroupBy,
+    buildNestedFilterArr,
+    clearGroupCache,
+    syncCount: groupSyncCount,
+    fetchMissingGroupChunks,
+    updateGroupAggregations,
+    fetchMissingGroupAggregations,
+    toggleExpandAll,
+  } = useInfiniteGroups(viewMeta, meta, where, {
+    syncVisibleData,
+  })
+
+  const {
+    insertRow,
+    updateRowProperty,
+    addEmptyRow,
+    deleteRow,
+    deleteRowById,
+    updateOrSaveRow,
+    cachedRows,
+    clearCache,
+    totalRows,
+    actualTotalRows,
+    bulkUpdateView,
+    removeRowIfNew,
+    syncCount,
+    fetchChunk,
+    getChunkIndex,
+    selectedRows,
+    chunkStates,
+    isRowSortRequiredRows,
+    clearInvalidRows,
+    applySorting,
+    CHUNK_SIZE,
+    isLastRow,
+    isFirstRow,
+    getExpandedRowIndex,
+    loadData,
+    updateRecordOrder,
+    updateRowFields,
+    selectedAllRecords,
+    selectedAllRecordsSkipPks,
+    loadAggCommentsCount,
+    navigateToSiblingRow,
+    getRows,
+    getDataCache,
+    groupDataCache,
+  } = useInfiniteData({
+    meta,
+    viewMeta,
+    callbacks: {
+      syncVisibleData,
+      getCount,
+      getWhereFilter: async (_path?: Array<number>) => where?.value ?? '',
+      getWhereFilterArr: getGroupFilterArr,
+      reloadAggregate: triggerAggregateReload,
+      findGroupByPath: (path?: Array<number>) => {
+        return findGroupByPath(cachedGroups.value, path)
+      },
+    },
+    groupByColumns,
+    where,
+    isPublic,
+  })
+
+  function triggerAggregateReload(params: {
+    fields?: Array<{ title: string; aggregation?: string | undefined }>
+    path: Array<number>
+  }) {
+    const { fields, path } = params
+
+    reloadAggregate?.trigger(params)
+
+    if (!isGroupBy.value) {
+      return
+    }
+
+    function collectChildGroups(group: CanvasGroup): CanvasGroup[] {
+      const result: CanvasGroup[] = [group]
+      if (group.groups && group.groups.size > 0) {
+        for (const childGroup of group.groups.values()) {
+          result.push(...collectChildGroups(childGroup))
+        }
+      }
+      return result
+    }
+
+    const targetGroup = findGroupByPath(cachedGroups.value, path)
+    if (!targetGroup) return
+
+    const groupsToUpdate = collectChildGroups(targetGroup)
+    updateGroupAggregations(groupsToUpdate, fields)
+
+    if (path.length > 1) {
+      for (let i = path.length - 1; i > 0; i--) {
+        const parentPath = path.slice(0, i)
+        const parentGroup = findGroupByPath(cachedGroups.value, parentPath)
+        if (parentGroup) {
+          const parentAndChildren = collectChildGroups(parentGroup)
+          updateGroupAggregations(parentAndChildren, fields)
+        }
+      }
+    }
+  }
+
+  const reloadAggregateListener = (v: Record<string, any> = {}) => {
+    const { path, fields } = v
+    if (!path?.length && isGroupBy.value) {
+      const allGroups: CanvasGroup[] = []
+
+      function collectAllGroups(groups: Map<number, CanvasGroup>) {
+        const groupArray = Array.from(groups.values())
+        allGroups.push(...groupArray)
+
+        for (const group of groupArray) {
+          if (group.groups && group.groups.size > 0) {
+            collectAllGroups(group.groups)
+          }
+        }
+      }
+
+      collectAllGroups(cachedGroups.value)
+
+      if (allGroups.length) {
+        updateGroupAggregations(allGroups, fields)
+      }
+    }
+  }
+
+  reloadAggregate?.on(reloadAggregateListener)
+
+  // While the socket is disconnected (e.g. tab left idle for hours) every realtime
+  // data event is missed — peers moving records between groups, deletes, updates —
+  // so group counts and cached rows go stale and moved-out records linger as loading
+  // placeholders. A page reload fixes it; so does resyncing the view on reconnect.
+  // Only on an actual reconnect, not the first handshake (data is already fresh then).
+  const offSocketReady = $ncSocket.onReady(({ reconnected }) => {
+    if (!reconnected) return
+    reloadViewDataHook?.trigger()
+    // Footer/column aggregations aren't re-fetched by the data reload above (group
+    // aggregations reload with their chunks, but the view-level footer only reloads
+    // on view switch), so refresh them too or they'd stay stale after reconnect.
+    reloadAggregate?.trigger(undefined)
+  })
+
+  onBeforeUnmount(() => {
+    reloadAggregate?.off(reloadAggregateListener)
+    offSocketReady?.()
+  })
+
+  function getCount(path?: Array<number>) {
+    if (!path?.length) return
+    let currentGroups = cachedGroups.value
+    const pathCopy = [...path]
+
+    for (let i = 0; i < path.length - 1; i++) {
+      const groupIndex = pathCopy[i]
+      const group = currentGroups.get(groupIndex)
+
+      if (!group || !group.groups) {
+        console.warn(`Invalid path: Group at index ${groupIndex} not found or has no subgroups`)
+        return undefined
+      }
+
+      currentGroups = group.groups
+    }
+
+    const finalIndex = pathCopy[path.length - 1]
+    const targetGroup = currentGroups.get(finalIndex)
+
+    if (!targetGroup) {
+      console.warn(`Target group at path [${path}] not found`)
+      return undefined
+    }
+
+    return targetGroup.count
+  }
+
+  async function getGroupFilterArr(path: Array<number> = [], _ignoreWhereFilter = false) {
+    let group = findGroupByPath(cachedGroups.value, path)
+
+    if (!group) {
+      try {
+        let currentGroups = cachedGroups.value
+        let parentGroup: CanvasGroup | undefined
+        let targetIndex: number | undefined
+
+        for (let depth = 0; depth < path.length; depth++) {
+          const groupIndex = path[depth]
+          const currentGroup = currentGroups.get(groupIndex)
+
+          if (!currentGroup) {
+            targetIndex = groupIndex
+            break
+          }
+
+          if (depth === path.length - 1) {
+            targetIndex = groupIndex
+            break
+          }
+
+          if (!currentGroup.isExpanded || !currentGroup.groups) {
+            return []
+          }
+
+          parentGroup = currentGroup
+          currentGroups = currentGroup.groups
+        }
+
+        if (targetIndex !== undefined) {
+          await fetchMissingGroupChunks(targetIndex, targetIndex, parentGroup)
+        }
+
+        group = findGroupByPath(cachedGroups.value, path)
+      } catch (error) {
+        console.error(`Failed to load group for path ${path}:`, error)
+        return []
+      }
+    }
+
+    return buildNestedFilterArr(group)
+  }
+
+  function syncVisibleData() {
+    reloadVisibleDataHook?.trigger()
+  }
+
+  async function deleteSelectedRows(path: Array<number> = []): Promise<void> {
+    let removedRowsData: Record<string, any>[] = []
+    let compositePrimaryKey = ''
+    isBulkOperationInProgress.value = true
+    const dataCache = getDataCache(path)
+
+    for (const row of dataCache.selectedRows.value) {
+      const { row: rowData, rowMeta } = row
+
+      if (!rowMeta.selected || rowMeta.new) {
+        continue
+      }
+
+      const extractedPk = extractPk(meta?.value?.columns as ColumnType[])
+      const compositePkValue = extractPkFromRow(rowData, meta?.value?.columns as ColumnType[]) as string
+      const pkData = rowPkData(rowData, meta?.value?.columns as ColumnType[])
+
+      if (extractedPk && compositePkValue) {
+        if (!compositePrimaryKey) compositePrimaryKey = extractedPk
+        removedRowsData.push({
+          [compositePrimaryKey]: compositePkValue as string,
+          pkData,
+          row: deepClone(rowData),
+          rowMeta,
+        })
+      }
+    }
+
+    if (!removedRowsData.length) return
+
+    try {
+      // Full-record enrichment uses the PLAIN data ops — interface pages skip
+      // it (cached rows already hold every field the page may serve).
+      if (!interfaceDataApi) {
+        const { list = [] } = await $api.internal.getOperation((meta.value as any).fk_workspace_id!, meta.value!.base_id!, {
+          operation: 'dataList',
+          tableId: meta.value?.id as string,
+          pks: removedRowsData.map((row) => row[compositePrimaryKey]).join(','),
+          getHiddenColumns: true,
+          limit: removedRowsData.length,
+        })
+
+        removedRowsData = removedRowsData.map((row) => {
+          const rowObj = row.row
+          const rowPk = rowPkData(rowObj, meta.value?.columns as ColumnType[])
+
+          const fullRecord = list.find((r: Record<string, any>) => {
+            return Object.keys(rowPk).every((key) => r[key] === rowPk[key])
+          })
+
+          if (!fullRecord) return { ...row }
+          return {
+            ...row,
+            row: { ...fullRecord },
+          }
+        })
+      }
+
+      await bulkDeleteRows(removedRowsData.map((row) => row.pkData))
+    } catch (e: any) {
+      const errorMessage = await extractSdkResponseErrorMsg(e)
+      isBulkOperationInProgress.value = false
+      return message.error(`${t('msg.error.deleteRowFailed')}: ${errorMessage}`)
+    }
+
+    await updateCacheAfterDelete(removedRowsData, false, path)
+
+    isBulkOperationInProgress.value = false
+
+    await syncCount(path)
+  }
+
+  async function bulkUpdateRows(
+    rows: Row[],
+    props: string[],
+    { metaValue = meta.value, onError }: { metaValue?: TableType; viewMetaValue?: ViewType; onError?: (e: any) => void } = {},
+    path: Array<number> = [],
+  ): Promise<void> {
+    isBulkOperationInProgress.value = true
+
+    const dataCache = getDataCache(path)
+
+    await Promise.all(
+      rows.map(async (row) => {
+        if (row.rowMeta) {
+          row.rowMeta.changed = false
+          await until(() => !(row.rowMeta?.new && row.rowMeta?.saving)).toMatch((v) => v)
+          row.rowMeta.saving = true
+        }
+      }),
+    )
+    const pksIndex = [] as { pk: string; rowIndex: number }[]
+
+    const updateArray = rows.map((row) => {
+      const pk = rowPkData(row.row, metaValue?.columns as ColumnType[])
+      const updateData = props.reduce((acc, prop) => ({ ...acc, [prop]: row.row[prop] }), {})
+      pksIndex.push({
+        pk: extractPkFromRow(row.row, metaValue?.columns as ColumnType[]) as string,
+        rowIndex: row.rowMeta.rowIndex!,
+      })
+      return { ...updateData, ...pk }
+    })
+
+    try {
+      let newRows: Record<string, any>
+
+      if (interfaceDataApi?.bulkUpdateRows) {
+        // Interface pages — the page-scoped bulk update (grant-authorized;
+        // the raw bulk endpoint 403s for interface collaborators). It
+        // returns no rows; local optimistic values stand and the page-scoped
+        // realtime updates reconcile.
+        const pkTitles = ((metaValue?.columns ?? []) as ColumnType[]).filter((c) => c.pk).map((c) => c.title!)
+        await interfaceDataApi.bulkUpdateRows(
+          rows.map((row) => ({
+            rowId: extractPkFromRow(row.row, metaValue?.columns as ColumnType[]) as string,
+            data: props.reduce(
+              (acc, prop) => (pkTitles.includes(prop) ? acc : { ...acc, [prop]: row.row[prop] }),
+              {} as Record<string, any>,
+            ),
+          })),
+        )
+        newRows = []
+      } else {
+        newRows = (await $api.dbTableRow.bulkUpdate(NOCO, metaValue?.base_id as string, metaValue?.id as string, updateArray, {
+          typecast: 'true',
+        })) as Record<string, any>
+      }
+
+      triggerAggregateReload({ fields: props.map((p) => ({ title: p })), path })
+
+      newRows.forEach((newRow: Record<string, any>) => {
+        const pk = extractPkFromRow(newRow, metaValue?.columns as ColumnType[])
+        const rowIndex = pksIndex.find((pkIndex) => pkIndex.pk === pk)?.rowIndex
+
+        if (rowIndex !== undefined && rowIndex !== null) {
+          const row = dataCache.cachedRows.value.get(rowIndex)
+          if (row) {
+            row.rowMeta.saving = false
+            row.row = {
+              ...row.row,
+              ...newRow,
+            }
+            // Mark row as hidden if it moved out of user's RLS scope after update
+            if (newRow.__nc_rls_hidden) {
+              row.rowMeta.isRlsHidden = true
+            }
+            dataCache.cachedRows.value.set(rowIndex, row)
+          }
+        }
+      })
+    } catch (e) {
+      console.error(e)
+      onError?.(e)
+      message.error(await extractSdkResponseErrorMsg(e as any))
+      isBulkOperationInProgress.value = false
+      return
+    } finally {
+      rows.forEach((row) => {
+        if (row.rowMeta) row.rowMeta.saving = false
+      })
+    }
+    applySorting(rows)
+    syncVisibleData()
+    reloadViewDataHook?.trigger()
+    isBulkOperationInProgress.value = false
+  }
+
+  async function bulkUpsertRows(
+    insertRows: Row[],
+    updateRows: Row[],
+    props: string[],
+    {
+      metaValue = meta.value,
+    }: {
+      metaValue?: TableType
+    } = {},
+    columns: Partial<ColumnType>[],
+    path: Array<number> = [],
+  ) {
+    const dataCache = getDataCache(path)
+
+    try {
+      isBulkOperationInProgress.value = true
+      const rowsToFetch = updateRows.filter((row) => !dataCache.cachedRows.value.has(row.rowMeta.rowIndex!))
+      const chunksToFetch = new Set(rowsToFetch.map((row) => Math.floor(row.rowMeta.rowIndex! / CHUNK_SIZE)))
+
+      await Promise.all(Array.from(chunksToFetch).map((chunkId) => fetchChunk(chunkId, path)))
+
+      const getPk = (row: Row) => extractPkFromRow(row.row, metaValue?.columns as ColumnType[])
+
+      const cleanRow = (row: any) => {
+        const cleanedRow = { ...row }
+        metaValue?.columns?.forEach((col) => {
+          // Strip system, virtual and readonly (e.g. AutoNumber) columns — the backend
+          // rejects readonly columns in insert/update payloads. Keep pk so upsert can
+          // still match existing rows for updates.
+          if (col.system || isVirtualCol(col) || (col.readonly && !col.pk)) delete cleanedRow[col.title!]
+        })
+        return cleanedRow
+      }
+
+      updateRows = updateRows.map((row) => {
+        const cachedRow = dataCache.cachedRows.value.get(row.rowMeta.rowIndex!)
+        if (cachedRow) {
+          return {
+            ...cachedRow,
+            row: { ...cachedRow.row, ...row.row },
+            oldRow: cachedRow.row,
+          }
+        }
+        return row
+      })
+
+      let bulkUpsertedRows: Record<string, any>[]
+      // Set when an interface insert chunk fails after earlier chunks committed
+      let partialInsertError: any
+
+      if (interfaceDataApi?.bulkInsertRows && interfaceDataApi.bulkUpdateRows) {
+        // Interface pages — page-scoped ops, so the rows get edit grace and the
+        // field allow-list applies (the raw upsert 403s for interface collaborators).
+        // Not atomic: updates run first so their failure strands no new rows, and
+        // rows inserted before a failed chunk are still cached and returned.
+        const pkTitles = ((metaValue?.columns ?? []) as ColumnType[]).filter((c) => c.pk).map((c) => c.title!)
+        const updateData = updateRows.map((row) => ({
+          rowId: getPk(row) as string,
+          data: props.reduce(
+            (acc, prop) => (pkTitles.includes(prop) ? acc : { ...acc, [prop]: row.row[prop] }),
+            {} as Record<string, any>,
+          ),
+        }))
+        for (let i = 0; i < updateData.length; i += INTERFACE_BULK_CHUNK_SIZE) {
+          await interfaceDataApi.bulkUpdateRows(updateData.slice(i, i + INTERFACE_BULK_CHUNK_SIZE))
+        }
+
+        const insertData = insertRows.map((row) => cleanRow(row.row))
+        const insertedPks: Record<string, any>[] = []
+        for (let i = 0; i < insertData.length; i += INTERFACE_BULK_CHUNK_SIZE) {
+          try {
+            insertedPks.push(...(await interfaceDataApi.bulkInsertRows(insertData.slice(i, i + INTERFACE_BULK_CHUNK_SIZE))))
+          } catch (e) {
+            if (!insertedPks.length) throw e
+            partialInsertError = e
+            break
+          }
+        }
+
+        bulkUpsertedRows = [
+          ...insertedPks.map((pk, i) => ({ ...insertData[i], ...pk })),
+          ...updateRows.map((row) => cleanRow(row.row)),
+        ]
+      } else {
+        bulkUpsertedRows = await $api.dbTableRow.bulkUpsert(
+          NOCO,
+          metaValue?.base_id ?? (base.value?.id as string),
+          metaValue?.id as string,
+          [...insertRows.map((row) => cleanRow(row.row)), ...updateRows.map((row) => cleanRow(row.row))],
+          { typecast: 'true' },
+        )
+      }
+
+      const existingPks = new Set(Array.from(dataCache.cachedRows.value.values()).map((row) => getPk(row)))
+      const [insertedRows, updatedRows] = bulkUpsertedRows.reduce(
+        ([inserted, updated], row) => {
+          const isPkExisting = existingPks.has(extractPkFromRow(row, metaValue?.columns as ColumnType[]))
+          return isPkExisting
+            ? [inserted, [...updated, { row, rowMeta: {}, oldRow: row }]]
+            : [[...inserted, { row, rowMeta: {}, oldRow: {} }], updated]
+        },
+        [[], []] as [Row[], Row[]],
+      )
+
+      insertedRows.forEach((row: Row, index: number) => {
+        const newIndex = dataCache.totalRows.value + index
+        row.rowMeta.rowIndex = newIndex
+        dataCache.cachedRows.value.set(newIndex, { ...row, rowMeta: { ...row.rowMeta, rowIndex: newIndex } })
+      })
+      updatedRows.forEach((row: Row) => {
+        const existingRow = Array.from(dataCache.cachedRows.value.entries()).find(([_, r]) => getPk(r) === getPk(row))
+        if (existingRow) {
+          dataCache.cachedRows.value.set(existingRow[0], {
+            ...row,
+            rowMeta: { ...row.rowMeta, rowIndex: existingRow[0] },
+          })
+        }
+      })
+
+      dataCache.totalRows.value += insertedRows.length
+
+      reloadViewDataHook?.trigger()
+      syncVisibleData()
+      await syncCount(path, true, false)
+
+      if (partialInsertError) message.error(await extractSdkResponseErrorMsg(partialInsertError))
+
+      return bulkUpsertedRows
+    } catch (error: any) {
+      message.error(await extractSdkResponseErrorMsg(error))
+      // Interface writes aren't atomic — earlier requests may have committed
+      if (interfaceDataApi) reloadViewDataHook?.trigger()
+    } finally {
+      isBulkOperationInProgress.value = false
+    }
+  }
+
+  async function updateCacheAfterDelete(
+    rowsToDelete: Record<string, any>[],
+    nested = true,
+    path: Array<number> = [],
+  ): Promise<void> {
+    const dataCache = getDataCache(path)
+    const maxCachedIndex = Math.max(...dataCache.cachedRows.value.keys())
+    const newCachedRows = new Map<number, Row>()
+
+    const deleteSet = new Set(rowsToDelete.map((row) => (nested ? row.row : row).rowMeta.rowIndex))
+    const affectedChunks = new Set<number>()
+    let deletionCount = 0
+
+    for (let i = 0; i <= maxCachedIndex + 1; i++) {
+      if (deleteSet.has(i)) {
+        deletionCount++
+        affectedChunks.add(getChunkIndex(i))
+        continue
+      }
+
+      if (dataCache.cachedRows.value.has(i)) {
+        const row = dataCache.cachedRows.value.get(i)
+        if (row) {
+          const newIndex = i - deletionCount
+
+          row.rowMeta.rowIndex = newIndex
+          newCachedRows.set(newIndex, row)
+          affectedChunks.add(getChunkIndex(i))
+          affectedChunks.add(getChunkIndex(newIndex))
+        }
+      }
+    }
+
+    const rowsByChunk = new Map<number, number>()
+    for (const [_, row] of newCachedRows) {
+      const chunkIndex = getChunkIndex(row.rowMeta.rowIndex)
+      rowsByChunk.set(chunkIndex, (rowsByChunk.get(chunkIndex) || 0) + 1)
+    }
+
+    for (const chunkIndex of affectedChunks) {
+      if (!rowsByChunk.has(chunkIndex) || rowsByChunk.get(chunkIndex) < CHUNK_SIZE) {
+        dataCache.chunkStates.value[chunkIndex] = undefined
+      }
+    }
+
+    const indices = new Set<number>()
+    for (const [_, row] of newCachedRows) {
+      if (indices.has(row.rowMeta.rowIndex)) {
+        console.error(`Op: updateCacheAfterDelete: Duplicate index detected:`, row.rowMeta.rowIndex)
+        break
+      }
+      indices.add(row.rowMeta.rowIndex)
+    }
+
+    dataCache.cachedRows.value = newCachedRows
+    dataCache.totalRows.value = Math.max(0, dataCache.totalRows.value - rowsToDelete.length)
+
+    await syncCount(path)
+    syncVisibleData()
+  }
+
+  async function deleteRangeOfRows(cellRange: CellRange, path: Array<number> = []): Promise<void> {
+    if (!cellRange._start || !cellRange._end) return
+    isBulkOperationInProgress.value = true
+    const dataCache = getDataCache(path)
+
+    const start = Math.min(cellRange._start.row, cellRange._end.row)
+    const end = Math.max(cellRange._start.row, cellRange._end.row)
+
+    let rowsToDelete: Record<string, any>[] = []
+    let compositePrimaryKey = ''
+
+    await getRows(start, end, path)
+
+    for (let i = start; i <= end; i++) {
+      const cachedRow = dataCache.cachedRows.value.get(i)
+      if (!cachedRow) {
+        console.warn(`Record at index ${i} not found in local cache`)
+        continue
+      }
+
+      const { row: rowData, rowMeta } = cachedRow
+
+      if (!rowMeta.new) {
+        const extractedPk = extractPk(meta?.value?.columns as ColumnType[])
+        const compositePkValue = extractPkFromRow(rowData, meta?.value?.columns as ColumnType[])
+        const pkData = rowPkData(rowData, meta?.value?.columns as ColumnType[])
+
+        if (extractedPk && compositePkValue) {
+          if (!compositePrimaryKey) compositePrimaryKey = extractedPk
+
+          rowsToDelete.push({
+            [compositePrimaryKey]: compositePkValue,
+            pkData,
+            ...cachedRow,
+            rowIndex: i,
+          })
+        }
+      }
+    }
+
+    if (!rowsToDelete.length) return
+
+    try {
+      // Same interface skip as `deleteSelectedRows` — plain-op enrichment only.
+      if (!interfaceDataApi) {
+        const { list = [] } = await $api.internal.getOperation((meta.value as any).fk_workspace_id!, meta.value!.base_id!, {
+          operation: 'dataList',
+          tableId: meta.value?.id as string,
+          pks: rowsToDelete.map((row) => row[compositePrimaryKey]).join(','),
+          getHiddenColumns: 'true',
+          limit: rowsToDelete.length,
+        })
+
+        rowsToDelete = rowsToDelete.map((row) => {
+          const rowObj = row.row
+          const rowPk = rowPkData(rowObj, meta.value?.columns as ColumnType[])
+
+          const fullRecord = list.find((r: Record<string, any>) => {
+            return Object.keys(rowPk).every((key) => r[key] === rowPk[key])
+          })
+
+          if (!fullRecord) {
+            console.warn(`Full record not found for row with index ${row.rowMeta.rowIndex}`)
+            return row
+          }
+          row.row = fullRecord
+          return row
+        })
+      }
+
+      await bulkDeleteRows(rowsToDelete.map((row) => row.pkData))
+    } catch (e: any) {
+      const errorMessage = await extractSdkResponseErrorMsg(e)
+      message.error(`${t('msg.error.deleteRowFailed')}: ${errorMessage}`)
+      isBulkOperationInProgress.value = false
+      throw e
+    }
+
+    await updateCacheAfterDelete(rowsToDelete, false, path)
+    isBulkOperationInProgress.value = false
+  }
+
+  async function bulkDeleteRows(
+    rows: Record<string, string>[],
+    {
+      metaValue = meta.value,
+      viewMetaValue = viewMeta.value,
+    }: {
+      metaValue?: TableType
+      viewMetaValue?: ViewType
+    } = {},
+  ): Promise<any> {
+    // Let adapter failures propagate — the callers toast and leave the row
+    // cache intact (the shared catch below swallows, which would evict rows
+    // that were never deleted).
+    if (interfaceDataApi) {
+      await interfaceDataApi.bulkDeleteRows(rows.map((pkData) => Object.values(pkData).join('___')))
+
+      triggerAggregateReload({ path: [] })
+
+      return rows
+    }
+
+    try {
+      const bulkDeletedRowsData = await $api.internal.postOperation(
+        (metaValue as any).fk_workspace_id!,
+        metaValue!.base_id!,
+        {
+          operation: 'dataDelete',
+          tableId: metaValue?.id as string,
+          viewId: viewMetaValue?.id as string,
+        },
+        rows.length === 1 ? rows[0] : rows,
+      )
+
+      triggerAggregateReload({ path: [] })
+
+      return rows.length === 1 && bulkDeletedRowsData ? [bulkDeletedRowsData] : bulkDeletedRowsData
+    } catch (error: any) {
+      const errorMessage = await extractSdkResponseErrorMsg(error)
+      message.error(`Bulk delete failed: ${errorMessage}`)
+    }
+  }
+
+  /** Resolves false when the delete failed, so the caller can keep the selection. */
+  async function bulkDeleteAll(path: Array<number> = []) {
+    let succeeded = false
+
+    try {
+      isBulkOperationInProgress.value = true
+
+      const skipPks = Object.values(selectedAllRecordsSkipPks.value).join(',')
+
+      if (interfaceDataApi) {
+        // The interface has no persisted view for the server to re-apply filters
+        // from, so forward the live search (`where`) + ad-hoc toolbar filters —
+        // the same narrowing select-all counted; the viz scope bounds it server-side.
+        if (!interfaceDataApi.bulkDeleteAll) {
+          throw new Error('Delete all records is not available on this surface')
+        }
+
+        await interfaceDataApi.bulkDeleteAll({
+          where: where?.value,
+          filtersArr: smartsheetStore?.nestedFilters?.value ?? [],
+          skipPks,
+        })
+      } else {
+        await $api.internal.postOperation(
+          (meta.value as any).fk_workspace_id!,
+          meta.value!.base_id!,
+          {
+            operation: 'bulkDataDeleteAll',
+            tableId: meta.value.id!,
+            where: where?.value,
+            viewId: viewMeta.value?.id,
+            skipPks,
+          },
+          {},
+        )
+      }
+
+      succeeded = true
+    } catch (error: any) {
+      message.error(`Bulk delete failed: ${await extractSdkResponseErrorMsg(error)}`)
+    } finally {
+      clearCache(Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, path)
+      await syncCount(path)
+      syncVisibleData?.()
+      triggerAggregateReload({ path })
+      isBulkOperationInProgress.value = false
+    }
+
+    return succeeded
+  }
+
+  return {
+    cachedRows,
+    loadData,
+    insertRow,
+    updateRowProperty,
+    addEmptyRow,
+    deleteRow,
+    deleteRowById,
+    deleteSelectedRows,
+    deleteRangeOfRows,
+    updateOrSaveRow,
+    bulkUpdateRows,
+    bulkUpsertRows,
+    bulkUpdateView,
+    bulkDeleteAll,
+    loadAggCommentsCount,
+    syncCount,
+    removeRowIfNew,
+    navigateToSiblingRow,
+    getExpandedRowIndex,
+    optimisedQuery,
+    isLastRow,
+    isFirstRow,
+    clearCache,
+    totalRows,
+    actualTotalRows,
+    selectedRows,
+    syncVisibleData,
+    chunkStates,
+    clearInvalidRows,
+    applySorting,
+    isRowSortRequiredRows,
+    isBulkOperationInProgress,
+    updateRecordOrder,
+    updateRowFields,
+    selectedAllRecords,
+    selectedAllRecordsSkipPks,
+    getRows,
+    getDataCache,
+    groupDataCache,
+    // Groupby
+    cachedGroups,
+    totalGroups,
+    toggleExpand,
+    groupByColumns,
+    isGroupBy,
+    groupSyncCount,
+    fetchMissingGroupChunks,
+    fetchMissingGroupAggregations,
+    clearGroupCache,
+    toggleExpandAll,
+  }
+}

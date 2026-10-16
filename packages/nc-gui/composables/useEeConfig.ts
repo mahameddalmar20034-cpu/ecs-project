@@ -1,0 +1,754 @@
+import type { CloudFeaturesType } from '~/lib/types'
+
+const eeConfigState = createGlobalState(() => {
+  const cloudFeatures = ref<CloudFeaturesType[]>([])
+
+  return { cloudFeatures }
+})
+
+export const useEeConfig = createSharedComposable(() => {
+  const { cloudFeatures } = eeConfigState()
+
+  const { appInfo } = useGlobal()
+
+  const isOrgBilling = ref(false)
+
+  const isSideBannerExpanded = ref(false)
+
+  const isPaidPlan = computed(() => false)
+
+  const activePlan = computed(() => undefined)
+
+  const activePlanTitle = computed(() => undefined)
+
+  const isHigherActivePlan = computed(() => false)
+
+  const activeSubscription = computed(() => undefined)
+
+  const isLoyaltyDiscountAvailable = computed(() => false)
+
+  const isPaymentEnabled = computed(() => false)
+
+  const blockAddNewRecord = computed(() => false)
+
+  const isRecordLimitReached = computed(() => false)
+
+  const gracePeriodActive = computed(() => true)
+
+  const gracePeriodEndDate = computed(() => '')
+
+  const isWsAuditEnabled = computed(() => false)
+
+  const isAllowToAddExtension = computed(() => true)
+
+  const blockAddNewExtension = computed(() => false)
+
+  const blockExtensions = computed(() => false)
+
+  const blockAddNewAttachment = computed(() => false)
+
+  const blockAddNewExternalSource = computed(() => false)
+
+  const blockAddNewWebhook = computed(() => false)
+
+  const isTopBannerVisible = computed(() => false)
+
+  const blockWsImageLogoUpload = computed(() => true)
+
+  const blockCurrentUserFilter = computed(() => false)
+
+  const blockRowColoring = computed(() => true)
+
+  const blockToggleFilter = computed(() => true)
+
+  const blockToggleGroupBy = computed(() => true)
+
+  const blockToggleSort = computed(() => true)
+
+  const blockPinnedFilter = computed(() => true)
+
+  const blockCellColoring = computed(() => true)
+
+  const blockTableAndFieldPermissions = computed(() => true)
+
+  const blockPrivateBases = computed(() => true)
+
+  const blockEnterpriseVaults = computed(() => true)
+
+  const blockAddNewDashboard = computed(() => true)
+
+  // Interfaces are EE-only — every gate stays blocked in CE.
+  const hideInterfaces = computed(() => true)
+
+  const blockAddNewInterface = computed(() => true)
+  const isInterfacePageLimitReached = (_count: number) => true
+  const blockInterfaceMultiViz = computed(() => true)
+
+  const blockCoEditing = computed(() => true)
+  const blockInterfaceMetricColorConditions = computed(() => true)
+  const blockInterfacePivotWidget = computed(() => true)
+  const blockInterfaceViewWidget = computed(() => true)
+  const blockInterfaceIframeWidget = computed(() => true)
+  const blockInterfaceUserFilters = computed(() => true)
+  const blockCopyViewSettingFromOther = computed(() => true)
+
+  // Skills governance is EE-only; CE has no plan concept at all.
+  const blockSkillsGovernance = computed(() => true)
+  const blockSkillsOrg = computed(() => true)
+  const showUpgradeToUseSkillsGovernance = (..._args: any[]) => {}
+  const showUpgradeToUseSkillsOrg = (..._args: any[]) => {}
+  const blockInterfaceToolbarToggles = computed(() => true)
+  const blockInterfaceDrafts = computed(() => true)
+  const blockInterfacePreviewAs = computed(() => true)
+  const blockInterfaceAccessControl = computed(() => true)
+  const blockInterfacePageAccessControl = computed(() => true)
+  const blockInterfaceButtonVisibility = computed(() => true)
+  const showUpgradeForInterfaceFeature = (..._args: any[]) => {}
+  const showInterfacePlanLimitExceededModal = (..._args: any[]) => {}
+  const showInterfacePageLimitExceededModal = (..._args: any[]) => {}
+
+  const blockCalendarRange = computed(() => true)
+
+  const blockTimelineView = computed(() => true)
+
+  const blockGanttView = computed(() => true)
+
+  const blockAddNewScript = computed(() => true)
+
+  const blockAddNewAgent = computed(() => true)
+
+  const showUserMayChargeAlert = computed(() => false)
+
+  const maxAttachmentsAllowedInCell = computed(() => {
+    // Keeping 50 to keep backward fallback compatibility
+    return Math.max(1, +appInfo.value.ncMaxAttachmentsAllowed || 50)
+  })
+
+  const blockAiPromptField = computed(() => true)
+
+  const blockAiButtonField = computed(() => true)
+
+  const blockAiChat = computed(() => true)
+
+  const blockAiIntegrations = computed(() => true)
+
+  const blockAiIntegrationsLimit = computed(() => true)
+
+  const blockDocAi = computed(() => true)
+
+  const blockButtonVisibility = computed(() => true)
+
+  const blockTableVisibility = computed(() => true)
+
+  const blockFieldVisibility = computed(() => true)
+
+  const blockColourField = computed(() => true)
+
+  const blockTeamHierarchy = computed(() => true)
+
+  const blockTeamsManagement = computed(() => true)
+
+  const blockAddNewTeamToWs = computed(() => true)
+
+  const blockCardFieldHeaderVisibility = computed(() => true)
+
+  const blockAddNewEnvironmentInstance = computed(() => true)
+
+  const blockSync = computed(() => true)
+
+  const blockTableSync = computed(() => true)
+
+  const blockTableSyncAuto = computed(() => true)
+
+  const blockCustomSync = computed(() => true)
+
+  const blockUnique = computed(() => true)
+
+  // UUID field is EE-only — always blocked in CE
+  const blockUuidField = computed(() => true)
+
+  const blockListView = computed(() => true)
+
+  const blockMapView = computed(() => true)
+
+  // AutoNumber field is EE-only — always blocked in CE
+  const blockAutoNumberField = computed(() => true)
+
+  // AI credits are EE/Cloud-only — CE never gates on them
+  const blockAiCredits = computed(() => false)
+
+  const showBuyCredits = (..._args: any[]) => {}
+
+  const calculatePrice = (..._args: any[]) => {}
+
+  const getLimit = (..._args: any[]) => {}
+
+  const getStatLimit = (..._args: any[]) => {}
+
+  const updateStatLimit = (..._args: any[]) => {}
+
+  const getFeature = (..._args: any[]) => {
+    return true
+  }
+
+  const getFeatureForPlanTitle = (..._args: any[]) => {
+    return true
+  }
+
+  const getHigherPlan = (..._args: any[]) => {}
+
+  const getPlanTitle = (..._args: any[]) => {}
+
+  const navigateToBilling = (..._args: any[]) => {}
+
+  const navigateToPricing = (..._args: any[]) => {}
+
+  const navigateToCheckout = (..._args: any[]) => {}
+
+  const handleUpgradePlan = (..._args: any[]) => {}
+
+  const handleRequestUpgrade = async (..._args: any[]) => false
+
+  const showUserPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showRecordPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showStoragePlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showExternalSourcePlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showWebhookPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showWebhookLogsFeatureAccessModal = (..._args: any[]) => {}
+
+  const blockExternalSourceRecordVisibility = (..._args: any[]) => {}
+
+  const showAsBluredRecord = (..._args: any[]) => {}
+
+  const showUpgradeToSeeMoreRecordsModal = (..._args: any[]) => {}
+
+  const showUpgradeToUploadWsImage = (..._args: any[]) => {}
+
+  const showUpgradeToUseCurrentUserFilter = (..._args: any[]) => {}
+
+  const showUpgradeToUseRowColoring = (..._args: any[]) => {}
+
+  const showUpgradeToUseToggleFilter = (..._args: any[]) => {}
+
+  const showUpgradeToUseToggleGroupBy = (..._args: any[]) => {}
+
+  const showUpgradeToUseToggleSort = (..._args: any[]) => {}
+
+  const showUpgradeToUsePinnedFilter = (..._args: any[]) => {}
+
+  const showUpgradeToUseCellColoring = (..._args: any[]) => {}
+
+  const showUpgradeToUseTableAndFieldPermissions = (..._args: any[]) => {}
+
+  const showUpgradeToUseTableVisibility = (..._args: any[]) => {}
+
+  const showUpgradeToUseFieldVisibility = (..._args: any[]) => {}
+
+  const showUpgradeToAddAiIntegration = (..._args: any[]) => {}
+
+  const blockDocumentPermissions = computed(() => true)
+
+  const showUpgradeToUseDocumentPermissions = (..._args: any[]) => {}
+
+  const showUpgradeToUsePrivateBases = (..._args: any[]) => {}
+
+  const showUpgradeToAddMoreAttachmentsInCell = (..._args: any[]) => {}
+
+  const blockDocs = computed(() => true)
+
+  const showUpgradeToUseDocs = (..._args: any[]) => {}
+
+  const blockDocsInlineComments = computed(() => true)
+
+  const blockDocsResolveComments = computed(() => true)
+
+  const blockDocsExportPdf = computed(() => true)
+
+  const blockDocShare = computed(() => true)
+
+  const showUpgradeToShareDoc = (..._args: any[]) => {}
+
+  const showDashboardPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const blockStagingEnvironment = computed(() => true)
+
+  const blockPerUserCredentials = computed(() => true)
+
+  const blockCustomEnvironment = computed(() => true)
+
+  const isEnvironmentBlocked = (..._args: any[]) => true
+
+  const environmentUpgradeFeature = (..._args: any[]) => undefined
+
+  const showUpgradeToUseStagingEnvironment = (..._args: any[]) => {}
+
+  const showUpgradeToUsePerUserCredentials = (..._args: any[]) => {}
+
+  const showUpgradeToUseCustomEnvironment = (..._args: any[]) => {}
+
+  const showDocumentPagePlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showUpgradeToUseDocsInlineComments = (..._args: any[]) => {}
+
+  const showUpgradeToUseDocsResolveComments = (..._args: any[]) => {}
+
+  const blockCommentAttachments = computed(() => true)
+
+  const showUpgradeToUseCommentAttachments = (..._args: any[]) => {}
+
+  const showUpgradeToUseDocsExportPdf = (..._args: any[]) => {}
+
+  const revisionRetentionLadder = computed<{ title: string; days: number }[]>(() => [])
+
+  const requiredPlanForRevisionAge = (..._args: any[]): string | null => null
+
+  const showScriptPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showAgentPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const showUpgradeToUseCalendarRange = (..._args: any[]) => {}
+
+  const showUpgradeToUseTimelineView = (..._args: any[]) => {}
+
+  const showUpgradeToUseGanttView = (..._args: any[]) => {}
+
+  const showUpgradeToUseAiPromptField = (..._args: any[]) => {}
+
+  const showUpgradeToUseAiButtonField = (..._args: any[]) => {}
+
+  const showUpgradeToUseAiChat = (..._args: any[]) => {}
+
+  const showUpgradeToUseAiIntegrations = (..._args: any[]) => {}
+
+  const showUpgradeToUseDocAi = (..._args: any[]) => {}
+
+  const showUpgradeToUseButtonVisibility = (..._args: any[]) => {}
+
+  const showUpgradeToUseColourField = (..._args: any[]) => {}
+
+  const showUpgradeToUseTeamHierarchy = (..._args: any[]) => {}
+
+  const showUpgradeToUseTeams = (..._args: any[]) => {}
+
+  const showUpgradeToAddMoreTeams = (..._args: any[]) => {}
+
+  const showUpgradeToUseSync = (..._args: any[]) => {}
+
+  const showUpgradeToUseTableSync = (..._args: any[]) => {}
+
+  const showUpgradeToUseCustomSync = (..._args: any[]) => {}
+
+  const showUpgradeToUseUnique = (..._args: any[]) => {}
+
+  const showUpgradeToUseUuidField = (..._args: any[]) => {}
+
+  const showUpgradeToUseAutoNumberField = (..._args: any[]) => {}
+
+  const blockRecordTemplates = computed(() => false)
+
+  const blockRls = computed(() => true)
+
+  const showUpgradeToUseRecordTemplates = (..._args: any[]) => {}
+
+  const showUpgradeToUseRls = (..._args: any[]) => {}
+
+  const showUpgradeToDuplicateTableToOtherWs = (..._args: any[]) => {}
+
+  const showUpgradeToDuplicateTableToOtherBase = (..._args: any[]) => {}
+
+  const blockFormScheduling = computed(() => true)
+
+  const showUpgradeToUseFormScheduling = (..._args: any[]) => {}
+
+  const blockFormRequireSignin = computed(() => true)
+
+  const showUpgradeToUseFormRequireSignin = (..._args: any[]) => {}
+
+  const blockViewSections = computed(() => true)
+
+  const showUpgradeToUseViewSections = (..._args: any[]) => {}
+
+  const blockBaseSections = computed(() => true)
+
+  const showUpgradeToUseBaseSections = (..._args: any[]) => {}
+
+  const blockBaseVariables = computed(() => true)
+
+  const showUpgradeToUseBaseVariables = (..._args: any[]) => {}
+
+  const showEnvironmentPlanLimitExceededModal = (..._args: any[]) => {}
+  const showUpgradeToUseListView = (..._args: any[]) => {}
+
+  const showUpgradeToUseMapView = (..._args: any[]) => {}
+
+  const blockDateDependency = computed(() => true)
+
+  const showUpgradeToUseDateDependency = (..._args: any[]) => {}
+
+  const showUpgradeToUseExtensions = (..._args: any[]) => {}
+  const blockMfa = computed(() => true)
+  const showUpgradeToUseMfa = (..._args: any[]) => {}
+
+  const blockForce2fa = computed(() => true)
+  const showUpgradeToUseForce2fa = (..._args: any[]) => {}
+
+  const isEEFeatureBlocked = computed(() => true)
+
+  const hideUpgradePrompts = ref(false)
+  const communityMode = computed(() => false)
+
+  const showUpgradeSurface = (_isBlocked: boolean) => true
+
+  const showEEFeatures = computed(() => false)
+
+  const blockWorkspaceCreate = computed(() => true)
+
+  const blockWorkspaceMembers = computed(() => false)
+
+  const showUpgradeToCreateWorkspace = (..._args: any[]) => {}
+
+  const showUpgradeToManageWorkspaceMembers = (..._args: any[]) => {}
+
+  const showUpgradeForEEFeature = (..._args: any[]) => {}
+
+  const blockSSO = computed(() => true)
+
+  const showUpgradeToUseSSO = (..._args: any[]) => {}
+
+  const blockWorkspaceSso = computed(() => true)
+
+  const showUpgradeToUseWorkspaceSso = (..._args: any[]) => {}
+
+  const blockScim = computed(() => true)
+
+  const showUpgradeToUseScim = (..._args: any[]) => {}
+
+  const blockMssql = computed(() => true)
+
+  const showUpgradeToUseMssql = (..._args: any[]) => {}
+
+  const blockOracle = computed(() => true)
+
+  const showUpgradeToUseOracle = (..._args: any[]) => {}
+
+  const blockWhiteLabel = computed(() => true)
+
+  const showUpgradeToUseWhiteLabel = (..._args: any[]) => {}
+
+  const showUpgradeToUseAudit = (..._args: any[]) => {}
+
+  const blockTrashSettings = computed(() => true)
+
+  const showUpgradeToUseTrashSettings = (..._args: any[]) => {}
+
+  const blockFormGridLayout = computed(() => true)
+
+  const showUpgradeToUseFormGridLayout = (..._args: any[]) => {}
+
+  const blockSnapshots = computed(() => true)
+
+  const showUpgradeToUseSnapshots = (..._args: any[]) => {}
+
+  const blockCustomUrls = computed(() => true)
+
+  const showUpgradeToUseCustomUrls = (..._args: any[]) => {}
+
+  const blockScripts = computed(() => true)
+
+  const showUpgradeToUseScripts = (..._args: any[]) => {}
+
+  const blockWorkflows = computed(() => true)
+
+  const blockAgents = computed(() => true)
+
+  const showUpgradeToUseAgents = (..._args: any[]) => {}
+
+  const blockAppFactory = computed(() => true)
+
+  const showUpgradeToUseAppFactory = (..._args: any[]) => {}
+
+  const showUpgradeToUseWorkflows = (..._args: any[]) => {}
+
+  const blockApps = computed(() => true)
+
+  const showUpgradeToUseApps = (..._args: any[]) => {}
+
+  const blockAppVanityUrl = computed(() => true)
+
+  const showUpgradeToUseAppVanityUrl = (..._args: any[]) => {}
+
+  const blockAppCustomDomain = computed(() => true)
+
+  const showUpgradeToUseAppCustomDomain = (..._args: any[]) => {}
+
+  const blockAppApi = computed(() => true)
+
+  const showUpgradeToUseAppApi = (..._args: any[]) => {}
+
+  const isWorkflowLimitReached = (_count: number) => false
+
+  const showWorkflowPlanLimitExceededModal = (..._args: any[]) => {}
+
+  const blockBookmarks = computed(() => true)
+
+  const showUpgradeToUseBookmarks = (..._args: any[]) => {}
+
+  return {
+    calculatePrice,
+    getLimit,
+    getStatLimit,
+    updateStatLimit,
+    getFeature,
+    getFeatureForPlanTitle,
+    isPaidPlan,
+    activePlan,
+    activePlanTitle,
+    activeSubscription,
+    getHigherPlan,
+    getPlanTitle,
+    handleUpgradePlan,
+    handleRequestUpgrade,
+    isPaymentEnabled,
+    showUserPlanLimitExceededModal,
+    isRecordLimitReached,
+    gracePeriodActive,
+    blockAddNewRecord,
+    showRecordPlanLimitExceededModal,
+    navigateToBilling,
+    isWsAuditEnabled,
+    isAllowToAddExtension,
+    blockAddNewExtension,
+    blockAddNewAttachment,
+    showStoragePlanLimitExceededModal,
+    blockAddNewExternalSource,
+    showExternalSourcePlanLimitExceededModal,
+    blockAddNewWebhook,
+    showWebhookPlanLimitExceededModal,
+    showWebhookLogsFeatureAccessModal,
+    blockExternalSourceRecordVisibility,
+    showAsBluredRecord,
+    showUpgradeToSeeMoreRecordsModal,
+    navigateToPricing,
+    navigateToCheckout,
+    isLoyaltyDiscountAvailable,
+    gracePeriodEndDate,
+    isTopBannerVisible,
+    showUpgradeToUploadWsImage,
+    blockWsImageLogoUpload,
+    isSideBannerExpanded,
+    cloudFeatures,
+    blockCurrentUserFilter,
+    showUpgradeToUseCurrentUserFilter,
+    blockRowColoring,
+    showUpgradeToUseRowColoring,
+    blockToggleFilter,
+    showUpgradeToUseToggleFilter,
+    blockToggleGroupBy,
+    showUpgradeToUseToggleGroupBy,
+    blockToggleSort,
+    showUpgradeToUseToggleSort,
+    blockPinnedFilter,
+    showUpgradeToUsePinnedFilter,
+    blockCellColoring,
+    showUpgradeToUseCellColoring,
+    blockTableAndFieldPermissions,
+    showUpgradeToUseTableAndFieldPermissions,
+    blockTableVisibility,
+    showUpgradeToUseTableVisibility,
+    blockFieldVisibility,
+    showUpgradeToUseFieldVisibility,
+    blockDocumentPermissions,
+    showUpgradeToUseDocumentPermissions,
+    blockPrivateBases,
+    blockEnterpriseVaults,
+    showUpgradeToUsePrivateBases,
+    showUserMayChargeAlert,
+    maxAttachmentsAllowedInCell,
+    showUpgradeToAddMoreAttachmentsInCell,
+    blockDocs,
+    showUpgradeToUseDocs,
+    blockDocsInlineComments,
+    blockDocsResolveComments,
+    blockDocsExportPdf,
+    blockDocShare,
+    showUpgradeToShareDoc,
+    showDashboardPlanLimitExceededModal,
+    blockStagingEnvironment,
+    blockPerUserCredentials,
+    blockCustomEnvironment,
+    isEnvironmentBlocked,
+    environmentUpgradeFeature,
+    showUpgradeToUseStagingEnvironment,
+    showUpgradeToUsePerUserCredentials,
+    showUpgradeToUseCustomEnvironment,
+    showDocumentPagePlanLimitExceededModal,
+    showUpgradeToUseDocsInlineComments,
+    showUpgradeToUseDocsResolveComments,
+    blockCommentAttachments,
+    showUpgradeToUseCommentAttachments,
+    showUpgradeToUseDocsExportPdf,
+    revisionRetentionLadder,
+    requiredPlanForRevisionAge,
+    showScriptPlanLimitExceededModal,
+    blockAddNewScript,
+    showAgentPlanLimitExceededModal,
+    blockAddNewAgent,
+    blockAddNewDashboard,
+    hideInterfaces,
+    blockAddNewInterface,
+    isInterfacePageLimitReached,
+    blockInterfaceMultiViz,
+    blockCoEditing,
+    blockCopyViewSettingFromOther,
+    blockSkillsGovernance,
+    blockSkillsOrg,
+    showUpgradeToUseSkillsGovernance,
+    showUpgradeToUseSkillsOrg,
+    blockInterfaceMetricColorConditions,
+    blockInterfacePivotWidget,
+    blockInterfaceViewWidget,
+    blockInterfaceIframeWidget,
+    blockInterfaceUserFilters,
+    blockInterfaceToolbarToggles,
+    blockInterfaceDrafts,
+    blockInterfacePreviewAs,
+    blockInterfaceAccessControl,
+    blockInterfacePageAccessControl,
+    blockInterfaceButtonVisibility,
+    showUpgradeForInterfaceFeature,
+    showInterfacePlanLimitExceededModal,
+    showInterfacePageLimitExceededModal,
+    blockCalendarRange,
+    showUpgradeToUseCalendarRange,
+    blockTimelineView,
+    showUpgradeToUseTimelineView,
+    blockGanttView,
+    showUpgradeToUseGanttView,
+    isOrgBilling,
+    blockAiPromptField,
+    showUpgradeToUseAiPromptField,
+    blockAiButtonField,
+    showUpgradeToUseAiButtonField,
+    blockAiChat,
+    showUpgradeToUseAiChat,
+    blockAiCredits,
+    showBuyCredits,
+    blockAiIntegrations,
+    showUpgradeToUseAiIntegrations,
+    blockAiIntegrationsLimit,
+    showUpgradeToAddAiIntegration,
+    blockDocAi,
+    showUpgradeToUseDocAi,
+    blockButtonVisibility,
+    showUpgradeToUseButtonVisibility,
+    blockColourField,
+    showUpgradeToUseColourField,
+    blockTeamHierarchy,
+    showUpgradeToUseTeamHierarchy,
+    blockTeamsManagement,
+    showUpgradeToUseTeams,
+    blockAddNewTeamToWs,
+    showUpgradeToAddMoreTeams,
+    isHigherActivePlan,
+    blockCardFieldHeaderVisibility,
+    blockSync,
+    blockTableSync,
+    blockTableSyncAuto,
+    blockCustomSync,
+    blockRls,
+    blockUnique,
+    blockUuidField,
+    blockAutoNumberField,
+    showUpgradeToUseSync,
+    showUpgradeToUseTableSync,
+    showUpgradeToUseCustomSync,
+    showUpgradeToUseRls,
+    showUpgradeToUseUnique,
+    showUpgradeToUseUuidField,
+    showUpgradeToUseAutoNumberField,
+    showUpgradeToDuplicateTableToOtherWs,
+    showUpgradeToDuplicateTableToOtherBase,
+    blockAddNewEnvironmentInstance,
+    showEnvironmentPlanLimitExceededModal,
+    blockRecordTemplates,
+    showUpgradeToUseRecordTemplates,
+    blockFormScheduling,
+    showUpgradeToUseFormScheduling,
+    blockFormRequireSignin,
+    showUpgradeToUseFormRequireSignin,
+    blockViewSections,
+    showUpgradeToUseViewSections,
+    blockBaseSections,
+    showUpgradeToUseBaseSections,
+    blockBaseVariables,
+    showUpgradeToUseBaseVariables,
+    blockListView,
+    showUpgradeToUseListView,
+    blockMapView,
+    showUpgradeToUseMapView,
+    blockDateDependency,
+    showUpgradeToUseDateDependency,
+    blockExtensions,
+    showUpgradeToUseExtensions,
+    isEEFeatureBlocked,
+    communityMode,
+    hideUpgradePrompts,
+    showUpgradeSurface,
+    showEEFeatures,
+    blockWorkspaceCreate,
+    blockWorkspaceMembers,
+    showUpgradeToCreateWorkspace,
+    showUpgradeToManageWorkspaceMembers,
+    showUpgradeForEEFeature,
+    blockSSO,
+    showUpgradeToUseSSO,
+    blockWorkspaceSso,
+    showUpgradeToUseWorkspaceSso,
+    blockScim,
+    showUpgradeToUseScim,
+    blockMssql,
+    showUpgradeToUseMssql,
+    blockOracle,
+    showUpgradeToUseOracle,
+    blockWhiteLabel,
+    showUpgradeToUseWhiteLabel,
+    showUpgradeToUseAudit,
+    blockSnapshots,
+    showUpgradeToUseSnapshots,
+    blockCustomUrls,
+    showUpgradeToUseCustomUrls,
+    blockScripts,
+    showUpgradeToUseScripts,
+    blockWorkflows,
+    showUpgradeToUseWorkflows,
+    blockApps,
+    showUpgradeToUseApps,
+    blockAppVanityUrl,
+    showUpgradeToUseAppVanityUrl,
+    blockAppCustomDomain,
+    showUpgradeToUseAppCustomDomain,
+    blockAppApi,
+    showUpgradeToUseAppApi,
+    blockAgents,
+    showUpgradeToUseAgents,
+    isWorkflowLimitReached,
+    showWorkflowPlanLimitExceededModal,
+    blockAppFactory,
+    showUpgradeToUseAppFactory,
+    blockBookmarks,
+    showUpgradeToUseBookmarks,
+    blockTrashSettings,
+    showUpgradeToUseTrashSettings,
+    blockFormGridLayout,
+    showUpgradeToUseFormGridLayout,
+    blockMfa,
+    showUpgradeToUseMfa,
+    blockForce2fa,
+    showUpgradeToUseForce2fa,
+  }
+})

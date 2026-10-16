@@ -1,0 +1,350 @@
+import { isAxiosError } from 'axios'
+import type { Api } from 'nocodb-sdk'
+import { NcErrorType } from 'nocodb-sdk'
+import type { UseGlobalReturn } from '../composables/useGlobal/types'
+import type { Actions } from '~/composables/useGlobal/types'
+
+/**
+ * Safely persist to localStorage. In some embedded webviews and privacy
+ * modes `localStorage` is `null` (or accessing it throws a SecurityError),
+ * so direct `localStorage.setItem(...)` crashes the auth middleware. The
+ * continueAfterSignIn hint is non-critical — silently skip when unavailable.
+ */
+function safeSetLocalStorage(key: string, value: string) {
+  try {
+    localStorage?.setItem(key, value)
+  } catch {
+    // storage disabled/unavailable — non-critical, ignore
+  }
+}
+
+/** Read counterpart of `safeSetLocalStorage` — same null/SecurityError hazard. */
+function safeGetLocalStorage(key: string) {
+  try {
+    return localStorage?.getItem(key) ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Remove counterpart of `safeSetLocalStorage` — same null/SecurityError hazard. */
+function safeRemoveLocalStorage(key: string) {
+  try {
+    localStorage?.removeItem(key)
+  } catch {
+    // storage disabled/unavailable — non-critical, ignore
+  }
+}
+
+/**
+ * Only same-origin relative paths may be promoted back into the URL. Browsers
+ * have historically normalised forms like `/\evil.com` into protocol-relative
+ * URLs, so a plain `^https?://` check is not enough.
+ */
+function isSafeContinuePath(path: string) {
+  if (!path.startsWith('/') || path.startsWith('//') || path.startsWith('/\\')) return false
+
+  try {
+    return new URL(path, window.location.origin).origin === window.location.origin
+  } catch {
+    return false
+  }
+}
+
+/** Read-and-remove: an abandoned sign-in must not hijack a later, unrelated one. */
+function consumeStoredContinuePath() {
+  const stored = safeGetLocalStorage('continueAfterSignIn')
+  safeRemoveLocalStorage('continueAfterSignIn')
+  return stored
+}
+
+/** Strip continueAfterSignIn param from a path to prevent recursive nesting */
+function stripContinueParam(fullPath: string) {
+  const qIndex = fullPath.indexOf('?')
+  if (qIndex === -1) return fullPath
+  const params = new URLSearchParams(fullPath.slice(qIndex))
+  params.delete('continueAfterSignIn')
+  const remaining = params.toString()
+  return remaining ? `${fullPath.slice(0, qIndex)}?${remaining}` : fullPath.slice(0, qIndex)
+}
+
+/**
+ * Global auth middleware
+ *
+ * On page transitions, this middleware checks if the target route requires authentication.
+ * If the user is not signed in, the user is redirected to the sign in page.
+ * If the user is signed in and attempts to access a route that does not require authentication (i.e. signin/signup pages),
+ * the user is redirected to the home page.
+ *
+ * By default, we assume that auth is required
+ * If not required, mark the page as requiresAuth: false
+ *
+ * @example
+ * ```
+ * definePageMeta({
+ *   requiresAuth: false
+ * })
+ * ```
+ *
+ * If auth should be circumvented completely mark the page as public
+ *
+ * @example
+ * ```
+ * definePageMeta({
+ *   public: true
+ * })
+ * ```
+ */
+export default defineNuxtRouteMiddleware(async (to, from) => {
+  const state = useGlobal()
+
+  // Not useApi(): it adds interceptors to the shared $api on every call, and this runs on every navigation
+  const { $api: api } = useNuxtApp()
+
+  const { allRoles, loadRoles } = useRoles()
+
+  await checkForRedirect()
+
+  /** if user isn't signed in and google auth is enabled, try to check if sign-in data is present */
+  if (!state.signedIn.value && state.appInfo.value.googleAuthEnabled) {
+    await tryGoogleAuth(api, state.signIn)
+  }
+
+  /** Try token population based on short-lived-token */
+  await tryShortTokenAuth(api, state.signIn, state)
+
+  /** if public allow all visitors */
+  if (to.meta.public) return
+
+  /** if shared base allow without validating */
+  if (to.params.typeOrId === 'base') return
+
+  /** In history mode, root URLs with payment query params (e.g. /?upgrade=true) are meaningful routes that should be preserved */
+  const hasPaymentRedirectParams =
+    to.query.upgrade || to.query.pricing || to.query.afterPayment || to.query.afterManage || to.query.afterUpgrade
+
+  /** if auth is required or unspecified (same `as required) and user is not signed in, redirect to signin page */
+  if ((to.meta.requiresAuth || typeof to.meta.requiresAuth === 'undefined') && !state.signedIn.value) {
+    /** If this is the first usern navigate to signup page directly */
+    if (state.appInfo.value.firstUser) {
+      const continuePath =
+        to.fullPath !== '/' && (to.fullPath.match(/^\/(?!\?)/) || hasPaymentRedirectParams)
+          ? stripContinueParam(to.fullPath)
+          : undefined
+      const query = continuePath ? { continueAfterSignIn: continuePath } : {}
+      if (continuePath) {
+        safeSetLocalStorage('continueAfterSignIn', continuePath)
+      }
+
+      return navigateTo({
+        path: '/signup',
+        query,
+      })
+    }
+
+    try {
+      /** try generating access token using refresh token */
+      await state.refreshToken({})
+    } catch (e) {
+      console.info('Refresh token failed', (e as Error)?.message)
+      // Only sign out when the SERVER rejected the refresh. `refreshToken` now
+      // rethrows transient failures (no response at all — offline, aborted,
+      // proxy blip) instead of swallowing them, and bouncing those to /signin
+      // mid-session is the bug this PR fixes everywhere else. Mirrors the
+      // interceptor. A genuine expiry still arrives as a 401 response.
+      if (isAxiosError(e) && e.response) {
+        // Clear stale auth state so the next signin starts clean; an invalid
+        // token left in storage can short-circuit SSO into a redirect loop.
+        await state.signOut({ skipApiCall: true })
+      }
+    }
+
+    /** if user is still not signed in, redirect to signin page */
+    if (!state.signedIn.value) {
+      const signinContinuePath =
+        to.fullPath !== '/' && (to.fullPath.match(/^\/(?!\?)/) || hasPaymentRedirectParams)
+          ? stripContinueParam(to.fullPath)
+          : undefined
+      if (signinContinuePath) {
+        safeSetLocalStorage('continueAfterSignIn', signinContinuePath)
+      }
+      return navigateTo({
+        path: '/signin',
+        query: signinContinuePath ? { continueAfterSignIn: signinContinuePath } : {},
+      })
+    }
+  } else if (to.meta.requiresAuth === false && state.signedIn.value) {
+    if (to.query?.logout) {
+      await state.signOut({ redirectToSignin: true })
+    }
+
+    /**
+     * if user was turned away from non-auth page but also came from a non-auth page (e.g. user went to /signin and reloaded the page)
+     * redirect to home page
+     *
+     * else redirect back to the page they were coming from
+     */
+    if (from.meta.requiresAuth === false) {
+      return navigateTo('/')
+    } else {
+      return navigateTo(from.path)
+    }
+  } else {
+    /** If page is limited to certain users verify the user have the roles */
+    if (to.meta.allowedRoles && to.meta.allowedRoles.every((role) => !allRoles.value?.[role])) {
+      message.error("You don't have enough permission to access the page.")
+      return navigateTo('/')
+    }
+
+    /** if users are accessing the bases without having enough permissions, redirect to My Projects page */
+    if (to.params.baseId && from.params.baseId !== to.params.baseId) {
+      await loadRoles()
+
+      // Require a fully-loaded user before enforcing the guest check.
+      // Post-SSO-callback navigation can run this guard before workspace
+      // context resolves; a half-populated user.roles can otherwise bounce
+      // the user to / and complete a redirect loop.
+      if (state.user.value?.id && state.user.value.roles?.guest) {
+        message.error("You don't have enough permission to access the project.")
+
+        return navigateTo('/')
+      }
+    }
+  }
+})
+
+/**
+ * If present, try using google auth data to sign user in before navigating to the next page
+ */
+async function tryGoogleAuth(api: Api<any>, signIn: Actions['signIn']) {
+  if (window.location.search && /\bscope=|\bstate=/.test(window.location.search) && /\bcode=/.test(window.location.search)) {
+    let extraProps: any = {}
+    try {
+      let authProvider: 'google' | 'github' | 'oidc' = 'google'
+      if (window.location.search.includes('state=github')) {
+        authProvider = 'github'
+      } else if (window.location.search.includes('state=oidc')) {
+        authProvider = 'oidc'
+      }
+
+      // `extra` prop is used in our cloud implementation, so we are keeping it
+      const {
+        data: { token, extra },
+      } = await api.instance.post(`/auth/${authProvider}/genTokenByCode${window.location.search}`)
+
+      // if extra prop is null/undefined set it as an empty object as fallback
+      extraProps = extra || {}
+
+      signIn(token)
+      // the staged click is lost when the callback opens in another tab; GitHub has no badge
+      commitPendingAuthMethod(authProvider === 'github' ? undefined : authProvider)
+    } catch (e: any) {
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+
+    const cleanURL = new URL(window.location.href)
+    cleanURL.searchParams.delete('short-token')
+    cleanURL.searchParams.delete('continueAfterSignIn')
+    // Legacy Google/GitHub sign-in (genTokenByCode) returns no `extra`, so the
+    // return target lives only in localStorage. Restore it to the URL before the
+    // reload below — the reload wipes `isTokenUpdatedTab`, so without the query
+    // param the redirect plugin never navigates back to the gated page.
+    const continueAfterSignIn = extraProps?.continueAfterSignIn ?? consumeStoredContinuePath()
+    if (continueAfterSignIn && isSafeContinuePath(continueAfterSignIn)) {
+      cleanURL.searchParams.set('continueAfterSignIn', continueAfterSignIn)
+    }
+    window.history.pushState('object', document.title, cleanURL.toString())
+    window.location.reload()
+  }
+}
+
+/**
+ * If short-token present, try using it to generate long-living token before navigating to the next page
+ */
+async function tryShortTokenAuth(api: Api<any>, signIn: Actions['signIn'], state: UseGlobalReturn) {
+  const { setError } = useSsoError()
+
+  if (window.location.search && /\bshort-token=/.test(window.location.search)) {
+    // Capture the token and strip it from the URL synchronously, BEFORE any
+    // await. This middleware runs on every route navigation — a navigation
+    // fired while the exchange below is in-flight would otherwise see the
+    // short-token still in the URL and fire a duplicate exchange, which
+    // rotates token_version server-side and invalidates the token issued by
+    // the first call (session dies right after signin).
+    const params = new URLSearchParams(window.location.search)
+    const shortToken = params.get('short-token')
+    // `/sso/:id/redirect` hands back the page sign-in started from under its
+    // own name; it becomes `continueAfterSignIn` only after the exchange.
+    const redirectContinue = params.get('continueAfterSso')
+
+    const cleanURL = new URL(window.location.href)
+    cleanURL.searchParams.delete('short-token')
+    cleanURL.searchParams.delete('continueAfterSso')
+    cleanURL.searchParams.delete('continueAfterSignIn')
+    window.history.pushState('object', document.title, cleanURL.toString())
+
+    let extraProps: any = {}
+    try {
+      // `extra` prop is used in our cloud implementation, so we are keeping it
+      const { data } = await api.instance.post(
+        `/auth/long-lived-token`,
+        {},
+        {
+          headers: {
+            'xc-short-token': shortToken,
+          } as any,
+        },
+      )
+
+      const { token, extra } = data
+
+      // if extra prop is null/undefined set it as an empty object as fallback
+      extraProps = extra || {}
+
+      if (state.lastUsedAuthMethod) state.lastUsedAuthMethod.value = 'sso'
+
+      signIn(token)
+      commitPendingAuthMethod('sso')
+    } catch (e: any) {
+      if (e?.response?.data?.error === NcErrorType.ERR_MAX_WORKSPACE_LIMIT_REACHED) {
+        // Store error information in global state
+        setError({
+          type: NcErrorType.ERR_MAX_WORKSPACE_LIMIT_REACHED,
+          message: e?.response?.data?.message || 'Maximum workspace limit reached',
+        })
+        // navigate to sso page and display the error details
+        return await navigateTo('/sso')
+      }
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+
+    // `extra` is only populated on the authorization-callback request, never on
+    // this `/auth/long-lived-token` exchange. `/sso/:id` OIDC and SAML clients
+    // return the target on the redirect; others fall back to the stored one.
+    // Always consume the stored value so it cannot hijack a later sign-in.
+    const storedContinue = consumeStoredContinuePath()
+    const continueAfterSignIn = extraProps?.continueAfterSignIn ?? redirectContinue ?? storedContinue
+    if (continueAfterSignIn && isSafeContinuePath(continueAfterSignIn)) {
+      const continueURL = new URL(window.location.href)
+      continueURL.searchParams.set('continueAfterSignIn', continueAfterSignIn)
+      window.history.pushState('object', document.title, continueURL.toString())
+    }
+    window.location.reload()
+  }
+}
+
+/** Check if url contains redirect param and redirect to the url if found */
+async function checkForRedirect() {
+  if (window.location.search && /\bui-redirect=/.test(window.location.search)) {
+    let url
+    try {
+      url = new URLSearchParams(window.location.search).get('ui-redirect')
+    } catch (e: any) {
+      message.error(await extractSdkResponseErrorMsg(e))
+    }
+
+    if (url) {
+      return navigateTo(url, { replace: true })
+    }
+  }
+}

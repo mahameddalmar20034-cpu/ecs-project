@@ -1,0 +1,537 @@
+<script lang="ts" setup>
+import { PlanFeatureTypes, extractBaseRoleFromWorkspaceRole } from 'nocodb-sdk'
+
+interface NavItem {
+  key: string
+  icon: string
+  label: string
+  disabled?: boolean
+  active?: boolean
+  onClick?: () => void
+}
+
+const router = useRouter()
+
+const route = router.currentRoute
+
+const { navigateToProject, isMobileMode } = useGlobal()
+
+const { $e: _$e } = useNuxtApp()
+
+const { t } = useI18n()
+
+const workspaceStore = useWorkspace()
+
+const { activeWorkspaceId, activeWorkspace, isTemplatesPageOpened } = storeToRefs(workspaceStore)
+
+const { isWhiteLabelled, productName, faviconUrl } = useBranding()
+
+const basesStore = useBases()
+
+const { basesList, resolvedProject } = storeToRefs(basesStore)
+
+const sidebarStore = useSidebarStore()
+
+const { activeSidebarTab } = storeToRefs(sidebarStore)
+
+const openWorkspaceSettings = useWorkspaceSettingsLink()
+
+const { isUIAllowed, workspaceRoles } = useRoles()
+
+const notificationStore = useNotification()
+
+const { unreadCount } = toRefs(notificationStore)
+
+const isNotificationOpen = ref(false)
+
+const { isFullScreen: isChatFullScreen, hasBaseContext: hasChatBaseContext, cycleChatPanel } = useChatPanel()
+
+const { isAgentsEnabled } = storeToRefs(useAgentStore())
+
+const { isAppsEnabled } = storeToRefs(useAppStore())
+
+const {
+  blockAiChat,
+  showEEFeatures,
+  isEEFeatureBlocked,
+  showUpgradeToUseBookmarks,
+  hideInterfaces,
+  showUpgradeForInterfaceFeature,
+  showUpgradeSurface,
+  blockAgents,
+  showUpgradeToUseAgents,
+  blockWorkflows,
+  showUpgradeToUseWorkflows,
+} = useEeConfig()
+
+// Both ship on the unlicensed on-prem Free tier, so community mode may only drop
+// them where they'd be a pure upsell (blocked tier) — not via `showEEFeatures`.
+const showWorkflowsNav = computed(() => isEeUI && showUpgradeSurface(blockWorkflows.value))
+
+const showInterfacesNav = computed(() => isEeUI && showUpgradeSurface(hideInterfaces.value))
+
+const isBookmarksFlyoutOpen = ref(false)
+
+const bookmarksContainerRef = ref<HTMLElement | null>(null)
+
+onClickOutside(
+  bookmarksContainerRef,
+  () => {
+    isBookmarksFlyoutOpen.value = false
+  },
+  {
+    ignore: [
+      '.nc-bookmark-add-dropdown',
+      '.nc-bookmark-context-menu',
+      '.nc-bookmark-group-menu',
+      '.nc-bookmark-settings-menu',
+      '.nc-modal-wrapper',
+      '.nc-bookmark-bulk-more-dropdown-move-to',
+      '.nc-bookmark-bulk-more-dropdown',
+    ],
+  },
+)
+
+const { isRtl } = useRtl()
+
+const handleChatToggle = () => {
+  cycleChatPanel()
+}
+
+const isBaseOpen = computed(() => {
+  return route.value.name?.toString().startsWith('index-typeOrId-baseId-')
+})
+
+watch(
+  isBaseOpen,
+  (val) => {
+    if (val && ncBackRoute().get() !== '/') ncBackRoute().set('')
+  },
+  { immediate: true },
+)
+
+const isBaseListModalOpen = ref(false)
+
+const navigateToProjectPage = () => {
+  if (route.value.name?.toString().startsWith('index-typeOrId-baseId-')) {
+    return
+  }
+
+  const lastVisitedBase = ncLastVisitedBase().get()
+
+  const baseToNavigate = lastVisitedBase
+    ? basesList.value?.find((b) => b.id === lastVisitedBase) ?? basesList.value[0]
+    : basesList.value[0]
+
+  navigateToProject({ workspaceId: isEeUI ? activeWorkspaceId.value : undefined, baseId: baseToNavigate?.id })
+}
+
+const hasAvailableBases = computed(() => !!basesList.value?.length)
+
+const { isActiveBaseAppOnlyInstall } = useManagedAppInstalls()
+
+const { isActiveBaseCodeProject, isCodeProjectRoute } = useCodeProjects()
+
+// Templates are browsed before a project exists: the project's own navigation
+// there points at whichever project was open last, which is not what is on screen.
+// A code project has no apps of its own to open either.
+const showAppTile = computed(
+  () => isAppsEnabled.value && hasAvailableBases.value && !isTemplatesPageOpened.value && !isActiveBaseCodeProject.value,
+)
+
+const isAppFirst = computed(() => isAppFirstBase(resolvedProject.value))
+
+const getBasePath = () => {
+  const wsId = route.value.params.typeOrId || activeWorkspaceId.value
+  const baseId = route.value.params.baseId
+  if (baseId) return `/${wsId}/${baseId}`
+
+  return resolvedProject.value?.id ? `/${wsId}/${resolvedProject.value.id}` : ''
+}
+
+const onTabClick = async (tabKey: string) => {
+  if (isChatFullScreen.value) isChatFullScreen.value = false
+
+  if (tabKey === 'settings') {
+    // Inside a base, base settings opens as a modal over the page — same route,
+    // plus a query param — so the sidebar keeps showing the vertical you were in.
+    if (isBaseOpen.value) {
+      navigateTo({ query: { ...route.value.query, settings: 'members' } })
+      return
+    }
+
+    // Elsewhere, like the other tiles, it opens the last-used base; with no base, workspace settings.
+    const settingsBasePath = getBasePath()
+
+    if (settingsBasePath) {
+      navigateTo({ path: settingsBasePath, query: { settings: 'members' } })
+    } else {
+      openWorkspaceSettings('general')
+    }
+
+    return
+  }
+
+  // Navigate first, then update tab — avoids stale API calls from the current page
+  const basePath = getBasePath()
+  if (!basePath) return
+
+  if (tabKey === 'workflows') {
+    if (blockWorkflows.value) {
+      showUpgradeToUseWorkflows({ triggerSource: 'minisidebar-workflows' })
+      return
+    }
+    await navigateTo(`${basePath}/workflows`)
+  } else if (tabKey === 'agents') {
+    if (blockAgents.value) {
+      showUpgradeToUseAgents({ triggerSource: 'minisidebar-agents' })
+      return
+    }
+    await navigateTo(`${basePath}/agents`)
+  } else if (tabKey === 'interfaces') {
+    // Plan-blocked: upsell instead of navigating (mirrors bookmarks)
+    if (hideInterfaces.value) {
+      showUpgradeForInterfaceFeature(PlanFeatureTypes.FEATURE_INTERFACES, 'minisidebar-interfaces')
+      return
+    }
+    await navigateTo(`${basePath}/interfaces`)
+  } else {
+    await navigateTo(basePath)
+  }
+
+  activeSidebarTab.value = tabKey as typeof activeSidebarTab.value
+}
+
+useEventListener(document, 'keydown', async (e: KeyboardEvent) => {
+  const isBaseSearchInput = e.target instanceof HTMLInputElement && e.target.closest('.nc-base-search-input')
+
+  if (
+    !e.altKey ||
+    (!isBaseSearchInput &&
+      (isActiveInputElementExist(e) ||
+        cmdKActive() ||
+        isCmdJActive() ||
+        isNcDropdownOpen() ||
+        isActiveElementInsideExtension() ||
+        isActiveElementInsideScriptPane() ||
+        isDrawerOrModalExist() ||
+        isExpandedFormOpenExist()))
+  ) {
+    return
+  }
+
+  switch (e.code) {
+    case 'KeyB': {
+      e.preventDefault()
+      navigateToProjectPage()
+      break
+    }
+  }
+})
+
+// Cmd/Ctrl + Shift + A — toggle AI chat
+useEventListener(document, 'keydown', (e: KeyboardEvent) => {
+  if (!isEeUI || blockAiChat.value || !hasChatBaseContext.value || isActiveBaseCodeProject.value) return
+  const cmdOrCtrl = isMac() ? e.metaKey : e.ctrlKey
+  if (
+    cmdOrCtrl &&
+    e.shiftKey &&
+    e.code === 'KeyA' &&
+    !isActiveInputElementExist(e) &&
+    !isNcDropdownOpen() &&
+    !isDrawerOrModalExist()
+  ) {
+    e.preventDefault()
+    handleChatToggle()
+  }
+})
+
+// ── Main nav items (add/remove/reorder here) ──
+const mainItems = computed<NavItem[]>(() =>
+  // An app-only install has no base to navigate: every one of these routes
+  // resolves straight back to the app, so offering them is offering dead ends.
+  isActiveBaseAppOnlyInstall.value || isTemplatesPageOpened.value
+    ? []
+    : isActiveBaseCodeProject.value
+    ? // A code project has no data behind those either — just its sessions,
+      // and a way back to them from Settings.
+      [
+        {
+          key: 'home',
+          icon: 'ncHome',
+          label: t('general.home'),
+          active: isCodeProjectRoute(route.value),
+          onClick: () => {
+            // Off `settings`, or that item stays lit beside this one.
+            activeSidebarTab.value = 'data'
+            navigateTo(`${getBasePath()}/factory`)
+          },
+        },
+      ]
+    : [
+        {
+          key: 'data',
+          icon: 'ncTable',
+          label: t('general.data'),
+          disabled: !hasAvailableBases.value,
+          onClick: () => {
+            onTabClick('data')
+          },
+        },
+        ...(!isMobileMode.value && showWorkflowsNav.value
+          ? [
+              {
+                key: 'workflows',
+                icon: 'ncAutomation',
+                label: t('general.workflows'),
+                disabled:
+                  !hasAvailableBases.value ||
+                  !isUIAllowed('scriptList', {
+                    roles: resolvedProject.value?.project_role || extractBaseRoleFromWorkspaceRole(workspaceRoles.value),
+                  }),
+                onClick: () => {
+                  onTabClick('workflows')
+                },
+              },
+            ]
+          : []),
+        // Paid-only, but the entry stays visible below the tier — clicking upsells
+        // (onTabClick) instead of navigating, mirroring bookmarks.
+        ...(showInterfacesNav.value
+          ? [
+              {
+                key: 'interfaces',
+                icon: 'ncLayout',
+                label: t('general.interfaces'),
+                disabled:
+                  !hasAvailableBases.value ||
+                  !isUIAllowed('interfaceList', {
+                    roles: resolvedProject.value?.project_role || extractBaseRoleFromWorkspaceRole(workspaceRoles.value),
+                  }),
+                onClick: () => onTabClick('interfaces'),
+              },
+            ]
+          : []),
+        ...(isAgentsEnabled.value
+          ? [
+              {
+                key: 'agents',
+                icon: 'ncAgent',
+                label: t('general.agents'),
+                disabled:
+                  !hasAvailableBases.value ||
+                  !isUIAllowed('agentList', {
+                    roles: resolvedProject.value?.project_role || extractBaseRoleFromWorkspaceRole(workspaceRoles.value),
+                  }),
+                onClick: () => onTabClick('agents'),
+              },
+            ]
+          : []),
+      ],
+)
+
+const handleOpenBookmarkPanel = () => {
+  if (isEEFeatureBlocked.value) {
+    showUpgradeToUseBookmarks({ triggerSource: 'minisidebar-bookmarks' })
+  } else {
+    isBookmarksFlyoutOpen.value = !isBookmarksFlyoutOpen.value
+  }
+}
+
+// Base settings is an overlay on the current route, so the tile reads the query.
+// Only a slug the nav knows counts — `?settings=true` belongs to the agent panel.
+const isBaseSettingsOpen = computed(() => !!resolveBaseSettingsTab(route.value.query.settings))
+
+const isSettingsActive = computed(() => isBaseSettingsOpen.value || !!wsSettingsSlugFromRoute(route.value))
+</script>
+
+<template>
+  <nav class="nc-rail" data-testid="nc-mini-sidebar-v2-rail">
+    <div class="flex-none h-[var(--topbar-height)] w-full relative flex items-center justify-center">
+      <!-- Logo — hover shows back arrow, click navigates to workspace -->
+      <NcTooltip placement="right" :arrow="false">
+        <template #title>{{ $t('labels.backToWorkspace') }}: {{ activeWorkspace?.title }}</template>
+        <div
+          class="nc-rail-logo nc-rail-logo-hover"
+          data-testid="nc-mini-sidebar-v2-logo"
+          :data-workspace-title="activeWorkspace?.title"
+          @click="navigateTo(`/${activeWorkspaceId}`)"
+        >
+          <img
+            v-if="isWhiteLabelled && faviconUrl"
+            :src="faviconUrl"
+            :alt="productName"
+            class="!h-7 !w-7 nc-logo-icon object-contain"
+          />
+          <GeneralNocodbLogo v-else class="!h-7 !w-7 nc-logo-icon" />
+          <div class="nc-back-icon">
+            <GeneralIcon icon="ncArrowLeft" class="!h-4.5 !w-4.5 text-nc-content-gray" />
+          </div>
+        </div>
+      </NcTooltip>
+      <div class="absolute bottom-0 left-0 right-0 flex justify-center">
+        <NcDivider class="!w-8 !min-w-8 !my-0 !border-nc-border-gray-medium" />
+      </div>
+    </div>
+
+    <!-- Apps — leads the group for a base built through the App flow -->
+    <DashboardMiniSidebarV2AppTiles v-if="showAppTile && isAppFirst" variant="rail" />
+
+    <!-- Main nav items -->
+    <DashboardMiniSidebarV2RailItem
+      v-for="(item, idx) of mainItems"
+      :key="idx"
+      :icon="item.icon"
+      :label="item.label"
+      :panel-key="item.key"
+      :active="item.active ?? (activeSidebarTab === item.key && !isChatFullScreen && !isBaseSettingsOpen)"
+      :disabled="item.disabled"
+      @click="item.onClick?.()"
+    />
+
+    <DashboardMiniSidebarV2AppTiles v-if="showAppTile && !isAppFirst" variant="rail" />
+
+    <!-- Settings -->
+    <DashboardMiniSidebarV2RailItem
+      v-if="!isActiveBaseAppOnlyInstall && !isTemplatesPageOpened"
+      icon="ncSettings"
+      :label="$t('labels.settings')"
+      panel-key="settings"
+      :active="isSettingsActive && !isChatFullScreen && !isCodeProjectRoute(route)"
+      @click="onTabClick('settings')"
+    />
+
+    <!-- Bottom group -->
+    <div class="nc-rail-bottom-group">
+      <!-- Help -->
+      <DashboardMiniSidebarHelp>
+        <DashboardMiniSidebarV2RailItem icon="ncHelp" :label="$t('general.help')" panel-key="help" is-dropdown />
+      </DashboardMiniSidebarHelp>
+    </div>
+
+    <NcDivider class="!w-8 !min-w-8 !max-w-8 !my-0 !border-nc-border-gray-medium" />
+
+    <!-- Bookmarks -->
+    <div v-if="showEEFeatures" ref="bookmarksContainerRef" class="relative">
+      <DashboardMiniSidebarV2RailItem
+        icon="ncBookmark"
+        :tooltip="$t('tooltip.bookmarks')"
+        :label="$t('labels.bookmarks')"
+        :active="isBookmarksFlyoutOpen"
+        is-dropdown
+        data-testid="nc-rail-bookmarks"
+        @click="handleOpenBookmarkPanel"
+      />
+
+      <LazyBookmarksFlyout v-if="isBookmarksFlyoutOpen" @close="isBookmarksFlyoutOpen = false" />
+    </div>
+
+    <!-- Activity / Notifications -->
+    <NcDropdown
+      v-model:visible="isNotificationOpen"
+      :placement="isRtl ? 'left' : 'right'"
+      overlay-class-name="!shadow-none"
+      :overlay-style="isRtl ? { marginRight: '8px' } : { marginLeft: '8px' }"
+      :trigger="['click']"
+    >
+      <DashboardMiniSidebarV2RailItem
+        :label="$t('labels.activity')"
+        :tooltip="$t('labels.activity')"
+        panel-key="notification"
+        data-testid="nc-sidebar-notification-btn"
+        :active="isNotificationOpen"
+        :disable-tooltip="isNotificationOpen"
+        is-dropdown
+      >
+        <template #icon>
+          <div class="relative flex items-center justify-center">
+            <span
+              v-if="unreadCount"
+              class="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full border border-white dark:border-[#1a1a1a]"
+              style="background: #e75a8d"
+            />
+            <GeneralIcon icon="notification" class="nc-rail-item-icon" />
+          </div>
+        </template>
+      </DashboardMiniSidebarV2RailItem>
+      <template #overlay>
+        <NotificationCard @close="isNotificationOpen = false" />
+      </template>
+    </NcDropdown>
+
+    <!-- User Avatar -->
+    <DashboardSidebarUserInfo />
+
+    <WorkspaceBaseListModal v-model:visible="isBaseListModalOpen" />
+  </nav>
+</template>
+
+<style lang="scss" scoped>
+.nc-rail {
+  @apply flex flex-col gap-2 items-center h-full w-full;
+}
+
+.nc-rail-logo {
+  @apply flex items-center justify-center cursor-pointer opacity-90 hover:opacity-100 transition-all duration-150 p-1.5 rounded-lg;
+}
+
+.nc-rail-bottom-group {
+  @apply flex flex-col items-center w-full;
+  margin-top: auto;
+}
+
+.nc-rail-admin-wrapper {
+  @apply relative w-full flex justify-center;
+
+  .nc-notif-dot {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 8px;
+    height: 8px;
+    background: #e75a8d;
+    border-radius: 50%;
+    border: 2px solid #f0f0f0;
+    z-index: 1;
+
+    :root[theme='dark'] & {
+      border-color: var(--color-minisidebar-bg);
+    }
+  }
+}
+
+.nc-rail-logo-hover {
+  @apply relative;
+  // Fixed size so layout never shifts
+  width: 40px;
+  height: 40px;
+
+  .nc-logo-icon,
+  .nc-back-icon {
+    @apply absolute inset-0 m-auto;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+
+  .nc-logo-icon {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  .nc-back-icon {
+    @apply flex items-center justify-center;
+    opacity: 0;
+    transform: scale(0.8);
+  }
+
+  &:hover {
+    .nc-logo-icon {
+      opacity: 0;
+      transform: scale(0.8);
+    }
+    .nc-back-icon {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+}
+</style>

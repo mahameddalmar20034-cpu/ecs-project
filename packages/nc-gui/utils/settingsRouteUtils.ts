@@ -1,0 +1,199 @@
+import type { WsHomePane } from './routeUtils'
+
+/**
+ * Shared settings route slug mappings.
+ *
+ * Internal tab names (used in components/stores) ↔ URL slugs (used in route paths).
+ * Single source of truth — import these instead of hardcoding mappings.
+ */
+
+// Base settings: internal tab name → URL slug
+export const baseSettingsTabToSlug: Record<string, string> = {
+  'collaborator': 'members',
+  'interface-members': 'interface-members',
+  'data-source': 'data-sources',
+  'permissions': 'permissions',
+  'docs-permissions': 'docs-permissions',
+  'syncs': 'syncs',
+  'integrations': 'integrations',
+  // The old General pane, kept so `?settings=settings` links still resolve; the
+  // shell forwards it to the first of the rows that replaced it.
+  'base-settings': 'settings',
+  'base-type': 'base-type',
+  'data-display': 'data-display',
+  'migrate-to-v3': 'migrate-to-v3',
+  'migrate': 'migrate',
+  'audit': 'audits',
+  'audits': 'audits',
+  'workflows': 'workflows',
+  'mcp': 'mcp',
+  'api-tokens': 'api-tokens',
+  'record-trash': 'record-trash',
+  'variables': 'variables',
+  'snapshots': 'snapshots',
+  // App settings (EE) — one app per base, so its settings live alongside the
+  // base's rather than behind a separate surface.
+  'app-url': 'app-url',
+  'app-theme': 'app-theme',
+  'app-access': 'app-access',
+  'app-public': 'app-public',
+  'app-marketplace': 'app-marketplace',
+  'app-connections': 'app-connections',
+  'app-assistant': 'app-assistant',
+  'app-api': 'app-api',
+  'app-versions': 'app-versions',
+  'skills': 'skills',
+}
+
+// The app settings section, in nav order. Rendered only when the base has an
+// app, so it is inert in CE. `label` is an i18n key, resolved by the caller.
+//
+// `installer` marks a tab whose subject belongs to whoever INSTALLED the app
+// rather than to the publisher — the serving address, who may use it, and which
+// connections it may reach. The rest edit the publisher's artifact, which the
+// backend refuses on an install and the next update would overwrite anyway.
+//
+// `listing` marks a tab that only exists once the base carries a store listing.
+//
+// `production` marks a tab whose subject is the SERVING app. Every one of those
+// rows is base-scoped to Production, so inside an environment copy the tab can
+// only show an empty list or mint a credential the app origin will refuse — so
+// the pane says so, rather than the tab vanishing from a copy's nav.
+export const appSettingsNav: {
+  tab: string
+  label: string
+  icon: string
+  testId: string
+  installer?: boolean
+  listing?: boolean
+  production?: boolean
+}[] = [
+  // Who may use the app is the first thing its owner reaches for, so it leads the nav.
+  { tab: 'app-access', label: 'labels.appAccess.membersTitle', icon: 'ncUsers', testId: 'app-access', installer: true },
+  { tab: 'app-url', label: 'labels.appUrl', icon: 'ncGlobe', testId: 'app-url', installer: true },
+  { tab: 'app-theme', label: 'labels.appTheme', icon: 'ncPalette', testId: 'app-theme' },
+  // The anonymous surface is its own subject: pages and the actions a visitor
+  // may invoke are two halves of one answer, and neither belongs in a roster.
+  { tab: 'app-public', label: 'labels.appPublic.title', icon: 'ncEye', testId: 'app-public', installer: true },
+  // The store page's own settings: everything the inline listing form does not
+  // ask for, plus the takedown. Beside Access and Public because it is the third
+  // audience — the internet, the workspace, and other companies.
+  {
+    tab: 'app-marketplace',
+    label: 'general.marketplace',
+    icon: 'ncBox',
+    testId: 'app-marketplace',
+    listing: true,
+  },
+  { tab: 'app-assistant', label: 'labels.appAssistant', icon: 'ncAutoAwesome', testId: 'app-assistant' },
+  {
+    tab: 'app-connections',
+    label: 'labels.appConnections.title',
+    icon: 'ncLink',
+    testId: 'app-connections',
+    installer: true,
+  },
+  // The tokens belong to whoever installed the app, not to the publisher's
+  // artifact — each one acts as its creator's persona on THIS install, and the
+  // spec shown beside them is that same persona's reach.
+  { tab: 'app-api', label: 'labels.appApi.title', icon: 'ncKey2', testId: 'app-api', installer: true, production: true },
+  {
+    tab: 'app-versions',
+    label: 'title.versionHistory',
+    icon: 'ncGitBranch',
+    testId: 'app-versions',
+    production: true,
+  },
+]
+
+/** The nav an installed app's owner gets; the full one for its publisher. */
+export function appSettingsNavFor(isInstall: boolean, isListing = false, hasApp = true, storeEnabled = true) {
+  if (isInstall) return appSettingsNav.filter((item) => item.installer)
+
+  // Every tab but Marketplace edits the app; Marketplace edits the listing. A
+  // base published with nothing to serve has a store page and no app, so the
+  // listing is then the whole nav — otherwise Edit leads to an empty pane.
+  // `storeEnabled` is the store's own feature flag: a base can already carry a
+  // listing from before the flag went on, and its store pane is store-facing.
+  return appSettingsNav.filter((item) => (item.listing ? isListing && storeEnabled : hasApp))
+}
+
+/** Workspace settings panes, by their `/{ws}/settings/{slug}` slug. The slug is the pane key. */
+export const wsSettingsSlugs = ['general', 'skills', 'security', 'danger-zone', 'billing', 'usage', 'audits', 'sso'] as const
+
+export type WsSettingsSlug = (typeof wsSettingsSlugs)[number]
+
+/** The old General page's sections — one rail row each now, `?tab=` on the old page. */
+export type WsSettingsSection = 'appearance' | 'skills' | 'security' | 'dangerZone'
+
+/**
+ * Old names that still reach a pane: the flat `/{ws}/{page}` routes, the
+ * `/{ws}/settings/{page}` slugs before them, and the General page's `?tab=`
+ * sections, which are rail rows now.
+ */
+export const wsSettingsLegacySlugs: Record<string, WsSettingsSlug> = {
+  'settings': 'general',
+  'more': 'general',
+  'ws-settings': 'general',
+  'appearance': 'general',
+  'dangerZone': 'danger-zone',
+  'ws-billing': 'billing',
+  'ws-audits': 'audits',
+  'ws-sso': 'sso',
+}
+
+/** Settings slugs, current and legacy, for the panes that moved to the workspace home page. */
+export const wsHomePaneBySettingsSlug: Record<string, WsHomePane> = {
+  'members': 'members',
+  'collaborators': 'members',
+  'ws-collaborators': 'members',
+  'teams': 'teams',
+  'ws-teams': 'teams',
+  'integrations': 'integrations',
+  'ws-integrations': 'integrations',
+}
+
+/** The pane a slug (or a legacy name) names, or null when it names none. */
+export function resolveWsSettingsSlug(slug: unknown): WsSettingsSlug | null {
+  if (typeof slug !== 'string') return null
+
+  if ((wsSettingsSlugs as readonly string[]).includes(slug)) return slug as WsSettingsSlug
+
+  return wsSettingsLegacySlugs[slug] ?? null
+}
+
+export const wsSettingsRouteName = 'index-typeOrId-settings-page'
+
+/** The pane the current route shows when it is the workspace settings page, else null. */
+export function wsSettingsSlugFromRoute(route?: { name?: unknown; params?: Record<string, unknown> }): WsSettingsSlug | null {
+  if (route?.name !== wsSettingsRouteName) return null
+
+  return resolveWsSettingsSlug(route.params?.page)
+}
+
+export function wsSettingsPath(workspaceId: string, slug: WsSettingsSlug) {
+  return `/${workspaceId}/settings/${slug}`
+}
+
+// Combined: all settings tabs → URL slugs
+export const settingsTabToSlug: Record<string, string> = {
+  ...baseSettingsTabToSlug,
+}
+
+// Inverse: URL slug → internal tab name
+export const baseSettingsSlugToTab: Record<string, string> = Object.fromEntries(
+  Object.entries(baseSettingsTabToSlug).map(([k, v]) => [v, k]),
+)
+
+/**
+ * The internal tab a `?settings=` value names, or null when it names none.
+ *
+ * `?settings` is not the base settings shell's alone — the agent page drives its
+ * own panel off `?settings=true` — so every reader has to reject a value it does
+ * not recognise rather than fall back to a default pane.
+ */
+export function resolveBaseSettingsTab(slug: unknown): string | null {
+  if (typeof slug !== 'string') return null
+
+  return baseSettingsSlugToTab[slug] ?? null
+}

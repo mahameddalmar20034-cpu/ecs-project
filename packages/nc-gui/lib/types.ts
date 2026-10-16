@@ -1,0 +1,1409 @@
+import type { CSSProperties } from '@vue/runtime-dom'
+import type { Ref } from 'vue'
+
+import {
+  type BaseType,
+  type BaseVersion,
+  type ColumnType,
+  type FilterType,
+  type FocusValue,
+  type ManagedAppInstallSurface,
+  type MetaType,
+  type PaginatedType,
+  type PermissionEntity,
+  type PermissionKey,
+  type ProjectRoles,
+  type PublicAttachmentScope,
+  type Roles,
+  type RolesObj,
+  type TableType,
+  type UITypes,
+  type UserType,
+  type ViewType,
+  type ViewTypes,
+} from 'nocodb-sdk'
+import type { Composer, I18n } from 'vue-i18n'
+import type { Theme as AntTheme } from 'ant-design-vue/es/config-provider'
+import type { UploadFile } from 'ant-design-vue'
+import type { TooltipPlacement } from 'ant-design-vue/lib/tooltip'
+import type { ImageWindowLoader } from '../components/smartsheet/grid/canvas/loaders/ImageLoader'
+import type { MarkdownLoader } from '../components/smartsheet/grid/canvas/loaders/markdownLoader'
+import type { SpriteLoader } from '../components/smartsheet/grid/canvas/loaders/SpriteLoader'
+import type { ActionManager } from '../components/smartsheet/grid/canvas/loaders/ActionManager'
+import type { TableMetaLoader } from '../components/smartsheet/grid/canvas/loaders/TableMetaLoader'
+import type { UseDetachedLongTextProps } from '../components/smartsheet/grid/canvas/composables/useDetachedLongText'
+import type { BaseRoleLoader } from '../components/smartsheet/grid/canvas/loaders/BaseRoleLoader'
+import type { IconMapKey } from '../utils/iconUtils'
+import type { AuditLogsDateRange, ImportSource, ImportType, PreFilledMode, TabType } from './enums'
+import type { rolePermissions } from './acl'
+import type Record from '~icons/*'
+
+export interface SchemaField {
+  name: string
+  type: 'string' | 'number' | 'boolean' | 'array' | 'object' | 'enum'
+  description?: string
+  items?: SchemaField
+  properties?: SchemaField[]
+  enum?: string[]
+  required?: boolean
+}
+
+interface User {
+  id: string
+  email: string
+  firstname: string | null
+  lastname: string | null
+  roles: RolesObj
+  base_roles: RolesObj
+  workspace_roles: RolesObj
+  org_roles?: RolesObj
+  invite_token?: string
+  base_id?: string
+  display_name?: string | null
+  featureFlags?: Record<string, boolean>
+  meta?: MetaType
+  is_new_user?: boolean
+}
+
+interface ProjectMetaInfo {
+  Node?: string
+  Arch?: string
+  Platform?: string
+  Docker?: boolean
+  Database?: string
+  ProjectOnRootDB?: boolean
+  RootDB?: string
+  PackageVersion?: string
+}
+
+interface Field {
+  order: number
+  show: number | boolean
+  bold: boolean | number
+  italic: boolean | number
+  underline: boolean | number
+  title: string
+  fk_column_id?: string
+  fk_level_id?: string
+  system?: boolean
+  isViewEssentialField?: boolean
+  initialShow?: boolean
+}
+
+type Filter = FilterType & {
+  field?: string
+  status?: 'update' | 'delete' | 'create'
+  parentId?: string
+  readOnly?: boolean
+}
+
+type NocoI18n = I18n<Record<string, unknown>, Record<string, unknown>, Record<string, unknown>, string, false>
+
+interface ThemeConfig extends AntTheme {
+  primaryColor: string
+  accentColor: string
+}
+
+interface RowMetaRowColorInfo {
+  rowBgColor?: string | null
+  rowLeftBorderColor?: string | null
+  rowHoverColor?: string | null
+  rowBorderColor?: string | null
+  is_set_as_background?: boolean
+  cellColors?: Record<string, any>
+}
+
+interface Row {
+  row: Record<string, any>
+  oldRow: Record<string, any>
+  rowMeta: {
+    // Used in InfiniteScroll Grid View
+    isLastRow?: number
+    rowIndex?: number
+    isLoading?: boolean
+    isValidationFailed?: boolean
+    isRowOrderUpdated?: boolean
+    isGroupChanged?: boolean
+    changedGroupIndex?: number
+    isDragging?: boolean
+    rowProgress?: {
+      message: string
+      progress: number
+    }
+    path?: Array<number> | null
+
+    new?: boolean
+    selected?: boolean
+    commentCount?: number
+    changed?: boolean
+    saving?: boolean
+    // Buffered links for a NEW (not-yet-created) record — persisted via the create
+    // payload on save. Existing-row deferred edits use the row store's pendingLtarOps
+    // queue instead (#14013, #14058).
+    ltarState?: Record<string, Record<string, any> | Record<string, any>[] | null>
+    fromExpandedForm?: boolean
+    // Row is hidden by RLS policy after insert
+    isRlsHidden?: boolean
+    // use in datetime picker component
+    isUpdatedFromCopyNPaste?: Record<string, boolean>
+    // Used in Calendar view
+    style?: Partial<CSSStyleDeclaration>
+    range?: {
+      fk_from_col: ColumnType
+      fk_to_col: ColumnType | null
+      is_readonly?: boolean
+    }
+    id?: string
+    position?: string
+    dayIndex?: number
+    overLapIteration?: number
+    numberOfOverlaps?: number
+    // Calendar week/3-day: this overlapping sliver is packed beyond the readable-width cap,
+    // so it is not drawn (its events are reached via the dense-cluster "View all N" overlay).
+    capHidden?: boolean
+    minutes?: number
+    recordIndex?: number // For week spanning records in month view
+    maxSpanning?: number
+    // Calendar all-day week view: stacking order + natural card height (px) +
+    // spanned column range, used to pack variable-height multi-field cards.
+    suitableRow?: number
+    cardHeight?: number
+    startCol?: number
+    spanCols?: number
+    /** Per-button-column visibility: true = button disabled for this row */
+    buttonDisabled?: Record<string, boolean>
+    /**
+     * Buffered SmartText (LongText + smartMode) ProseMirror drafts for a NEW
+     * (not-yet-created) record, keyed by column id. The SmartText editor persists
+     * via a rowId-keyed backend op which doesn't exist until the record is created,
+     * so edits are staged here and flushed on save (see useExpandedFormStore.save).
+     * Drafts whose flush fails stay buffered so the SmartText modal can restore
+     * and re-save them.
+     */
+    smartTextDrafts?: Record<string, Record<string, any> | null>
+    /**
+     * Optimistic-row save failure marker. Set when a frontend pre-check
+     * (currently: missing required NOT-NULL fields) blocks the insert before
+     * the row reaches the backend. The row stays in the local cache with this
+     * flag so the canvas/grid can render a ⚠️ marker; clearing it (e.g. once
+     * the missing fields are filled) re-enables the auto-retry path.
+     */
+    saveError?: {
+      reason: 'missingRequired'
+      // Column titles that were required-and-null on the failed insert.
+      // UI consumers can cross-reference against FieldsInj to decide whether
+      // any are hidden in the current view (in which case the marker should
+      // prompt the user to open the expanded form).
+      missingFields: string[]
+    }
+  } & RowMetaRowColorInfo
+}
+
+interface Attachment {
+  url: string
+}
+
+interface CalendarRangeType {
+  fk_from_column_id: string
+  fk_to_column_id: string | null
+}
+
+type RolePermissions = Omit<typeof rolePermissions, 'guest' | 'admin' | 'super'>
+
+type GetKeys<T> = T extends Record<any, Record<infer Key, boolean>> ? Key : never
+
+type Permission<K extends keyof RolePermissions = keyof RolePermissions> = RolePermissions[K] extends Record<any, any>
+  ? GetKeys<RolePermissions[K]>
+  : never
+
+interface TabItem {
+  type: TabType
+  title: string
+  id?: string
+  viewTitle?: string
+  viewId?: string
+  sortsState?: Map<string, any>
+  filterState?: Map<string, any>
+  meta?: MetaType
+  tabMeta?: any
+  baseId?: string
+}
+
+interface SharedViewMeta extends Record<string, any> {
+  surveyMode?: boolean
+  transitionDuration?: number // in ms
+  withTheme?: boolean
+  theme?: Partial<ThemeConfig>
+  defaultTheme?: 'light' | 'dark' | 'system'
+  allowCSVDownload?: boolean
+  rtl?: boolean
+  preFillEnabled?: boolean
+  preFilledMode?: PreFilledMode
+}
+
+interface SharedView {
+  uuid?: string
+  id: string
+  password?: string
+  type?: ViewTypes
+  meta: SharedViewMeta
+}
+
+type importFileList = (UploadFile & { data: string | ArrayBuffer; encoding?: string })[]
+
+type streamImportFileList = (UploadFile & { encoding?: string })[]
+
+type Nullable<T> = { [K in keyof T]: T[K] | null }
+
+/**
+ * @description: Base type for frontend
+ */
+type NcProject = BaseType & {
+  /**
+   * When base is expanded in sidebar
+   * */
+  isExpanded?: boolean
+  /**
+   * When base's content is being fetched i.e tables, views, etc
+   */
+  isLoading?: boolean
+  temp_title?: string
+  edit?: boolean
+  starred?: boolean
+  uuid?: string
+  users?: User[]
+  default_role?: ProjectRoles | string
+  version?: BaseVersion
+  // Managed App fields
+  managed_app_master?: boolean
+  managed_app_id?: string
+  managed_app_version_id?: string
+  managed_app_version?: string
+  managed_app_published_at?: string
+  auto_update?: boolean
+  managed_app_schema_locked?: boolean
+  /** What the publisher handed this install's owner. Null on an install from
+   *  before the column — read it through `resolveInstallSurface`. */
+  managed_app_surface?: ManagedAppInstallSurface
+  /** An operator's kill switch. 'app' stops every install of the listing;
+   *  'version' only the installs pinned to that release. Unset while it runs. */
+  managed_app_suspended_scope?: 'app' | 'version'
+  managed_app_suspended_reason?: string | null
+  // Set only for lane bases — the production base this environment instance
+  // belongs to. Used to decide whether to surface a lane base in the base list.
+  fk_base_id?: string
+  // True when the base has a published interface the current user can open.
+  // Drives the base card default ("Open interface" + a "Go to data" button).
+  has_published_interface?: boolean
+}
+
+interface ImportWorkerPayload {
+  importType: ImportType
+  importSource: ImportSource
+  value: any
+  config: Record<string, any>
+  existingColumns?: ColumnType[]
+}
+
+interface Group {
+  key: string
+  column: ColumnType
+  color: string
+  count: number
+  nestedIn: GroupNestedIn[]
+  paginationData: PaginatedType
+  nested: boolean
+  children?: Group[]
+  aggregations: Record<string, any>
+  rows?: Row[]
+  root?: boolean
+  displayValueProp?: string
+}
+
+interface GroupNestedIn {
+  title: string
+  column_name: string
+  key: string
+  column_uidt: string
+  column_id: string
+  groupIndex?: number
+}
+
+interface Users {
+  emails?: string
+  role: Roles
+  invitationToken?: string
+}
+
+type ProjectPageType =
+  | 'overview'
+  | 'collaborator'
+  | 'interface-members'
+  | 'data-source'
+  | 'base-settings'
+  | 'syncs'
+  | 'integrations'
+  | 'permissions'
+  | 'audits'
+  | 'workflows'
+  | 'mcp'
+  | 'record-trash'
+  | 'snapshots'
+
+type ViewPageType = 'view' | 'webhook' | 'api' | 'field' | 'relation' | 'permissions' | 'rls' | 'templates' | 'dates'
+
+type NcButtonSize = 'xxsmall' | 'xsmall' | 'small' | 'medium' | 'xs'
+
+interface SidebarTableNode extends TableType {
+  isMetaLoading?: boolean
+  isViewsLoading?: boolean
+  views: ViewType[]
+}
+
+interface UsersSortType {
+  field?: 'email' | 'roles' | 'title' | 'id' | 'memberCount' | 'baseCount' | 'workspaceCount' | 'created_at' | 'billable'
+  direction?: 'asc' | 'desc'
+}
+
+type CommandPaletteType = 'cmd-k' | 'cmd-j' | 'cmd-l'
+
+interface FormFieldsLimitOptionsType {
+  id: string
+  order: number
+  show: boolean
+}
+
+interface ImageCropperConfig {
+  stencilProps?: {
+    aspectRatio?: number
+    /**
+     * It can be used to force the cropper fills all visible area by default:
+     * @default true
+     */
+    fillDefault?: boolean
+    circlePreview?: boolean
+  }
+  minHeight?: number
+  minWidth?: number
+  imageRestriction?: 'fill-area' | 'fit-area' | 'stencil' | 'none'
+}
+
+interface ImageCropperProps {
+  imageConfig: {
+    src: string
+    type: string
+    name: string
+  }
+  cropperConfig: ImageCropperConfig
+  uploadConfig?: {
+    path?: string
+    scope?: PublicAttachmentScope
+    // filesize in bytes
+    maxFileSize?: number
+  }
+  showCropper: boolean
+}
+
+interface AuditLogsQuery {
+  type?: string[]
+  workspaceId?: string
+  workspaceIds?: string[]
+  baseId?: string
+  sourceId?: string
+  user?: string
+  startDate?: string
+  endDate?: string
+  dateRange?: AuditLogsDateRange
+  dateRangeLabel?: string
+  orderBy: {
+    created_at?: 'asc' | 'desc'
+    user?: 'asc' | 'desc'
+  }
+}
+
+interface NcTableColumnProps<T extends object = Record<string, any>> {
+  key: 'name' | 'action' | string
+  // title is column header cell value and we can also pass i18n value as this is just used to render in UI
+  title: string
+  // minWidth is required to fix overflow col issue
+  minWidth: number
+  // provide width if we want col to be fixed width or provide basis value
+  width?: number
+  basis?: CSSProperties['flex-basis']
+  padding?: CSSProperties['padding']
+  align?: 'items-center' | 'items-start' | 'items-end'
+  justify?: 'justify-center' | 'justify-start' | 'justify-end'
+  showOrderBy?: boolean
+  // dataIndex is used as key to extract data from row object
+  dataIndex?: keyof T | (string & Record<never, never>)
+  // name can be used as value, which will be used to display in header if title is absent and in data-test-id
+  name?: string
+  format?: (value: any, record: T) => any
+  bodyCellClassName?: string
+  headerCellClassName?: string
+  [key: string]: any
+}
+
+interface ProductFeedItem {
+  Id: string
+  Title: string
+  Description: string
+  ['Feed Source']: 'Youtube' | 'Github' | 'All' | 'Cloud'
+  Url: string
+  Tags?: string
+  ['Published Time']: string
+  Image?: string | null
+}
+
+type SordDirectionType = 'asc' | 'desc' | undefined
+
+type NestedArray<T> = T | NestedArray<T>[]
+
+interface ViewActionState {
+  viewProgress: {
+    progress: number
+    message?: string
+  } | null
+  rowProgress: Map<
+    string,
+    {
+      progress: number
+      message?: string
+    }
+  >
+  cellProgress: Map<
+    string,
+    Map<
+      string,
+      {
+        progress: number
+        message?: string
+        icon?: keyof typeof iconMap
+      }
+    >
+  >
+}
+
+interface CellRendererOptions {
+  value: any
+  row: any
+  pk: any
+  column: ColumnType
+  relatedColObj?: ColumnType
+  relatedTableMeta?: TableType
+  meta?: TableType
+  metas?: { [idOrTitle: string]: TableType | any }
+  baseRoles?: Record<string, any>
+  // Bound at grid setup and threaded through so cell click handlers can run
+  // permission checks without calling useRoles() outside a component setup.
+  isUIAllowed?: (permission: string, args?: { roles?: string | Record<string, boolean> | string[] | null }) => boolean
+  x: number
+  y: number
+  width: number
+  height: number
+  selected: boolean
+  pv?: boolean
+  readonly?: boolean
+  imageLoader: ImageWindowLoader
+  markdownLoader: MarkdownLoader
+  spriteLoader: SpriteLoader
+  actionManager: ActionManager
+  tableMetaLoader: TableMetaLoader
+  baseRoleLoader: BaseRoleLoader
+  isMysql: (sourceId?: string) => boolean
+  isXcdbBase: (sourceId?: string) => boolean
+  isPg: (sourceId?: string) => boolean
+  t: Composer['t']
+  padding: number
+  renderCell: (ctx: CanvasRenderingContext2D, column: any, options: CellRendererOptions) => void
+  isUnderLookup?: boolean
+  tag?: {
+    renderAsTag?: boolean
+    tagPaddingX?: number
+    tagPaddingY?: number
+    tagHeight?: number
+    tagRadius?: number
+    tagBgColor?: string
+    tagSpacing?: number
+    tagBorderColor?: string
+    tagBorderWidth?: number
+  }
+  disabled?: {
+    isInvalid: boolean
+    tooltip?: string
+  }
+  fontSize?: number
+  textAlign?: 'left' | 'right' | 'center' | 'start' | 'end'
+  textColor?: string
+  mousePosition: {
+    x: number
+    y: number
+  }
+  sqlUis?: Record<string, any>
+  skipRender?: boolean
+  /** interface inline edit (simple link picker): LTAR cells draw a select-style chevron instead of plus/expand icons */
+  isSimpleLinkRecordList?: boolean
+  setCursor: SetCursorType
+  getColor: GetColorType
+  isDark?: boolean
+  cellRenderStore: CellRenderStore
+  baseUsers?: (Partial<UserType> | Partial<User>)[]
+  user?: Partial<UserType> | Partial<User>
+  formula?: boolean
+  isPublic?: boolean
+  path?: Array<number>
+  renderAsPlainCell?: boolean
+  fontFamily?: string
+  isRowHovered?: boolean
+  isRowChecked?: boolean
+  isRowCellSelected?: boolean
+  isCellInSelectionRange?: boolean
+  isGroupHeader?: boolean
+  rowMeta?: Row['rowMeta']
+  allowLocalUrl?: boolean
+  /**
+   * `isRootCell` is used to determine if the cell is the root cell of the row or nested cell
+   * This is used in row colouring
+   */
+  isRootCell?: boolean
+  /**
+   * When true, the row-level background fill (in renderRows) already painted the row color,
+   * so renderCell can skip the redundant per-cell background fill and only draw borders.
+   */
+  rowBgAlreadyApplied?: boolean
+}
+
+interface CellRenderStore {
+  x?: number
+  y?: number
+  width?: number
+  height?: number
+  links?: { x: number; y: number; width: number; height: number; url: string }[]
+  ratingChanged?: {
+    value: number
+    hoverValue: number
+  }
+  ltar?: { oldX?: number; oldY?: number; x?: number; y?: number; width?: number; height?: number; value?: any }[]
+  [key: string]: any
+}
+
+type CursorType = CSSProperties['cursor']
+
+type SetCursorType = (cursor: CursorType, customCondition?: (prevValue: CursorType) => boolean) => void
+
+type GetColorType = (
+  cssVariableValue: string,
+  darkCssVariableValue?: string,
+  opacity?: number,
+  options?: { bypass?: boolean },
+) => string
+
+type MakeCellEditableFn = (row: Row, clickedColumn: CanvasGridColumn, showEditCellRestrictionTooltip?: boolean) => void
+
+interface CellRenderFn {
+  (ctx: CanvasRenderingContext2D, options: CellRendererOptions): void | { x?: number; y?: number; nextLine?: boolean }
+}
+
+interface CellRenderer {
+  render: CellRenderFn
+  renderEmpty?: CellRenderFn
+  handleClick?: (options: {
+    event: MouseEvent
+    mousePosition: { x: number; y: number }
+    value: any
+    column: CanvasGridColumn
+    row: Row
+    pk: any
+    path: Array<number>
+    readonly: boolean
+    isDoubleClick: boolean
+    getCellPosition: (column: CanvasGridColumn, rowIndex: number) => { width: number; height: number; x: number; y: number }
+    updateOrSaveRow: (
+      row: Row,
+      property?: string,
+      ltarState?: Record<string, any>,
+      args?: { metaValue?: TableType; viewMetaValue?: ViewType },
+      beforeRow?: string,
+      path?: Array<number>,
+    ) => Promise<any>
+    actionManager: ActionManager
+    makeCellEditable: MakeCellEditableFn
+    selected: boolean
+    imageLoader: ImageWindowLoader
+    markdownLoader: MarkdownLoader
+    cellRenderStore: CellRenderStore
+    isPublic?: boolean
+    openDetachedExpandedForm: (props: UseExpandedFormDetachedProps) => void
+    openDetachedLongText: (props: UseDetachedLongTextProps) => void
+    openSmartText?: (rowId: string, columnId: string, rowData?: Record<string, any>, rowIndex?: number) => void
+    formula?: boolean
+    allowLocalUrl?: boolean
+    t: Composer['t']
+    getColor: GetColorType
+  }) => Promise<boolean>
+  handleKeyDown?: (options: {
+    e: KeyboardEvent
+    row: Row
+    column: CanvasGridColumn
+    value: any
+    pk: any
+    readonly: boolean
+    path: Array<number>
+    updateOrSaveRow: (
+      row: Row,
+      property?: string,
+      ltarState?: Record<string, any>,
+      args?: { metaValue?: TableType; viewMetaValue?: ViewType },
+      beforeRow?: string,
+      path?: Array<number>,
+    ) => Promise<any>
+    actionManager: ActionManager
+    markdownLoader: MarkdownLoader
+    makeCellEditable: MakeCellEditableFn
+    cellRenderStore: CellRenderStore
+    openDetachedLongText: (props: UseDetachedLongTextProps) => void
+    openSmartText?: (rowId: string, columnId: string, rowData?: Record<string, any>, rowIndex?: number) => void
+    allowLocalUrl?: boolean
+    t: Composer['t']
+  }) => Promise<boolean | void>
+  handleHover?: (options: {
+    event: MouseEvent
+    mousePosition: { x: number; y: number }
+    value: any
+    column: CanvasGridColumn
+    row: Row
+    pk: any
+    getCellPosition: (column: CanvasGridColumn, rowIndex: number) => { width: number; height: number; x: number; y: number }
+    updateOrSaveRow?: (
+      row: Row,
+      property?: string,
+      ltarState?: Record<string, any>,
+      args?: { metaValue?: TableType; viewMetaValue?: ViewType },
+      beforeRow?: string,
+      path?: Array<number>,
+    ) => Promise<any>
+    actionManager: ActionManager
+    makeCellEditable: MakeCellEditableFn
+    selected: boolean
+    imageLoader: ImageWindowLoader
+    markdownLoader: MarkdownLoader
+    cellRenderStore: CellRenderStore
+    setCursor: SetCursorType
+    path: Array<number>
+    baseUsers?: (Partial<UserType> | Partial<User>)[]
+    /** Interface pages suppress collaborator-facing hover chrome (user cell name/email/role card). */
+    isInterface?: boolean
+    t: Composer['t']
+  }) => Promise<void>
+  [key: string]: any
+}
+
+interface FillHandlerPosition {
+  x: number
+  y: number
+  size: number
+  fixedCol: boolean
+}
+
+interface ColumnDragOver {
+  id: string
+  index: number
+  // drop on the display value slot: set the dragged field as display value instead of reordering
+  setDisplayValue?: boolean
+}
+
+interface CanvasGridColumn {
+  id: string
+  grid_column_id: string
+  title: string
+  width: string
+  uidt: keyof typeof UITypes | null
+  fixed: boolean
+  virtual?: boolean
+  pv: boolean
+  columnObj: ColumnType & {
+    extra?: any | never
+  }
+  readonly: boolean
+  isCellEditable?: boolean
+  /** Interface builder: this column's inline-edit was turned off in its Field
+   *  pane. Read-only like a permission denial, but the renderer skips the
+   *  "Edit restricted" tooltip/border — it's an element config choice. */
+  inlineEditDisabled?: boolean
+  isSyncedColumn?: boolean
+  aggregation: string
+  agg_fn: string
+  agg_prefix: string
+  /** True when a cell selection is active and this field is either out-of-scope
+   *  (blank) or in-scope but has no aggregator configured. Renderer should
+   *  skip both the value and the "Summary" hover affordance. */
+  aggregationSuppressed?: boolean
+  relatedColObj?: ColumnType
+  relatedTableMeta?: TableType
+  isInvalidColumn?: {
+    isInvalid: boolean
+    tooltip: string
+    ignoreTooltip?: boolean
+  }
+  isDateDependencyField?: boolean
+  abstractType: any
+}
+
+interface ParsePlainCellValueProps {
+  value: any
+  params: {
+    col: ColumnType
+    abstractType: unknown
+    meta: TableType
+    metas: { [idOrTitle: string]: TableType | any }
+    baseUsers?: Map<string, User[]>
+    isMysql: (sourceId?: string) => boolean
+    isXcdbBase: (sourceId?: string) => boolean
+    t: Composer['t']
+    isUnderLookup?: boolean
+  }
+}
+
+type CanvasEditEnabledType = {
+  rowIndex: number
+  column: ColumnType
+  row: Row
+  x: number
+  y: number
+  width: number
+  minHeight: number
+  height: number | string
+  fixed: boolean
+  path: Array<number>
+  isCellEditable?: boolean
+} | null
+
+type CanvasCellEventDataInjType = ExtractInjectedReactive<typeof CanvasCellEventDataInj>
+
+interface CanvasGroup {
+  groupIndex?: number
+  column: ColumnType
+  groups: Map<number, CanvasGroup>
+  chunkStates: Array<'loading' | 'loaded' | 'failed' | undefined>
+  count: number
+  isExpanded: boolean
+  value: any
+  displayValueProp?: string
+  relatedTableMeta?: TableType
+  relatedColumn?: ColumnType
+  color: string
+  groupCount?: number
+  path?: Array<number>
+  nestedIn: GroupNestedIn[]
+  aggregations: Record<string, any>
+  /** Lazy aggregation fetch state — unset means not requested yet (fetched when the group becomes visible) */
+  aggregationState?: 'loading' | 'loaded'
+}
+
+interface CloudFeaturesType {
+  'Id'?: number
+  'Title'?: string
+  'Highlight'?: boolean
+  'Coming Soon'?: boolean
+}
+
+type CanvasScrollToCellFn = (row?: number, column?: number, path?: Array<number>, horizontalScroll?: boolean) => void
+
+/** Topbar identity for a shared page that is not a view — see `useSharedView().sharedPageTitle`. */
+interface SharedPageTitle {
+  title: string
+  icon?: IconMapKey
+  /** Small muted suffix after the title, e.g. an artifact's version. */
+  badge?: string
+  /** Standing caveat about the page's content, shown on the right of the topbar. */
+  notice?: string
+  /** Link beside the notice — `href` is used verbatim, so encode it at the source. */
+  report?: { label: string; href: string }
+}
+
+interface PermissionConfig {
+  entity: PermissionEntity
+  entityId: string
+  entityTitle?: string
+  permission: PermissionKey
+  /** Overrides the PermissionMeta label, for hosts too narrow for the full one. */
+  label?: string
+  disabled?: boolean
+  tooltip?: string
+  /** Pre-resolved effective value for inherited permissions (e.g. from parent doc). */
+  effectiveValue?: string
+  /** Parent's effective permission value — child options more permissive than this are disabled. */
+  parentEffectiveValue?: string
+  /** Current visibility value — editing options more permissive than this are disabled. */
+  visibilityValue?: string
+  /**
+   * Multi-entity bulk mode. When set and length > 1, the underlying
+   * usePermissionSelector composable fans the set/drop API call out over every
+   * id. entityId is still used as the initial-state probe.
+   */
+  entityIds?: string[]
+}
+
+interface PermissionSelectorUser {
+  id: string
+  email?: string
+  display_name?: string | null
+  type?: 'user' | 'team' | 'appTeam' | 'agent'
+  hierarchy_scope?: 'self_only' | 'self_and_descendants'
+}
+
+/** A user offered in the "Specific users" pool beyond the base members (e.g. interface-only collaborators). */
+interface PermissionPoolUser {
+  id: string
+  email: string
+  display_name?: string | null
+  /** Base-role-shaped role so the minimum-role filter can place them; viewer when unknown. */
+  roles?: string
+  meta?: Record<string, any> | string | null
+}
+
+/** A team offered in the "Specific users" pool beyond the base teams — shaped like a base-team row. */
+interface PermissionPoolTeam {
+  team_id: string
+  team_title: string
+  team_icon?: string | null
+  team_icon_type?: string | null
+  team_badge_color?: string | null
+  /** Base-role-shaped role so the minimum-role filter can place it; viewer when unknown. */
+  base_role?: string
+}
+
+// NcList type starts here
+
+type MultiSelectRawValueType = Array<string | number>
+
+type RawValueType = string | number | MultiSelectRawValueType
+
+interface NcListItemType {
+  value?: RawValueType
+  label?: string
+  ncItemDisabled?: boolean
+  ncItemTooltip?: string
+  /**
+   * If the item is a group header, this will be the title of the group
+   */
+  ncGroupHeader?: boolean
+  /**
+   * If the list has groups then we need to add `ncGroupHeaderLabel` in each item, will he user in sorting and filtering the list
+   */
+  ncGroupHeaderLabel?: string
+  [key: string]: any
+}
+
+interface NcListSearchBasisOptionType {
+  /**
+   * The search basis info to use for the list.
+   * This will tell user that the search is based on this property.
+   */
+  searchBasisInfo: string
+  /**
+   * The filter callback to use for the list.
+   */
+  filterCallback: (input: string, option: NcListItemType, index: Number) => boolean
+}
+
+/**
+ * Props interface for a standalone NcListItem component.
+ * Used both by NcList internally and anywhere an individual list-item
+ * with consistent variant / state styling is needed.
+ */
+interface NcListItemProps {
+  /** The list item data object */
+  option: NcListItemType
+  /** Size variant — controls padding and min-height */
+  variant?: 'default' | 'small' | 'medium'
+  /** Index within the parent list (used for keyboard-active CSS class) */
+  index?: number
+  /** Key for reading the label from the option object */
+  optionLabelKey?: string
+  /** Whether this item is currently selected */
+  isSelected?: boolean
+  /** Whether this item is currently active / keyboard-focused */
+  isActive?: boolean
+  /** Show a checkmark icon when the item is selected */
+  showSelectedOption?: boolean
+  /**
+   * Whether to render the selected-item background highlight.
+   * NcList sets this to false while the user is moving with the keyboard
+   * so the hover effect doesn't compete with the keyboard-active highlight.
+   */
+  showHoverEffect?: boolean
+  /** Disable all pointer interaction (locked view) */
+  isLocked?: boolean
+  /** Remove horizontal padding and rounded corners (full-width mode) */
+  itemFullWidth?: boolean
+  /** Extra CSS classes forwarded to the item root element */
+  itemClassName?: string
+  /** Extra CSS classes forwarded to group-header items */
+  groupHeaderClassName?: string
+  /** Placement for the item-level tooltip (ncItemTooltip) */
+  itemTooltipPlacement?: TooltipPlacement
+  /**
+   * Secondary info shown next to the label when the item was matched via
+   * a search-basis option rather than by label text.
+   */
+  searchBasisInfo?: string
+  /** Min-height of group header rows in pixels */
+  groupHeaderHeight?: number
+}
+
+/**
+ * Props interface for the List component
+ */
+interface NcListProps {
+  /** The currently selected value — absent/null while nothing is selected */
+  value?: RawValueType | null
+  /** The list of items to display */
+  list: NcListItemType[]
+  /**
+   * The order of the groups in the list, this will be used to sort the groups in the list
+   * @example
+   * ```ts
+   * const groupOrder = ['Group 1', 'Group 2', 'Group 3']
+   * ```
+   */
+  groupOrder?: string[]
+
+  /**
+   * The key to use for accessing the value from a list item
+   * @default 'value'
+   */
+  optionValueKey?: string
+  /**
+   * The key to use for accessing the label from a list item
+   * @default 'label'
+   */
+  optionLabelKey?: string
+  /** Whether the list is open or closed */
+  open?: boolean
+  /**
+   * Whether to close the list after an item is selected
+   * @default true
+   */
+  closeOnSelect?: boolean
+  /** Placeholder text for the search input */
+  searchInputPlaceholder?: string
+  /** Show search input box always */
+  showSearchAlways?: boolean
+  /** Whether to show the currently selected option */
+  showSelectedOption?: boolean
+  /**
+   * The height of each item in the list, used for virtual list rendering.
+   * @default 38
+   */
+  itemHeight?: number
+  /**
+   * The height of the group header in the list
+   * @default 28
+   */
+  groupHeaderHeight?: number
+  variant?: 'default' | 'small' | 'medium'
+  /** Custom filter function for list items */
+  filterOption?: (input: string, option: NcListItemType, index: Number) => boolean
+  /**
+   * Indicates whether the component allows multiple selections.
+   */
+  isMultiSelect?: boolean
+  /**
+   * The minimum number of items required in the list to enable search functionality.
+   */
+  minItemsForSearch?: number
+  /**
+   * Whether the list is locked and cannot be interacted with
+   */
+  isLocked?: boolean
+
+  /**
+   * Show a loading spinner in place of the list body while data is being fetched.
+   * Search input and header/footer slots stay visible.
+   * @default false
+   */
+  isLoading?: boolean
+
+  /**
+   * The search box queries a server rather than the list already in memory.
+   *
+   * Local filtering is skipped, because `list` is then already the answer to
+   * the query — re-filtering it would drop rows whose label does not literally
+   * contain the query (a pull request matched on its body, say). Pair with
+   * `@search-change` to run the fetch and `isLoading` while it is in flight.
+   * @default false
+   */
+  serverSearch?: boolean
+
+  /**
+   * How long to wait after the last keystroke before `search-change` fires, in
+   * milliseconds. Only relevant with `serverSearch`.
+   * @default 300
+   */
+  searchDebounce?: number
+
+  /**
+   * Whether input should have border
+   */
+  inputBordered?: boolean
+
+  listWrapperClassName?: string
+
+  containerClassName?: string
+
+  wrapperClassName?: string
+
+  itemClassName?: string
+
+  groupHeaderClassName?: string
+
+  itemTooltipPlacement?: TooltipPlacement
+
+  /**
+   * Whether to hide the top divider
+   */
+  hideTopDivider?: boolean
+
+  emptyDescription?: string
+
+  /**
+   * This will remove side padding and rounded corners from the list item
+   */
+  itemFullWidth?: boolean
+
+  /**
+   * Whether to stop propagation on item click
+   */
+  stopPropagationOnItemClick?: boolean
+
+  /**
+   * @Info - This will be used only if search result not found based on default search method.
+   *
+   * - With the help of search basis we can search list items based on different fields properties which are not visible for user.
+   * - Also we will show this info to user in tooltip.
+   *
+   * @example
+   * ```ts
+   * const searchBasisOptions: NcListSearchBasisOptionType[] = [
+   *  {
+   *    searchBasisInfo: t('msg.info.matchedByButtonLabel'),
+   *    filterCallback: (query, option) => {
+   *      if (!option) return false
+   *
+   *      const column = option as ColumnType
+   *
+   *      return isButton(column) && searchCompare([(column.colOptions as ButtonType)?.label], query)
+   *    },
+   *  },
+   *  {
+   *    searchBasisInfo: t('msg.info.matchedByFieldDescription'),
+   *    filterCallback: (query, option) => {
+   *      if (!option) return false
+   *
+   *      const column = option as ColumnType
+   *
+   *      if (!column.description) return false
+   *
+   *      return searchCompare([column.description], query)
+   *    },
+   *  }
+   * ]
+   * ```
+   */
+  searchBasisOptions?: NcListSearchBasisOptionType[]
+
+  /**
+   * @default default
+   */
+  theme?: 'default' | 'ai'
+
+  resetHoverEffectOnMouseLeave?: boolean
+
+  /** Focus search input on open */
+  focusSearchOnOpen?: boolean
+}
+
+// NcList type ends here
+
+/** Which UI the LTAR cells render inside `LinkRecordDropdown` — the classic
+ * card modal or the compact single-list picker used by interface inline edit. */
+type LinkRecordDropdownVariant = 'classic' | 'simple'
+
+type NcDropdownPlacement =
+  | 'bottom'
+  | 'top'
+  | 'bottomLeft'
+  | 'bottomRight'
+  | 'topLeft'
+  | 'topRight'
+  | 'topCenter'
+  | 'bottomCenter'
+  | 'right'
+  | 'rightTop'
+  | 'rightBottom'
+  | 'left'
+  | 'leftTop'
+  | 'leftBottom'
+
+interface CreateViewForm {
+  title: string
+  type: ViewTypes
+  description?: string
+  copy_from_id: string | null
+  // for kanban view only
+  fk_grp_col_id: string | null
+  fk_geo_data_col_id: string | null
+  // for calendar view only
+  calendar_range: Array<{
+    fk_from_column_id: string
+    fk_to_column_id: string | null // for ee only
+  }>
+  fk_cover_image_col_id: string | null | undefined
+}
+
+// NcClipboardDataType type starts here
+type NcClipboardDataType = Record<string, NcClipboardDataItemType>
+
+interface NcClipboardDataItemType {
+  /**
+   * Unique clipboard item id
+   */
+  id: string
+  workspaceId?: string
+  tableId?: string
+  rowIds: string[]
+  copiedPlainText: string
+  copiedHtml?: string
+  dbCellValueArr: Array<any[]>
+  columns: Partial<ColumnType>[]
+}
+
+// NcClipboardDataType type ends here
+
+interface AttachmentCellDropOverType {
+  rowIndex: number
+  colIndex: number
+  columnId: string
+  path: Array<number>
+}
+
+interface GroupKeysStorage {
+  [viewId: string]: {
+    keys: Array<string>
+    lastAccessed: number // timestamp
+  }
+}
+
+interface ViewScrollPositionStorage {
+  [viewId: string]: {
+    scrollTop: number
+    scrollLeft: number
+    lastAccessed: number // timestamp
+  }
+}
+
+interface OAuthAuthorization {
+  id: string
+  client_id: string
+  client_name: string
+  client_description?: string
+  client_uri?: string
+  logo_uri?: {
+    url?: string
+    signedUrl?: string
+    path?: string
+    title?: string
+    mimetype?: string
+    size?: number
+  }
+  scope?: string
+  granted_resources?: {
+    workspace_id?: string
+    base_id?: string
+  }
+  created_at: string
+  last_used_at?: string
+}
+
+interface SupportedDocsType {
+  title: string
+  href: string
+}
+
+interface TeamType {
+  id: string
+  title: string
+  description?: string
+  created_by: string
+  owners: string[]
+  members: string[]
+  created_at: string
+  updated_at: string
+  meta: MetaType
+}
+
+export type {
+  User,
+  ProjectMetaInfo,
+  Field,
+  Filter,
+  NocoI18n,
+  ThemeConfig,
+  RowMetaRowColorInfo,
+  Row,
+  RolePermissions,
+  Permission,
+  TabItem,
+  SharedView,
+  SharedViewMeta,
+  importFileList,
+  streamImportFileList,
+  Nullable,
+  NcProject,
+  ImportWorkerPayload,
+  Group,
+  GroupNestedIn,
+  Users,
+  ProjectPageType,
+  ViewPageType,
+  NcButtonSize,
+  SidebarTableNode,
+  UsersSortType,
+  CommandPaletteType,
+  CalendarRangeType,
+  FormFieldsLimitOptionsType,
+  ImageCropperConfig,
+  ImageCropperProps,
+  AuditLogsQuery,
+  NcTableColumnProps,
+  SordDirectionType,
+  ProductFeedItem,
+  Attachment,
+  NestedArray,
+  ViewActionState,
+  CellRenderFn,
+  CellRenderer,
+  CellRendererOptions,
+  CellRenderStore,
+  CanvasGridColumn,
+  ColumnDragOver,
+  FillHandlerPosition,
+  ParsePlainCellValueProps,
+  CanvasEditEnabledType,
+  SetCursorType,
+  GetColorType,
+  CursorType,
+  CanvasCellEventDataInjType,
+  CanvasGroup,
+  CloudFeaturesType,
+  CanvasScrollToCellFn,
+  SharedPageTitle,
+  PermissionConfig,
+  PermissionSelectorUser,
+  PermissionPoolUser,
+  PermissionPoolTeam,
+  NcListProps,
+  NcListItemProps,
+  NcListItemType,
+  NcListSearchBasisOptionType,
+  MultiSelectRawValueType,
+  RawValueType,
+  LinkRecordDropdownVariant,
+  NcDropdownPlacement,
+  MakeCellEditableFn,
+  CreateViewForm,
+  NcClipboardDataType,
+  NcClipboardDataItemType,
+  AttachmentCellDropOverType,
+  GroupKeysStorage,
+  ViewScrollPositionStorage,
+  OAuthAuthorization,
+  SupportedDocsType,
+  TeamType,
+}
+
+export interface GridRemoteFocus {
+  userId: string
+  presenceId: string
+  color: string
+  /** Collaborator display name, shown as a label on the focused cell. */
+  name: string
+  editing: boolean
+  /** An attachment upload is in flight on this cell. */
+  uploading?: boolean
+}
+
+/** rowPk → fieldId → focuses (one entry per remote connection on that cell). */
+export type GridRemoteFocusMap = Map<string, Map<string, GridRemoteFocus[]>>
+
+/** rowPk → connections with that record open (expanded form / card). */
+export type GridRemoteRecordMap = Map<string, GridRemoteFocus[]>
+
+/** fieldId → connections with that field's config editor open. */
+export type GridRemoteFieldMap = Map<string, GridRemoteFocus[]>
+
+/** The followed collaborator's focused cell in the current view (drives follow-scroll). */
+export interface GridFollowedFocus {
+  rowPk: string
+  fieldId: string
+}
+
+/**
+ * One remote connection's focus on a table, resolved for display.
+ *
+ * `active` folds the freshness check on the activity flags (`editing` /
+ * `typing` / `uploading`) so consumers render a boolean rather than each
+ * re-deriving staleness.
+ */
+export interface RemoteFocusEntry {
+  userId: string
+  presenceId: string
+  color: string
+  name: string
+  focus: NonNullable<FocusValue>
+  active: boolean
+}
+
+/** A user rendered in a presence avatar stack (topbar / doc / expanded record). */
+export interface PresenceStackUser {
+  userId: string
+  email?: string
+  display_name?: string
+  meta?: Record<string, any> | null
+  color?: string
+}
+
+export interface FocusPresenceParams {
+  view: Ref<ViewType | undefined>
+  activeCell: Ref<{ row?: number; column?: number; path?: Array<number> }>
+  /** Truthy while a cell is in edit mode (typed `unknown` to decouple from the canvas edit type). */
+  editEnabled: Ref<unknown>
+  /** `readonly` is the rolled-up "can this user edit this cell" — used to avoid broadcasting
+   *  "editing" when the grid opens a read-only/computed/synced cell in view mode. */
+  columns: Ref<Array<{ id?: string; columnObj?: ColumnType; readonly?: boolean }>>
+  getRowPk: (rowIndex: number, path?: Array<number>) => string | null
+}
+
+/** The shared open-delay state of the NcTooltips inside one NcTooltipProvider. */
+export interface NcTooltipGroup {
+  /** Milliseconds before a cold open; a tooltip's own `mouseEnterDelay` when undefined. */
+  delay?: number
+  /** Milliseconds before closing. */
+  closeDelay?: number
+  /** Milliseconds after a close during which the next tooltip opens instantly. */
+  timeout: number
+  /** The open delay a tooltip should use right now, given its own default in ms. */
+  enterDelay: (own: number) => number
+  onOpen: () => void
+  onClose: () => void
+  /**
+   * Set when the provider owns a single popup that moves between its items,
+   * the way Base UI's does. `NcTooltip` ignores this — only `NcTooltipItem`
+   * hands itself over, so grouped `NcTooltip`s keep their own popup each.
+   */
+  glide?: {
+    show: (anchor: HTMLElement, title: string) => void
+    hide: (anchor: HTMLElement) => void
+  }
+}

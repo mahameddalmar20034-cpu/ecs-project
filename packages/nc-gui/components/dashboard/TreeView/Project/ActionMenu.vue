@@ -1,0 +1,200 @@
+<script lang="ts" setup>
+import { BaseVersion, type SourceType, stringifyRolesObj } from 'nocodb-sdk'
+
+interface Props {
+  showBaseOption: (source: SourceType) => boolean
+  dataReflectionState?: number
+  dataReflectionText?: string
+}
+
+const props = defineProps<Props>()
+
+const emits = defineEmits<Emits>()
+
+interface Emits {
+  (e: 'clickMenu'): void
+  (e: 'rename'): void
+  (e: 'duplicateProject', base: NcProject): void
+  (e: 'shareBase'): void
+  (e: 'openBaseSettings', id: string): void
+  (e: 'openMcpServer', id: string): void
+  (e: 'copyProjectInfo'): void
+  (e: 'delete'): void
+}
+
+const base = inject(ProjectInj)!
+
+const { appInfo } = useGlobal()
+
+const { orgRoles, isUIAllowed, environmentRestrictionReason } = useRoles()
+
+const baseRole = computed(() => base.value.project_role || base.value.workspace_role)
+
+const baseDuplicateReason = computed(() =>
+  environmentRestrictionReason('baseDuplicate', {
+    roles: [stringifyRolesObj(orgRoles.value), baseRole.value].join(),
+    base,
+  }),
+)
+
+const isOptionVisible = computed(() => {
+  return {
+    rename: isUIAllowed('baseRename'),
+    // Public read-only link to the whole base: a base-level admin act, so it lives
+    // beside Duplicate rather than in the invite-first Share modal.
+    baseShare: isUIAllowed('baseShare', { roles: baseRole.value }),
+    baseDuplicate:
+      isUIAllowed('baseDuplicate', { roles: [stringifyRolesObj(orgRoles.value), baseRole.value].join() }) ||
+      !!baseDuplicateReason.value,
+    baseOptions:
+      (base.value?.sources?.[0]?.enabled || (base.value?.sources || []).length > 1) &&
+      props.showBaseOption(base.value.sources[0]),
+    apiDocs: isUIAllowed('apiDocs'),
+    baseMiscSettings: isUIAllowed('baseMiscSettings'),
+    baseDelete: isUIAllowed('baseDelete', { roles: [stringifyRolesObj(orgRoles.value), baseRole.value].join() }),
+  }
+})
+</script>
+
+<template>
+  <NcMenu
+    class="nc-scrollbar-md !min-w-50"
+    :style="{
+      maxHeight: '70vh',
+      overflow: 'overlay',
+    }"
+    :data-testid="`nc-sidebar-base-${base.title}-options`"
+    variant="small"
+    @click="emits('clickMenu')"
+  >
+    <!-- Copy Base ID -->
+    <NcMenuItemCopyId
+      :id="base.id"
+      :tooltip="$t('labels.clickToCopyBaseID')"
+      :label="
+        $t('labels.baseIdColon', {
+          baseId: base.id,
+        })
+      "
+    />
+
+    <NcMenuItem v-if="isUIAllowed('baseRename')" data-testid="nc-sidebar-project-rename" @click="emits('rename')">
+      <div v-e="['c:base:rename']" class="flex gap-2 items-center">
+        <GeneralIcon icon="rename" />
+        {{ $t('general.rename') }}
+      </div>
+    </NcMenuItem>
+
+    <NcTooltip
+      v-if="isOptionVisible.baseDuplicate"
+      :title="baseDuplicateReason ? $t(baseDuplicateReason) : ''"
+      :disabled="!baseDuplicateReason"
+    >
+      <NcMenuItem
+        data-testid="nc-sidebar-base-duplicate"
+        :disabled="!!baseDuplicateReason"
+        @click="!baseDuplicateReason && emits('duplicateProject', base)"
+      >
+        <div v-e="['c:base:duplicate']" class="flex gap-2 items-center">
+          <GeneralIcon icon="duplicate" />
+          {{ $t('general.duplicate') }}
+        </div>
+      </NcMenuItem>
+    </NcTooltip>
+
+    <NcMenuItem v-if="isOptionVisible.baseShare" data-testid="nc-sidebar-base-share" @click="emits('shareBase')">
+      <div v-e="['c:base:share-base']" class="flex gap-2 items-center">
+        <GeneralIcon icon="ncGlobe" />
+        {{ $t('activity.shareBase.label') }}
+      </div>
+    </NcMenuItem>
+
+    <NcDivider v-if="['baseDuplicate', 'baseRename'].some((permission) => isUIAllowed(permission)) || !!baseDuplicateReason" />
+
+    <!-- Copy Project Info -->
+    <NcMenuItem v-if="!isEeUI" key="copy" data-testid="nc-sidebar-base-copy-base-info" @click.stop="emits('copyProjectInfo')">
+      <div v-e="['c:base:copy-proj-info']" class="flex gap-2 items-center">
+        <GeneralIcon icon="copy" />
+        {{ $t('activity.account.projInfo') }}
+      </div>
+    </NcMenuItem>
+
+    <NcMenuItem key="mcp" data-testid="nc-sidebar-mcp-server" @click="emits('openMcpServer', base.id!)">
+      <div v-e="['c:base:mcp-server']" class="flex gap-2 items-center">
+        <GeneralIcon icon="mcp" />
+        {{ $t('title.mcpServer') }}
+      </div>
+    </NcMenuItem>
+
+    <!-- Swagger: Rest APIs -->
+    <NcSubMenu
+      v-if="isOptionVisible.apiDocs && base.version === BaseVersion.V2"
+      key="api"
+      data-testid="nc-sidebar-base-rest-apis"
+      class="py-0"
+      variant="small"
+      @click.stop
+    >
+      <template #title>
+        <!-- v-e sits on the title element: NcSubMenu resolves to a fragment root, so a directive on it never runs -->
+        <div v-e="['e:api-docs']" class="flex flex-row items-center gap-x-2">
+          <GeneralIcon icon="ncCode" class="opacity-80 !max-w-3.9" />
+          {{ $t('activity.account.swagger') }}
+        </div>
+      </template>
+
+      <NcMenuItem
+        data-testid="nc-sidebar-base-rest-apis-v2"
+        @click.stop="openLink(`/api/v2/meta/bases/${base.id}/swagger`, appInfo.ncSiteUrl)"
+      >
+        <GeneralIcon icon="ncCode" class="opacity-80 !max-w-3.9" />
+        API v2
+      </NcMenuItem>
+
+      <NcMenuItem
+        data-testid="nc-sidebar-base-rest-apis-v3"
+        @click.stop="openLink(`/api/v3/meta/bases/${base.id}/swagger`, appInfo.ncSiteUrl)"
+      >
+        <GeneralIcon icon="ncCode" class="opacity-80 !max-w-3.9" />
+        API v3
+      </NcMenuItem>
+    </NcSubMenu>
+    <NcMenuItem
+      v-else-if="isOptionVisible.apiDocs"
+      key="api-v3"
+      data-testid="nc-sidebar-base-rest-apis"
+      @click="openLink(`/api/v3/meta/bases/${base.id}/swagger`, appInfo.ncSiteUrl)"
+    >
+      <div v-e="['e:api-docs']" class="flex gap-2 items-center">
+        <GeneralIcon icon="ncCode" class="opacity-80 !max-w-3.9" />
+        {{ $t('activity.account.swagger') }}
+      </div>
+    </NcMenuItem>
+
+    <template v-if="isOptionVisible.baseOptions">
+      <NcDivider />
+      <DashboardTreeViewBaseOptions v-model:base="base" :source="base.sources[0]" />
+    </template>
+
+    <NcDivider v-if="isOptionVisible.baseMiscSettings || isOptionVisible.baseDelete" />
+
+    <NcMenuItem
+      v-if="isOptionVisible.baseMiscSettings"
+      key="teamAndSettings"
+      data-testid="nc-sidebar-base-settings"
+      class="nc-sidebar-base-base-settings"
+      @click="emits('openBaseSettings', base.id!)"
+    >
+      <div v-e="['c:base:settings']" class="flex gap-2 items-center">
+        <GeneralIcon icon="settings" />
+        {{ $t('activity.settings') }}
+      </div>
+    </NcMenuItem>
+    <NcMenuItem v-if="isOptionVisible.baseDelete" data-testid="nc-sidebar-base-delete" danger @click="emits('delete')">
+      <div class="flex gap-2 items-center">
+        <GeneralIcon icon="delete" class="w-4" />
+        {{ $t('general.delete') }}
+      </div>
+    </NcMenuItem>
+  </NcMenu>
+</template>

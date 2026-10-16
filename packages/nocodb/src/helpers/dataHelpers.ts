@@ -1,0 +1,357 @@
+import {
+  convertMS2Duration,
+  getEffectiveLookupColumn,
+  isLinksOrLTAR,
+  isSupportedDisplayValueColumn,
+  LongTextAiMetaProp,
+  parseDecimalValue,
+  parseHelper,
+  parseIntValue,
+  parseProp,
+  roundUpToPrecision,
+  UITypes,
+} from 'nocodb-sdk';
+import type { ColumnType } from 'nocodb-sdk';
+import type LinkToAnotherRecordColumn from '~/models/LinkToAnotherRecordColumn';
+import type LookupColumn from '~/models/LookupColumn';
+import type { NcContext } from '~/interface/config';
+import type Column from '~/models/Column';
+import { NcError } from '~/helpers/catchError';
+import { Model, View } from '~/models';
+import Base from '~/models/Base';
+import {
+  NC_GRID_MAX_SELECTION_LIMIT,
+  V1_V2_DATA_PAYLOAD_LIMIT,
+} from '~/constants';
+
+// `|v| >= 1e21` / `< 1e-6` stringify to exponent notation, which the import
+// side strips into a different number (`1e+21` -> `121`). Expanded by string
+// surgery, never through `Number()`: a pg `numeric` arrives as a string and can
+// hold more precision than a double, so anything without an exponent is passed
+// through untouched.
+function toPlainDecimal(value: unknown) {
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?[eE]([+-]?\d+)$/.exec(String(value));
+  if (!match) return value;
+
+  const [, sign, int, frac = '', exp] = match;
+  const digits = `${int}${frac}`;
+  const point = int.length + Number(exp);
+
+  const expanded =
+    point <= 0
+      ? `0.${'0'.repeat(-point)}${digits}`
+      : point >= digits.length
+      ? `${digits}${'0'.repeat(point - digits.length)}`
+      : `${digits.slice(0, point)}.${digits.slice(point)}`;
+
+  return `${sign}${expanded.replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '')}`;
+}
+
+export interface PathParams {
+  baseName: string;
+  tableName: string;
+  viewName?: string;
+}
+
+export interface OldPathParams {
+  baseId: string;
+  tableName: string;
+  viewName?: string;
+}
+
+export async function getViewAndModelByAliasOrId(
+  context: NcContext,
+  param: {
+    baseName: string;
+    tableName: string;
+    viewName?: string;
+  },
+) {
+  const base = await Base.getWithInfoByTitleOrId(context, param.baseName);
+
+  const model = await Model.getByAliasOrId(context, {
+    base_id: base.id,
+    aliasOrId: param.tableName,
+  });
+
+  if (!model) NcError.tableNotFound(param.tableName);
+
+  const view =
+    param.viewName &&
+    (await View.getByTitleOrId(context, {
+      titleOrId: param.viewName,
+      fk_model_id: model.id,
+    }));
+  if (param.viewName && !view) NcError.viewNotFound(param.viewName);
+
+  return { model, view };
+}
+
+export async function serializeCellValue(
+  context: NcContext,
+  {
+    value,
+    column,
+    siteUrl,
+    locale,
+    rawNumeric,
+  }: {
+    column?: Column;
+    value: any;
+    siteUrl: string;
+    locale?: string;
+    // Emit Decimal/Currency as stored instead of at the field's display
+    // precision. Off by default: every existing export rounds.
+    rawNumeric?: boolean;
+  },
+) {
+  if (!column) {
+    return value;
+  }
+
+  if (!value) return value;
+
+  switch (column?.uidt) {
+    case UITypes.Attachment: {
+      let data = value;
+      try {
+        if (typeof value === 'string') {
+          data = JSON.parse(value);
+        }
+
+        if (!Array.isArray(data)) {
+          data = [data];
+        }
+      } catch {
+        data = undefined;
+      }
+
+      return (data || [])
+        .filter((attachment) => attachment)
+        .map(
+          (attachment) =>
+            `${attachment.title || 'Attachment'}(${
+              attachment.signedPath
+                ? encodeURI(`${siteUrl}/${attachment.signedPath}`)
+                : attachment.signedUrl
+            })`,
+        )
+        .join(', ');
+    }
+    case UITypes.User:
+    case UITypes.CreatedBy:
+    case UITypes.LastModifiedBy: {
+      let data = value;
+      try {
+        if (typeof value === 'string') {
+          data = JSON.parse(value);
+        }
+      } catch {}
+
+      return (data ? (Array.isArray(data) ? data : [data]) : [])
+        .map((user) => user.display_name || user.email || '')
+        .join(', ');
+    }
+    case UITypes.Lookup:
+      {
+        const colOptions = await column.getColOptions<LookupColumn>();
+        if (colOptions?.error) return value?.toString?.() ?? '';
+
+        const relationCol = await colOptions.getRelationColumn();
+        if (!relationCol) return value?.toString?.() ?? '';
+
+        const relationColOptions =
+          await relationCol.getColOptions<LinkToAnotherRecordColumn>();
+        const { refContext } = relationColOptions.getRelContext();
+
+        const lookupColumn = await colOptions.getLookupColumn();
+        if (!lookupColumn) return value?.toString?.() ?? '';
+
+        // Apply the lookup column's own formatting override (meta.display_type +
+        // meta.display_column_meta) so export/webhook payloads honour the configured
+        // number/date format — but only when the override is still valid for the
+        // child's current result type; falls back to the child column otherwise (no
+        // override set, or a stale override after the looked-up field changed type).
+        const effectiveColumn = getEffectiveLookupColumn(
+          parseProp(column.meta),
+          lookupColumn as unknown as ColumnType,
+        ) as unknown as Column;
+
+        return (
+          await Promise.all(
+            [...(Array.isArray(value) ? value : [value])].map(async (v) =>
+              serializeCellValue(refContext, {
+                value: v,
+                column: effectiveColumn,
+                siteUrl,
+                locale,
+                rawNumeric,
+              }),
+            ),
+          )
+        ).join(', ');
+      }
+      break;
+    case UITypes.LinkToAnotherRecord:
+      {
+        const colOptions =
+          await column.getColOptions<LinkToAnotherRecordColumn>();
+        const relatedModel = await colOptions.getRelatedTable();
+        await relatedModel.getColumns();
+        // Honor the per-LTAR custom display value override — the grid shows
+        // that column, so exports must print the same value.
+        const overrideCol = colOptions.fk_display_value_column_id
+          ? relatedModel.columns?.find(
+              (c) =>
+                c.id === colOptions.fk_display_value_column_id &&
+                isSupportedDisplayValueColumn(c),
+            )
+          : undefined;
+        const displayCol = overrideCol ?? relatedModel.displayValue;
+        return [...(Array.isArray(value) ? value : [value])]
+          .map((v) => {
+            return v[displayCol?.title] ?? v[displayCol?.id];
+          })
+          .join(', ');
+      }
+      break;
+    case UITypes.Currency: {
+      if (isNaN(Number(value))) return null;
+
+      if (rawNumeric) return toPlainDecimal(value);
+
+      const currencyMeta = parseProp(column.meta);
+
+      try {
+        const roundedValue = roundUpToPrecision(
+          Number(value),
+          currencyMeta.precision ?? 2,
+        );
+
+        return new Intl.NumberFormat(currencyMeta.currency_locale || 'en-US', {
+          style: 'currency',
+          currency: currencyMeta.currency_code || 'USD',
+          minimumFractionDigits: currencyMeta.precision ?? 2,
+          maximumFractionDigits: currencyMeta.precision ?? 2,
+          // Matches Number/Decimal, which already skip it here: a group separator
+          // makes "1.234" ambiguous across locales, and fr-* use U+202F, which
+          // Excel cannot render (nocodb/nocodb#14563).
+          useGrouping: false,
+        }).format(+roundedValue);
+      } catch {
+        return value;
+      }
+    }
+    case UITypes.Decimal:
+      {
+        if (isNaN(Number(value))) return null;
+
+        if (rawNumeric) return toPlainDecimal(value);
+
+        return parseDecimalValue(value, column, {
+          skipThousandSeparator: true,
+          locale,
+        });
+      }
+      break;
+    case UITypes.Number:
+      {
+        if (isNaN(Number(value))) return null;
+
+        return parseIntValue(value, column, {
+          skipThousandSeparator: true,
+          locale,
+        });
+      }
+      break;
+    case UITypes.Duration: {
+      if (column.meta?.duration === undefined) {
+        return value;
+      }
+      return convertMS2Duration(value, column.meta.duration);
+    }
+    case UITypes.LongText: {
+      // If it is AI text field then just return value instead of whole json
+      if (column.meta?.[LongTextAiMetaProp] && value) {
+        const parsedValue = parseHelper(value);
+
+        if (parsedValue && typeof parsedValue === 'object') {
+          return parsedValue?.value?.toString() ?? '';
+        }
+      }
+      return value;
+    }
+    default:
+      if (value && typeof value === 'object') {
+        return JSON.stringify(value);
+      }
+      return value;
+  }
+}
+
+/**
+ * A link column whose `nc_col_relations_v2` row is orphaned (Column.delete2 drops
+ * it before the COLUMNS row, non-transactionally) passes every uidt check, so the
+ * nested-link read paths would deref null. Fail naming the column instead.
+ *
+ * Returns the resolved relation metadata so callers can reuse it instead of
+ * re-fetching — in CE `getColOptions` is a real `NocoCache` round-trip, not a
+ * per-request memo.
+ *
+ * No-op (returns `undefined`) for a missing or non-link column — `getColOptions`
+ * returning null is legitimate there, and those callers own that validation.
+ */
+export async function assertLinkColOptions(
+  context: NcContext,
+  column: Column,
+): Promise<LinkToAnotherRecordColumn | undefined> {
+  if (!column || !isLinksOrLTAR(column)) return undefined;
+
+  const colOptions = await column.getColOptions<LinkToAnotherRecordColumn>();
+
+  if (!colOptions) {
+    NcError.get(context).internalServerError(
+      `Link field '${
+        column.title || column.column_name
+      }' is missing its relation metadata`,
+    );
+  }
+
+  return colOptions;
+}
+
+export async function getColumnByIdOrName(
+  context: NcContext,
+  columnNameOrId: string,
+  model: Model,
+) {
+  const column = (await model.getColumns()).find(
+    (c) =>
+      c.title === columnNameOrId ||
+      c.id === columnNameOrId ||
+      c.column_name === columnNameOrId,
+  );
+
+  if (!column) NcError.fieldNotFound(columnNameOrId);
+
+  return column;
+}
+
+export const validateV1V2DataPayloadLimit = (
+  context: NcContext,
+  param: { body: any },
+) => {
+  if (!Array.isArray(param.body)) return;
+
+  // The api-token cap is the programmatic budget. Sessions were left uncapped on
+  // the assumption the grid's 1000-row selection limit bound them, but that is
+  // client-side only — so enforce it here. Never below the token cap, or a
+  // custom NC_API_BULK_OPERATION_MAX_RECORDS would tighten the UI by surprise.
+  const limit = context.is_api_token
+    ? V1_V2_DATA_PAYLOAD_LIMIT
+    : Math.max(NC_GRID_MAX_SELECTION_LIMIT, V1_V2_DATA_PAYLOAD_LIMIT);
+
+  if (param.body.length > limit) {
+    NcError.get(context).maxPayloadLimitExceeded(limit);
+  }
+};

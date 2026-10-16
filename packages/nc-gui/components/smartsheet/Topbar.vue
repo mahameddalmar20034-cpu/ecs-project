@@ -1,0 +1,159 @@
+<script lang="ts" setup>
+const route = useRoute()
+
+const { isUIAllowed } = useRoles()
+
+const { isViewsLoading } = storeToRefs(useViewsStore())
+
+const { activeScriptId } = storeToRefs(useScriptStore())
+
+const { activeDashboardId, isEditingDashboard } = storeToRefs(useDashboardStore())
+
+const { activeWorkflowId, activeWorkflowHasDraftChanges } = storeToRefs(useWorkflowStore())
+
+const { activeAgentId } = storeToRefs(useAgentStore())
+
+const isPublic = inject(IsPublicInj, ref(false))
+
+// Form view has no view toolbar, so its Tools entry lives here.
+const isFormView = inject(IsFormInj, ref(false))
+
+const { isMobileMode } = storeToRefs(useConfigStore())
+
+const { appInfo } = useGlobal()
+
+const { toggleActionPanel, isPanelExpanded: isActionPanelExpanded, isViewActionsEnabled } = useActionPane()
+
+const { isPanelExpanded: isChatPanelExpanded } = useChatPanel()
+
+const { isEEFeatureBlocked, blockWorkflows } = useEeConfig()
+
+const isSharedBase = computed(() => route.params.typeOrId === 'base')
+
+const topbarBreadcrumbItemWidth = computed(() => {
+  if (!isSharedBase.value && !isMobileMode.value) {
+    return 'calc(\(100% - 167px - 24px\) / 2)'
+  } else if (isMobileMode.value) {
+    return 'calc(75% - 12px)'
+  } else {
+    return 'calc(\(100% - 12px\) / 2)'
+  }
+})
+</script>
+
+<template>
+  <div
+    :class="{
+      'bg-nc-bg-brand': isEditingDashboard || activeWorkflowHasDraftChanges,
+    }"
+    class="nc-table-topbar py-2 border-b-1 border-nc-border-gray-medium flex gap-3 items-center justify-between overflow-hidden relative h-[var(--topbar-height)] max-h-[var(--topbar-height)] min-h-[var(--topbar-height)] md:(px-2) xs:(px-1)"
+    style="z-index: 7"
+  >
+    <template v-if="isViewsLoading && !activeScriptId && !activeDashboardId && !activeWorkflowId && !activeAgentId">
+      <a-skeleton-input :active="true" class="!w-44 !h-4 ml-2 !rounded overflow-hidden" />
+    </template>
+    <template v-else>
+      <div
+        class="flex items-center gap-3 md:min-w-[300px]"
+        :style="{
+          width: topbarBreadcrumbItemWidth,
+        }"
+      >
+        <GeneralOpenLeftSidebarBtn />
+        <LazySmartsheetToolbarViewInfo
+          v-if="!isPublic && !activeScriptId && !activeDashboardId && !activeWorkflowId && !activeAgentId"
+        />
+        <LazySmartsheetTopbarScriptInfo v-if="!isPublic && activeScriptId" />
+        <LazySmartsheetTopbarDashboardInfo v-if="!isPublic && activeDashboardId" />
+        <LazySmartsheetTopbarWorkflowInfo v-if="!isPublic && activeWorkflowId" />
+        <LazySmartsheetTopbarAgentInfo v-if="!isPublic && activeAgentId" />
+      </div>
+
+      <div v-if="activeDashboardId || activeWorkflowId || activeAgentId" class="min-w-0 shrink">
+        <SmartsheetTopbarEditingState />
+      </div>
+
+      <div class="flex items-center justify-end gap-2 flex-1">
+        <GeneralApiLoader v-if="!isMobileMode && !activeScriptId && !activeDashboardId" />
+
+        <!-- Variable Setup Warning -->
+        <SmartsheetTopbarManagedAppSetupWarning v-if="!isSharedBase && !isMobileMode" />
+
+        <!-- Managed App Status -->
+        <LazySmartsheetTopbarManagedAppStatus v-if="!isSharedBase && !isMobileMode" />
+
+        <!-- isEeUI, not appInfo.ee: presence ships on unlicensed on-prem too, where appInfo.ee is false. -->
+        <LazySmartsheetTopbarCollaboratorPresence v-if="!isPublic && !isSharedBase && !isMobileMode && isEeUI" />
+
+        <LazySmartsheetTopbarHistory v-if="!isSharedBase && !isMobileMode && isEeUI" />
+
+        <SmartsheetToolbarTableTools
+          v-if="isFormView && !activeScriptId && !activeDashboardId && !activeWorkflowId && !activeAgentId"
+        />
+
+        <NcButton
+          v-if="
+            !isSharedBase &&
+            !activeScriptId &&
+            !activeDashboardId &&
+            !activeWorkflowId &&
+            !activeAgentId &&
+            !isMobileMode &&
+            isViewActionsEnabled &&
+            !isEEFeatureBlocked
+          "
+          v-e="['c:action-toggle']"
+          type="secondary"
+          size="small"
+          class="nc-topbar-action-btn"
+          :class="{ '!bg-nc-bg-brand !hover:bg-nc-brand-100/70 !text-nc-content-brand': isActionPanelExpanded }"
+          data-testid="nc-topbar-action-btn"
+          @click="toggleActionPanel"
+        >
+          <div class="flex items-center justify-center min-w-[28.69px]">
+            <GeneralIcon
+              :icon="isActionPanelExpanded ? 'play' : 'play'"
+              class="w-4 h-4 !stroke-transparent"
+              :class="{ 'border-l-1 border-transparent': isActionPanelExpanded }"
+            />
+            <span
+              class="overflow-hidden transition-all duration-200"
+              :class="{
+                'w-[0px] invisible': isActionPanelExpanded || isChatPanelExpanded,
+                'ml-1 w-[54px]': !isActionPanelExpanded && !isChatPanelExpanded,
+              }"
+            >
+              {{ $t('general.actions') }}
+            </span>
+          </div>
+        </NcButton>
+
+        <div v-if="!isSharedBase" class="flex gap-2 items-center empty:hidden">
+          <LazySmartsheetTopbarDashboardState v-if="activeDashboardId && isUIAllowed('dashboardEdit')" />
+          <LazySmartsheetTopbarScriptAction v-if="activeScriptId && appInfo.ee" />
+          <!-- Not `appInfo.ee`: workflows are a capped Free feature on unlicensed
+               on-prem, and this holds the only Publish / revert affordance. -->
+          <LazySmartsheetTopbarWorkflowAction v-if="activeWorkflowId && !blockWorkflows" />
+          <LazySmartsheetTopbarAgentAction v-if="activeAgentId && appInfo.ee" />
+        </div>
+
+        <DashboardMiniSidebarTheme v-if="isSharedBase" placement="bottom" render-as-btn button-class="h-8 w-8" />
+
+        <LazySmartsheetTopbarShareProject v-if="!activeScriptId && !activeWorkflowId && !activeAgentId" />
+
+        <div v-if="isSharedBase">
+          <LazyGeneralLanguage
+            button
+            class="cursor-pointer text-lg hover:(text-nc-content-gray-extreme bg-nc-bg-gray-medium) mr-0 p-1.5 rounded-md"
+          />
+        </div>
+      </div>
+    </template>
+  </div>
+</template>
+
+<style scoped>
+.nc-table-toolbar-mobile {
+  @apply flex-wrap h-auto py-2;
+}
+</style>

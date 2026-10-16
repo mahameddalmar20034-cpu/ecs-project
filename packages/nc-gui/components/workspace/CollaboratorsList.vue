@@ -1,0 +1,1073 @@
+<script lang="ts" setup>
+import {
+  HigherPlan,
+  OrderedWorkspaceRoles,
+  OrgUserRoles,
+  type PlanLimitExceededDetailsType,
+  PlanLimitTypes,
+  PlanTitles,
+  RoleColors,
+  RoleIcons,
+  RoleLabels,
+  WorkspaceUserRoles,
+  type WorkspaceUserType,
+} from 'nocodb-sdk'
+
+const props = defineProps<{
+  workspaceId?: string
+  isActive?: boolean
+}>()
+
+const router = useRouter()
+const route = router.currentRoute
+
+const { $e } = useNuxtApp()
+
+const { workspaceRoles, orgRoles } = useRoles()
+
+const { user, isMobileMode, appInfo } = useGlobal()
+
+const { showInfoModal } = useNcConfirmModal()
+
+const workspaceStore = useWorkspace()
+
+const { removeCollaborator: _removeCollaborator, updateCollaborator: _updateCollaborator } = workspaceStore
+
+const {
+  collaborators,
+  activeWorkspace,
+  workspacesList,
+  isCollaboratorsLoading,
+  removingCollaboratorMap,
+  isTeamsEnabled,
+  teams,
+  teamsMap,
+  workspaceTeams,
+} = storeToRefs(workspaceStore)
+
+const {
+  isPaymentEnabled,
+  showUserPlanLimitExceededModal,
+  activePlanTitle,
+  getLimit,
+  isWsOwner,
+  navigateToPricing,
+  isTopBannerVisible,
+  showUpgradeToUseTeams,
+  blockWorkspaceMembers,
+  showUpgradeToManageWorkspaceMembers,
+  showEEFeatures,
+  isEEFeatureBlocked,
+} = useEeConfig()
+
+const currentWorkspace = computedAsync(async () => {
+  if (props.workspaceId) {
+    const ws = workspacesList.value.find((workspace) => workspace.id === props.workspaceId)
+    if (ws) {
+      return ws
+    }
+  }
+  return activeWorkspace.value ?? workspacesList.value[0]
+})
+
+const { sorts, sortDirection, loadSorts, handleGetSortedData, saveOrUpdate: saveOrUpdateUserSort } = useUserSorts('Workspace')
+
+const userSearchText = ref('')
+
+const isAdminPanel = inject(IsAdminPanelInj, ref(false))
+
+const isSettingsSidebar = inject(IsSettingsSidebarInj, ref(false))
+
+const isOnlyOneOwner = computed(() => {
+  return collaborators.value?.filter((collab) => collab.roles === WorkspaceUserRoles.OWNER).length === 1
+})
+
+const { t } = useI18n()
+
+const inviteDlg = ref(false)
+
+const isInviteTeamDlg = ref(false)
+
+const topSectionRef = ref<HTMLDivElement>()
+
+const tableHeaderSectionRef = ref<HTMLDivElement>()
+
+// Todo: @rameshmane7218 - toggle this when user clicks on listed team item
+const isEditModalOpenUsingRouterPush = ref<boolean>(false)
+
+const { height: toSectionHeight } = useElementSize(topSectionRef)
+
+const { height: tableHeaderSectionHeight } = useElementSize(tableHeaderSectionRef)
+
+const workspaceTeamsToCollaborators = computed(() => {
+  return (workspaceTeams.value || []).map((wt) => ({
+    ...wt,
+    id: wt.team_id,
+    isTeam: true,
+    display_name: wt.team_title,
+    roles: wt.workspace_role,
+    email: wt.team_title, // just for sort table by email
+  }))
+})
+
+const roleFilter = ref<string>('all')
+
+const typeFilter = ref<'all' | 'members' | 'teams'>('all')
+
+// INHERIT is where a role comes from, not a role to narrow by — rows are
+// matched on the role they end up with.
+const roleFilterOptions = computed(() => [
+  { value: 'all', label: t('labels.allRoles') },
+  ...OrderedWorkspaceRoles.filter((role) => role !== WorkspaceUserRoles.INHERIT).map((role) => ({
+    value: role,
+    label: t(`objects.roleType.${RoleLabels[role]}`),
+    icon: RoleIcons[role],
+    color: RoleColors[role],
+  })),
+])
+
+const typeFilterOptions = computed(() => [
+  { value: 'all', label: t('labels.wsNav.allTypes') },
+  { value: 'members', label: t('labels.members') },
+  { value: 'teams', label: t('labels.sourceTeams') },
+])
+
+const filterCollaborators = computed(() => {
+  const list = (collaborators.value ?? [])
+    .map((collab) => ({ ...collab, billable: !!parseProp(collab.meta).billable }))
+    .concat(workspaceTeamsToCollaborators.value)
+
+  return list.filter((collab: any) => {
+    if (userSearchText.value) {
+      if (!searchCompare([collab.display_name, collab.email], userSearchText.value)) return false
+      if (removingCollaboratorMap.value[collab.id]) return false
+    }
+
+    if (roleFilter.value !== 'all' && (collab.effective_role || collab.roles) !== roleFilter.value) return false
+
+    if (typeFilter.value === 'members' && collab.isTeam) return false
+    if (typeFilter.value === 'teams' && !collab.isTeam) return false
+
+    return true
+  })
+})
+
+const selected = reactive<{
+  [key: number]: boolean
+}>({})
+
+const toggleSelectAll = (value: boolean) => {
+  filterCollaborators.value.forEach((_, i) => {
+    selected[i] = value
+  })
+}
+
+const sortedCollaborators = computed(() => {
+  return handleGetSortedData(
+    filterCollaborators.value,
+    sorts.value,
+    workspaceTeamsToCollaborators.value.length ? { field: 'created_at', direction: 'asc' } : undefined,
+  )
+})
+
+const paidUsersCount = computed(() => (collaborators.value || []).filter((c) => !!parseProp(c?.meta).billable).length)
+
+const nonPaidUsersCount = computed(() => {
+  return (collaborators.value || []).length - paidUsersCount.value
+})
+
+const showBanner = false
+
+const showUpgradeAlert = computed(() => {
+  return (
+    (showBanner && isPaymentEnabled.value && paidUsersCount.value > getLimit(PlanLimitTypes.LIMIT_EDITOR)) ||
+    nonPaidUsersCount.value > getLimit(PlanLimitTypes.LIMIT_COMMENTER)
+  )
+})
+
+const selectAll = computed({
+  get: () =>
+    Object.values(selected).every((v) => v) &&
+    Object.keys(selected).length > 0 &&
+    Object.values(selected).length === sortedCollaborators.value.length,
+  set: (value) => {
+    toggleSelectAll(value)
+  },
+})
+
+const updateCollaborator = async (collab: any, roles: WorkspaceUserRoles, overrideBaseRole: boolean = false) => {
+  if (!currentWorkspace.value || !currentWorkspace.value.id) return
+
+  try {
+    if (collab?.isTeam) {
+      // INHERIT role can only be assigned to individual users, not teams
+      if (roles === WorkspaceUserRoles.INHERIT) {
+        message.error(t('msg.error.inheritRoleOnlyForUsers'))
+        return
+      }
+
+      const res = await workspaceStore.workspaceTeamUpdate(currentWorkspace.value.id, {
+        team_id: collab.id,
+        workspace_role: roles,
+      })
+
+      if (!res) return
+
+      message.success(t('msg.info.teamRoleUpdated'))
+    } else {
+      const res = await _updateCollaborator(collab.id, roles, currentWorkspace.value.id, overrideBaseRole)
+      if (!res) return
+      message.success(t('msg.info.userRoleUpdated'))
+
+      collaborators.value?.forEach((collaborator) => {
+        if (collaborator.id === collab.id) {
+          collaborator.roles = roles
+        }
+      })
+    }
+  } catch (e: any) {
+    const errorInfo = await extractSdkResponseErrorMsgv2(e)
+
+    if (isPaymentEnabled.value && errorInfo.error === NcErrorType.ERR_PLAN_LIMIT_EXCEEDED) {
+      const details = errorInfo.details as PlanLimitExceededDetailsType
+
+      showUserPlanLimitExceededModal({
+        details,
+        role: roles,
+        workspaceId: currentWorkspace.value.id,
+        isAdminPanel: isAdminPanel.value,
+        triggerSource: 'collaborators-members',
+      })
+    }
+  }
+}
+
+// Todo: Enable this after we add support for overriding base role in backend
+const showOverrideBaseRoleCheckbox = ref(false)
+
+const userRoleUpdateInfo = ref<{
+  collab?: WorkspaceUserType
+  roles?: WorkspaceUserRoles
+  showConfirmationModal: boolean
+  overrideBaseRole: boolean
+}>({
+  showConfirmationModal: false,
+  overrideBaseRole: false,
+})
+
+/**
+ * If user is only owner in any base then we should restrict overriding base role
+ */
+const showRoleChangeConfirmationModal = async (collab: any, roles: WorkspaceUserRoles) => {
+  if (!currentWorkspace.value || !currentWorkspace.value.id) return
+
+  userRoleUpdateInfo.value.collab = collab
+  userRoleUpdateInfo.value.roles = roles
+  userRoleUpdateInfo.value.overrideBaseRole = false
+
+  try {
+    /**
+     * Todo: API call to check if user has explicit base role assigned to any base or not
+     * And whether user is only owner in any base or not
+     */
+
+    userRoleUpdateInfo.value.showConfirmationModal = true
+  } catch (e: any) {
+    console.error(e)
+  }
+}
+
+const onCancelRoleChangeConfirmationModal = () => {
+  userRoleUpdateInfo.value.showConfirmationModal = false
+  userRoleUpdateInfo.value.overrideBaseRole = false
+}
+
+const onConfirmRoleChangeConfirmationModal = () => {
+  userRoleUpdateInfo.value.showConfirmationModal = false
+
+  updateCollaborator(userRoleUpdateInfo.value.collab, userRoleUpdateInfo.value.roles!, userRoleUpdateInfo.value.overrideBaseRole)
+}
+
+const isSuperAdmin = computed(() => orgRoles.value?.[OrgUserRoles.SUPER_ADMIN])
+
+const showBillableColumn = computed(() => isPaymentEnabled.value || !!appInfo.value.isOnPrem)
+
+// Unlicensed on-prem has no billing — use seat wording and hide seat detail
+const showBillableLabel = computed(() => !isEEFeatureBlocked.value)
+
+// Billing detail is owner-only (matches backend `workspaceUserSeatDetail` ACL);
+// `isWsOwner` is absent from the CE useEeConfig stub, hence the optional read.
+const canOpenSeatDetail = computed(() => !!(isWsOwner?.value || isSuperAdmin.value))
+
+const seatDetailUser = ref<WorkspaceUserType | null>(null)
+
+const isSeatDetailModalOpen = ref(false)
+
+function openSeatDetail(record: any) {
+  if (!canOpenSeatDetail.value || record?.isTeam) return
+
+  seatDetailUser.value = record
+  isSeatDetailModalOpen.value = true
+}
+
+const isOwnerOrCreator = computed(() => {
+  return (
+    isSuperAdmin.value || workspaceRoles.value?.[WorkspaceUserRoles.OWNER] || workspaceRoles.value?.[WorkspaceUserRoles.CREATOR]
+  )
+})
+
+const accessibleRoles = computed<WorkspaceUserRoles[]>(() => {
+  // Super admin can assign all workspace roles (treated as owner)
+  const currentRoleIndex = isSuperAdmin.value
+    ? 0
+    : OrderedWorkspaceRoles.findIndex((role) => workspaceRoles.value && Object.keys(workspaceRoles.value).includes(role))
+
+  if (currentRoleIndex === -1) return []
+  const roles = OrderedWorkspaceRoles.slice(currentRoleIndex).filter((r) => r)
+
+  // move INHERIT role to the end of the list
+  const inheritIndex = roles.indexOf(WorkspaceUserRoles.INHERIT)
+  if (inheritIndex !== -1) {
+    roles.push(...roles.splice(inheritIndex, 1))
+  }
+
+  return roles
+})
+
+const getTeamCompatibleAccessibleRoles = (roles: WorkspaceUserRoles[], record: any) => {
+  if (!record?.isTeam || !isEeUI) return roles.filter((r) => r !== WorkspaceUserRoles.INHERIT || isTeamsEnabled.value)
+
+  return roles.filter((r) => r !== WorkspaceUserRoles.OWNER && r !== WorkspaceUserRoles.INHERIT)
+}
+
+onMounted(async () => {
+  loadSorts()
+})
+
+const orderBy = computed<Record<string, SordDirectionType>>({
+  get: () => {
+    return sortDirection.value
+  },
+  set: (value: Record<string, SordDirectionType>) => {
+    // Check if value is an empty object
+    if (Object.keys(value).length === 0) {
+      saveOrUpdateUserSort({})
+      return
+    }
+
+    const [field, direction] = Object.entries(value)[0]
+
+    saveOrUpdateUserSort({
+      field,
+      direction,
+    })
+  },
+})
+
+const columns = computed<NcTableColumnProps[]>(() => [
+  // // Enable this select row column once we introduce bulk action
+  // {
+  //   key: 'select',
+  //   title: '',
+  //   width: 70,
+  //   minWidth: 70,
+  // },
+  {
+    key: 'email',
+    title: t('labels.members'),
+    minWidth: 220,
+    dataIndex: 'email',
+    showOrderBy: true,
+  },
+  {
+    key: 'role',
+    title: t('general.role'),
+    basis: '30%',
+    minWidth: 272,
+    dataIndex: 'roles',
+    showOrderBy: true,
+  },
+  ...(showBillableColumn.value
+    ? [
+        {
+          key: 'billable',
+          title: showBillableLabel.value ? t('general.billable') : t('labels.editorSeat'),
+          width: showBillableLabel.value ? 110 : 150,
+          minWidth: showBillableLabel.value ? 110 : 150,
+          dataIndex: 'billable',
+          showOrderBy: true,
+        } as NcTableColumnProps,
+      ]
+    : []),
+  {
+    key: 'created_at',
+    title: t('title.dateJoined'),
+    basis: '20%',
+    minWidth: 200,
+  },
+  {
+    key: 'action',
+    title: '',
+    width: 110,
+    minWidth: 110,
+    justify: 'justify-end',
+  },
+])
+
+const customRow = (_record: Record<string, any>, recordIndex: number) => ({
+  class: `user-row ${selected[recordIndex] ? 'selected' : ''}`,
+})
+
+const isScimManaged = (record: any) => !!record?.scim_managed
+
+const isRoleUpdateAllowed = (user) => {
+  return !(isOnlyOneOwner.value && user.roles === WorkspaceUserRoles.OWNER)
+}
+
+const isDeleteAllowed = (user) => {
+  if (isScimManaged(user)) return false
+  return !(isOnlyOneOwner.value && user.roles === WorkspaceUserRoles.OWNER)
+}
+
+const topScroll = ref(0)
+
+const tableHeight = computed(() => {
+  return `calc(100% - ${
+    tableHeaderSectionHeight.value + (isTopBannerVisible.value ? toSectionHeight.value - topScroll.value : 0) + 64
+  }px)`
+})
+
+const handleScroll = (e) => {
+  if (!isTopBannerVisible.value) return
+
+  topScroll.value = e.target?.scrollTop
+}
+
+const removeCollaborator = (userId: string, workspaceId: string, record: any) => {
+  if (record?.isTeam) {
+    $e('c:workspace:team-remove')
+
+    showInfoModal({
+      title: t('objects.teams.confirmRemoveTeamFromWorkspaceTitle'),
+      content: t('objects.teams.confirmRemoveTeamFromWorkspaceSubtitle'),
+      showCancelBtn: true,
+      showIcon: false,
+      okProps: {
+        type: 'danger',
+      },
+      okText: t('general.remove'),
+      okCallback: async () => {
+        workspaceStore.workspaceTeamRemove(workspaceId, [record.id])
+      },
+    })
+  } else {
+    showInfoModal({
+      title: userId === user.value?.id ? t('title.confirmLeaveWorkspaceTitle') : t('title.confirmRemoveMemberFromWorkspaceTitle'),
+      content:
+        userId === user.value?.id ? t('title.confirmLeaveWorkspaceSubtile') : t('title.confirmRemoveMemberFromWorkspaceSubtitle'),
+      showCancelBtn: true,
+      showIcon: false,
+      okProps: {
+        type: 'danger',
+      },
+      okText: userId === user.value?.id ? t('activity.leaveWorkspace') : t('general.remove'),
+      okCallback: async () => {
+        _removeCollaborator(userId, workspaceId)
+      },
+    })
+  }
+}
+
+const handleEditTeam = (team: any) => {
+  if (!team?.team_id) return
+
+  router.push({ query: { ...route.value.query, teamId: team.team_id } })
+
+  isEditModalOpenUsingRouterPush.value = true
+}
+
+/**
+ * Reset search query on unmount
+ */
+watch(
+  () => props.isActive,
+  () => {
+    userSearchText.value = ''
+  },
+)
+
+watch(inviteDlg, (newVal) => {
+  if (!newVal) {
+    isInviteTeamDlg.value = false
+  }
+})
+</script>
+
+<template>
+  <div
+    class="nc-collaborator-table-container overflow-auto nc-scrollbar-thin relative"
+    :class="{
+      'nc-is-admin-panel': isAdminPanel,
+      'nc-is-ws-members-list': !isAdminPanel && !isSettingsSidebar,
+      'nc-is-settings-sidebar': isSettingsSidebar,
+    }"
+    @scroll.passive="handleScroll"
+  >
+    <div ref="topSectionRef">
+      <PaymentBanner v-if="!isSettingsSidebar" />
+      <!-- CE's stub is an empty div; skip it so the gutter padding adds no gap. -->
+      <PaymentBanner v-else-if="isEeUI" rounded class="nc-shell-gutter pt-3" />
+    </div>
+
+    <div
+      class="nc-collaborator-table-wrapper h-full flex flex-col gap-6 sticky top-0"
+      :class="isSettingsSidebar ? 'nc-shell-gutter pt-3 pb-6' : 'nc-content-max-w mx-auto pt-4 pb-4 md:pb-6 px-4 md:px-6'"
+    >
+      <!-- Wraps rather than squeezes — a search box below its placeholder width is just an icon. -->
+      <div class="w-full flex flex-wrap items-center justify-between gap-3">
+        <a-input
+          v-model:value="userSearchText"
+          allow-clear
+          :disabled="isCollaboratorsLoading"
+          class="nc-input-border-on-value flex-1 !min-w-60 !max-w-90 nc-input-sm"
+          :placeholder="isTeamsEnabled && showEEFeatures ? $t('title.searchForMembersOrTeams') : $t('title.searchMembers')"
+        >
+          <template #prefix>
+            <GeneralIcon icon="search" class="mr-2 h-4 w-4 text-nc-content-gray-muted" />
+          </template>
+        </a-input>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <NcSelect
+            v-model:value="roleFilter"
+            class="nc-ws-members-filter flex-none !w-36"
+            :disabled="isCollaboratorsLoading"
+            data-testid="nc-ws-members-role-filter"
+            dropdown-class-name="nc-ws-members-filter-dropdown"
+          >
+            <a-select-option v-for="option in roleFilterOptions" :key="option.value" :value="option.value">
+              <div class="flex items-center gap-2">
+                <GeneralIcon
+                  v-if="'icon' in option"
+                  :icon="option.icon"
+                  class="flex-none h-4 w-4"
+                  :class="roleColorsMapping[option.color]?.content"
+                />
+                <span :class="'color' in option ? roleColorsMapping[option.color]?.content : ''">{{ option.label }}</span>
+              </div>
+            </a-select-option>
+          </NcSelect>
+
+          <NcSelect
+            v-if="isTeamsEnabled && showEEFeatures"
+            v-model:value="typeFilter"
+            class="nc-ws-members-filter flex-none !w-36"
+            :disabled="isCollaboratorsLoading"
+            data-testid="nc-ws-members-type-filter"
+            dropdown-class-name="nc-ws-members-filter-dropdown"
+          >
+            <a-select-option v-for="option in typeFilterOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </a-select-option>
+          </NcSelect>
+        </div>
+        <ShellActions>
+          <div class="flex items-center gap-4">
+            <template v-if="!isMobileMode && (isPaymentEnabled || appInfo.isOnPrem) && paidUsersCount && showEEFeatures">
+              <NcTooltip
+                v-if="activePlanTitle === PlanTitles.FREE && !appInfo.isOnPrem"
+                :tooltip-style="{ width: '230px' }"
+                :overlay-inner-style="{ width: '230px' }"
+                :title="
+                  $t('upgrade.freePlanEditorLimitTooltip', {
+                    limit: getLimit(PlanLimitTypes.LIMIT_EDITOR),
+                  })
+                "
+              >
+                <div class="flex items-center text-nc-content-gray-default text-sm whitespace-nowrap">
+                  <GeneralIcon icon="ncCrown" class="flex-none h-4 w-4 mr-1" />
+
+                  {{ paidUsersCount }} {{ paidUsersCount === 1 ? $t('labels.editorSeat') : $t('labels.editorSeats') }}
+                </div>
+              </NcTooltip>
+              <div
+                v-else-if="appInfo.isOnPrem && !appInfo.ee"
+                class="flex items-center text-nc-content-gray-default text-sm whitespace-nowrap"
+              >
+                <GeneralIcon icon="ncCrown" class="flex-none h-4 w-4 mr-1" />
+
+                {{ paidUsersCount }} {{ paidUsersCount === 1 ? $t('labels.editorSeat') : $t('labels.editorSeats') }}
+              </div>
+              <div v-else class="flex items-center text-nc-content-gray-default text-sm whitespace-nowrap">
+                <GeneralIcon icon="ncCrown" class="flex-none h-4 w-4 mr-1" />
+
+                {{ paidUsersCount }} {{ $t('general.paid') }}
+                {{ paidUsersCount === 1 ? $t('general.seat').toLowerCase() : $t('general.seats').toLowerCase() }}
+              </div>
+              <div class="self-stretch border-r-1 border-nc-border-gray-medium"></div>
+            </template>
+
+            <div class="flex items-center gap-2">
+              <NcButton
+                v-if="isTeamsEnabled && showEEFeatures"
+                v-e="['c:workspace:team-add']"
+                size="small"
+                type="secondary"
+                :disabled="isCollaboratorsLoading"
+                data-testid="nc-add-teams-btn"
+                text-color="primary"
+                @click="
+                  showUpgradeToUseTeams({
+                    successCallback: () => {
+                      isInviteTeamDlg = true
+                      inviteDlg = true
+                    },
+                    triggerSource: 'collaborators-teams',
+                  })
+                "
+              >
+                <div class="flex items-center gap-2">
+                  <GeneralIcon icon="ncBuilding" />
+                  <span class="hidden sm:inline">{{ $t('labels.addTeams') }}</span>
+                </div>
+              </NcButton>
+
+              <NcButton
+                size="small"
+                type="primary"
+                :disabled="isCollaboratorsLoading"
+                data-testid="nc-add-member-btn"
+                @click="
+                  blockWorkspaceMembers
+                    ? showUpgradeToManageWorkspaceMembers({ triggerSource: 'collaborators-members' })
+                    : (inviteDlg = true)
+                "
+              >
+                <div class="flex items-center gap-2">
+                  <GeneralIcon :icon="isTeamsEnabled ? 'ncUsers' : 'plus'" class="h-4 w-4" />
+                  <span class="hidden sm:inline">{{ $t('activity.addMembers') }}</span>
+                  <LazyPaymentUpgradeBadge :feature-enabled-callback="() => !blockWorkspaceMembers" remove-click />
+                </div>
+              </NcButton>
+            </div>
+          </div>
+        </ShellActions>
+      </div>
+
+      <NcAlert
+        v-if="showUpgradeAlert"
+        ref="tableHeaderSectionRef"
+        type="warning"
+        class=""
+        :message="$t('upgrade.adjustCollaboratorRoles')"
+        :description="
+          $t('upgrade.UpgradeToInviteMoreSubtitle', {
+            activePlan: activePlanTitle,
+            editors: getLimit(PlanLimitTypes.LIMIT_EDITOR),
+            commenters: getLimit(PlanLimitTypes.LIMIT_COMMENTER),
+            plan: HigherPlan[activePlanTitle],
+          })
+        "
+      >
+        <template #action>
+          <NcButton
+            type="text"
+            size="small"
+            class="!text-nc-content-brand !font-700"
+            @click="
+              navigateToPricing({
+                limitOrFeature:
+                  paidUsersCount > getLimit(PlanLimitTypes.LIMIT_EDITOR)
+                    ? PlanLimitTypes.LIMIT_EDITOR
+                    : PlanLimitTypes.LIMIT_COMMENTER,
+              })
+            "
+          >
+            {{ isWsOwner ? 'Upgrade' : $t('general.requestUpgrade') }}
+          </NcButton>
+        </template>
+      </NcAlert>
+
+      <!-- In the shell the pane is a flex column, so the table takes what is left of it. -->
+      <div
+        class="flex"
+        :class="{ 'flex-1 min-h-0': isSettingsSidebar }"
+        :style="isSettingsSidebar ? undefined : { height: tableHeight }"
+      >
+        <NcTable
+          v-model:order-by="orderBy"
+          hide-on-empty
+          :columns="columns"
+          :data="sortedCollaborators"
+          :is-data-loading="isCollaboratorsLoading"
+          :custom-row="customRow"
+          class="flex-1 nc-collaborators-list max-h-full min-h-0 max-w-full"
+          body-row-class-name="!cursor-default"
+          :pagination="true"
+          :pagination-offset="25"
+        >
+          <template #emptyText>
+            <ShellEmpty
+              :title="
+                userSearchText || roleFilter !== 'all' || typeFilter !== 'all'
+                  ? $t('title.noResultsMatchedYourSearch')
+                  : $t('title.noMembersFound')
+              "
+            />
+          </template>
+
+          <template #headerCell="{ column }">
+            <template v-if="column.key === 'select'">
+              <NcCheckbox v-model:checked="selectAll" :disabled="!sortedCollaborators.length" />
+            </template>
+            <template v-else>
+              {{ column.title }}
+            </template>
+          </template>
+
+          <template #bodyCell="{ column, record, recordIndex }">
+            <template v-if="column.key === 'select'">
+              <NcCheckbox v-model:checked="selected[recordIndex]" />
+            </template>
+
+            <template v-if="column.key === 'email' && record.isTeam">
+              <GeneralTeamInfo :team="transformToTeamObject(record, teamsMap[record.id])" />
+              <NcBadge v-if="teamsMap[record.id]?.scope === 'org'" :border="false" color="blue" size="xs" class="flex-none">
+                {{ $t('general.orgBadge') }}
+              </NcBadge>
+            </template>
+
+            <div v-else-if="column.key === 'email'" class="w-full flex gap-3 items-center users-email-grid">
+              <GeneralUserIcon size="base" :user="record" class="flex-none" />
+              <div class="flex flex-col flex-1 max-w-[calc(100%_-_44px)]">
+                <div class="flex items-center gap-1">
+                  <NcTooltip class="truncate max-w-full text-captionMedium text-nc-content-gray" show-on-truncate-only>
+                    <template #title>
+                      {{ extractUserDisplayNameOrEmail(record) }}
+                    </template>
+                    {{ extractUserDisplayNameOrEmail(record) }}
+                  </NcTooltip>
+                  <NcTooltip
+                    v-if="isScimManaged(record)"
+                    :title="$t('labels.scimManagedUserTooltip')"
+                    class="flex items-center"
+                    :tooltip-style="{ width: '230px' }"
+                    :overlay-inner-style="{ width: '230px' }"
+                  >
+                    <NcBadge :border="false" color="blue" size="xs">
+                      {{ $t('labels.scimManaged') }}
+                    </NcBadge>
+                  </NcTooltip>
+                </div>
+                <NcTooltip class="truncate max-w-full text-bodySm text-nc-content-gray-subtle2" show-on-truncate-only>
+                  <template #title>
+                    {{ record.email }}
+                  </template>
+                  {{ record.email }}
+                </NcTooltip>
+              </div>
+            </div>
+            <div v-if="column.key === 'role'">
+              <template
+                v-if="isRoleUpdateAllowed(record) && isOwnerOrCreator && getTeamCompatibleAccessibleRoles(accessibleRoles, record).includes(record.roles as WorkspaceUserRoles)"
+              >
+                <div class="flex flex-col gap-1">
+                  <RolesSelectorV2
+                    plain
+                    :on-role-change="(role) => showRoleChangeConfirmationModal(record, role as WorkspaceUserRoles)"
+                    :role="record.roles"
+                    :roles="getTeamCompatibleAccessibleRoles(accessibleRoles, record)"
+                    :effective-role="record.effective_role"
+                    class="cursor-pointer"
+                  />
+                  <NcTooltip v-if="record.role_source?.length" placement="bottom">
+                    <template #title>
+                      <div class="text-xs">
+                        <div v-for="src in record.role_source" :key="src.team_id">
+                          {{ teamsMap[src.team_id]?.title || src.team_id }}
+                          <span class="capitalize">({{ src.role?.replace('workspace-level-', '') }})</span>
+                        </div>
+                      </div>
+                    </template>
+                    <div class="flex items-center gap-1 text-xs text-nc-content-gray-muted cursor-help">
+                      <GeneralIcon icon="ncBuilding" class="h-3 w-3 flex-none" />
+                      <span>{{ $t('tooltip.roleInheritedFromTeam') }}</span>
+                    </div>
+                  </NcTooltip>
+                </div>
+              </template>
+              <template v-else>
+                <div class="flex flex-col gap-1">
+                  <RolesBadge plain :border="false" :role="record.effective_role || record.roles" class="cursor-default" />
+                  <NcTooltip v-if="record.role_source?.length" placement="bottom">
+                    <template #title>
+                      <div class="text-xs">
+                        <div v-for="src in record.role_source" :key="src.team_id">
+                          {{ teamsMap[src.team_id]?.title || src.team_id }}
+                          <span class="capitalize">({{ src.role?.replace('workspace-level-', '') }})</span>
+                        </div>
+                      </div>
+                    </template>
+                    <div class="flex items-center gap-1 text-xs text-nc-content-gray-muted cursor-help">
+                      <GeneralIcon icon="ncBuilding" class="h-3 w-3 flex-none" />
+                      <span>{{ $t('tooltip.roleInheritedFromTeam') }}</span>
+                    </div>
+                  </NcTooltip>
+                </div>
+              </template>
+            </div>
+            <div v-if="column.key === 'billable'" class="flex items-center">
+              <NcTooltip
+                v-if="record.billable"
+                class="flex items-center"
+                :tooltip-style="{ width: '230px' }"
+                :overlay-inner-style="{ width: '230px' }"
+              >
+                <template #title>
+                  <div>{{ $t('tooltip.paidUserBadgeTooltip') }}</div>
+                  <div v-if="canOpenSeatDetail && !record.isTeam" class="mt-2">{{ $t('tooltip.clickToSeeDetails') }}</div>
+                </template>
+                <component
+                  :is="canOpenSeatDetail && !record.isTeam ? 'button' : 'div'"
+                  v-e="['c:workspace:member:billable-detail']"
+                  class="nc-billable-badge flex items-center border-none p-0 bg-transparent"
+                  :class="{ 'cursor-pointer': canOpenSeatDetail && !record.isTeam }"
+                  data-testid="nc-billable-badge"
+                  @click="openSeatDetail(record)"
+                >
+                  <div v-if="activePlanTitle === PlanTitles.FREE && !appInfo.isOnPrem" class="text-nc-content-gray-default">
+                    <GeneralIcon icon="ncCrown" class="flex-none mb-0.5" />
+                  </div>
+                  <NcBadge
+                    v-else
+                    :border="false"
+                    color="green"
+                    class="text-nc-content-green-dark dark:!bg-nc-bg-green-light text-[10px] leading-[14px] !h-[18px] font-semibold"
+                  >
+                    <GeneralIcon icon="ncCrown" class="flex-none mb-0.5" />
+                  </NcBadge>
+                </component>
+              </NcTooltip>
+            </div>
+            <div v-if="column.key === 'created_at'">
+              <NcTooltip class="max-w-full">
+                <template #title>
+                  {{ parseStringDateTime(record.created_at) }}
+                </template>
+                <span>
+                  {{ timeAgo(record.created_at) }}
+                </span>
+              </NcTooltip>
+            </div>
+
+            <div v-if="column.key === 'action'">
+              <NcDropdown placement="bottomRight">
+                <NcButton size="small" type="secondary" class="nc-row-action">
+                  <GeneralIcon icon="threeDotVertical" />
+                </NcButton>
+                <template #overlay>
+                  <NcMenu variant="small">
+                    <NcMenuItemCopyId
+                      :id="record.id"
+                      :tooltip="record.isTeam ? $t(`labels.clickToCopyTeamID`) : $t(`labels.clickToCopyUserID`)"
+                      :label="
+                        record.isTeam
+                          ? $t(`labels.teamIdColon`, { teamId: record.id })
+                          : $t(`labels.userIdColon`, { userId: record.id })
+                      "
+                    />
+
+                    <template
+                      v-if="
+                        isEeUI &&
+                        (isOwnerOrCreator || record.id === user?.id || (record.isTeam && teamsMap[record.id]?.is_member))
+                      "
+                    >
+                      <NcDivider />
+
+                      <NcMenuItem v-if="record.isTeam && teamsMap[record.id]?.is_member" @click="handleEditTeam(record)">
+                        <GeneralIcon icon="ncEdit" class="h-4 w-4" />
+                        {{ $t('general.edit') }}
+                      </NcMenuItem>
+                      <template v-if="isAdminPanel && !record.isTeam">
+                        <NcMenuItem data-testid="nc-admin-org-user-delete">
+                          <GeneralIcon icon="signout" />
+                          <span>{{ $t('labels.signOutUser') }}</span>
+                        </NcMenuItem>
+
+                        <NcDivider />
+                      </template>
+
+                      <NcTooltip
+                        :disabled="(!isOnlyOneOwner || record.roles !== WorkspaceUserRoles.OWNER) && !isScimManaged(record)"
+                      >
+                        <template #title>
+                          {{ isScimManaged(record) ? $t('labels.scimManagedRemovalTooltip') : $t('tooltip.leaveWorkspace') }}
+                        </template>
+                        <NcMenuItem
+                          :disabled="!isDeleteAllowed(record) || (record.isTeam && !isOwnerOrCreator)"
+                          danger
+                          @click="removeCollaborator(record.id, currentWorkspace?.id, record)"
+                        >
+                          <div v-if="removingCollaboratorMap[record.id]" class="h-4 w-4 flex items-center justify-center">
+                            <GeneralLoader class="!flex-none !text-current" />
+                          </div>
+                          <GeneralIcon v-else icon="delete" />
+                          {{
+                            record.isTeam
+                              ? $t('objects.teams.removeTeam')
+                              : record.id === user.id
+                              ? t('activity.leaveWorkspace')
+                              : t('activity.removeMember')
+                          }}
+                        </NcMenuItem>
+                      </NcTooltip>
+                    </template>
+                  </NcMenu>
+                </template>
+              </NcDropdown>
+            </div>
+          </template>
+
+          <template #extraRow>
+            <div v-if="collaborators?.length === 1" class="w-full pt-12 pb-4 px-2 flex flex-col items-center gap-6 text-center">
+              <div class="text-2xl text-nc-content-gray font-bold">
+                {{ $t('placeholder.inviteYourTeam') }}
+              </div>
+              <div class="text-sm text-nc-content-gray-subtle">
+                {{ $t('placeholder.inviteYourTeamLabel') }}
+              </div>
+              <img src="~assets/img/placeholder/invite-team.png" :alt="$t('activity.inviteTeam')" class="!w-[30rem] flex-none" />
+            </div>
+          </template>
+        </NcTable>
+      </div>
+      <DlgInviteDlg
+        v-if="currentWorkspace"
+        v-model:model-value="inviteDlg"
+        :workspace-id="currentWorkspace?.id"
+        type="workspace"
+        :is-team="isInviteTeamDlg"
+        :users="sortedCollaborators"
+        :teams="teams"
+        :existing-team-ids="workspaceTeams?.map((team: any) => team.team_id) || []"
+      />
+
+      <WorkspaceTeamsEdit v-if="isTeamsEnabled" :is-open-using-router-push="isEditModalOpenUsingRouterPush" />
+
+      <WorkspaceBillableDetailModal
+        v-if="isEeUI && currentWorkspace?.id && seatDetailUser"
+        v-model:visible="isSeatDetailModalOpen"
+        :workspace-id="currentWorkspace.id"
+        :user="seatDetailUser"
+      />
+
+      <NcModalConfirm
+        v-if="currentWorkspace"
+        v-model:visible="userRoleUpdateInfo.showConfirmationModal"
+        ok-class="capitalize"
+        :ok-text="$t('general.confirm')"
+        :show-icon="false"
+        :keyboard="true"
+        :mask-closable="true"
+        @cancel="onCancelRoleChangeConfirmationModal"
+        @ok="onConfirmRoleChangeConfirmationModal"
+      >
+        <template #title>
+          <div>
+            <div class="inline-flex !align-top mr-2">
+              {{ $t('title.changeWorkspaceRoleTo') }}
+            </div>
+
+            <RolesBadge :border="false" :role="userRoleUpdateInfo.roles" class="inline-flex text-body"> </RolesBadge>
+          </div>
+        </template>
+        <template #extraContent>
+          <div class="flex flex-col gap-5 text-caption text-nc-content-gray">
+            <NcAlert
+              type="info"
+              :show-icon="false"
+              class="!p-3 bg-nc-bg-yellow-light dark:bg-nc-yellow-20 !border-nc-fill-yellow-light"
+              description-class="!line-clamp-none"
+            >
+              <template #description>
+                <div class="text-nc-content-yellow-dark">
+                  <b>{{ $t('general.notice') }}:</b>
+                  {{
+                    userRoleUpdateInfo.collab?.isTeam
+                      ? $t('msg.info.workspaceTeamRoleUpdateNotice')
+                      : $t('msg.info.workspaceRoleUpdateNotice')
+                  }}
+                </div>
+              </template>
+            </NcAlert>
+            <div v-if="showOverrideBaseRoleCheckbox" class="flex items-start gap-3">
+              <div class="flex items-center h-5">
+                <NcCheckbox v-model:checked="userRoleUpdateInfo.overrideBaseRole" />
+              </div>
+
+              <div class="flex flex-col gap-2">
+                <div class="font-semibold">{{ $t('labels.applyToAllBases') }}</div>
+                <div class="text-nc-content-gray-subtle">
+                  {{ $t('msg.info.applyRoleToAllBasesHint') }}
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+      </NcModalConfirm>
+    </div>
+  </div>
+</template>
+
+<style scoped lang="scss">
+.badge-text {
+  @apply text-[14px] pt-1 text-center;
+}
+
+/* The role chip is a table cell, so it reads at the table's own size. */
+:deep(.nc-role-badge .badge-text) {
+  @apply text-bodyDefaultSm;
+}
+
+/* NcSelect renders its value semibold by default; a filter is not an emphasis. */
+.nc-ws-members-filter {
+  :deep(.ant-select-selection-item) {
+    @apply !font-normal;
+  }
+}
+
+.nc-collaborator-table-container {
+  &.nc-is-admin-panel {
+    @apply h-[calc(100vh-144px)];
+
+    @supports (height: 100dvh) {
+      @apply h-[calc(100dvh-144px)];
+    }
+  }
+
+  // Workspace home: Members is not an Admin route, so no sub-tab bar is on screen
+  // and there is nothing to subtract beyond the topbar.
+  &.nc-is-ws-members-list {
+    @apply h-[calc(100vh-var(--topbar-height))];
+
+    @supports (height: 100dvh) {
+      @apply h-[calc(100dvh-var(--topbar-height))];
+    }
+  }
+
+  // Hosted in the settings shell, which bounds the height.
+  &.nc-is-settings-sidebar {
+    @apply h-full;
+  }
+}
+</style>
+
+<style lang="scss">
+/* Dropdowns render in a portal — scoped styles can't reach them. */
+.nc-ws-members-filter-dropdown {
+  .ant-select-item-option-content {
+    @apply text-bodyDefaultSm;
+  }
+}
+</style>

@@ -1,0 +1,2056 @@
+import groupBy from 'lodash/groupBy';
+import {
+  extractFilterFromXwhere,
+  getFirstNonPersonalView,
+  NcApiVersion,
+  UITypes,
+  ViewTypes,
+} from 'nocodb-sdk';
+import type { NcContext } from 'nocodb-sdk';
+import type { Logger } from '@nestjs/common';
+import type { IBaseModelSqlV2 } from '~/db/IBaseModelSqlV2';
+import type { LinkToAnotherRecordColumn, LookupColumn } from '~/models';
+import conditionV2 from '~/db/conditionV2';
+import sortV2 from '~/db/sortV2';
+import { _wherePk, applyPaginate } from '~/helpers/dbHelpers';
+import getAst from '~/helpers/getAst';
+import { Filter, Model, View } from '~/models';
+import { hasLimitedRelatedTableAccess } from '~/helpers/tableHelpers';
+import Noco from '~/Noco';
+import { nocoExecute } from '~/utils/nocoExecute';
+import {
+  getRelationReadDepth,
+  runAtNextRelationReadDepth,
+} from '~/db/BaseModelSqlv2/relation-read-depth';
+
+const GROUP_COL = '__nc_group_id';
+
+// How many relation levels `postProcessData` expands LTAR/Lookup before falling
+// back to a value-only projection (scalars/Rollup/Links/Formula). Depth 0 is the
+// surfaced relation read; expanding through this many levels means a lookup
+// chain up to one hop deeper than the bound resolves (depth 1 → the two-hop
+// lookup→lookup).
+//
+// Bounded at 1 — the cheapest bound that still fixes #14229's two-level
+// lookup→lookup case. Raising it to 2 (to also resolve a three-hop chain) was
+// tried but pushed the heavy self-referential metaLTAR read over its timeout on
+// hundreds of rows (CI: metaLTAR delete-record test timed out): each extra
+// expanded level turns one relation read into N more. Deeper chains are still
+// resolved — not by raising this bound, but by targeted expansion below, which
+// keeps only the columns an outer lookup actually references. Cyclic chains
+// still terminate here.
+const MAX_NESTED_RELATION_DEPTH = 1;
+
+// Targeted expansion (#14229): past the bound, a bounded nested read still keeps
+// the LTAR/Lookup columns an *outer* lookup chain references (so a deep
+// lookup→lookup→lookup resolves) instead of dropping all relations. That keeps
+// re-entering postProcessData one hop per lookup level, so a self/cyclic lookup
+// chain could recurse without limit. This hard cap severs it: at or ABOVE this
+// depth (`depth < TARGETED_EXPANSION_MAX_DEPTH` stops holding) we stop passing
+// required columns, the AST drops all relations again, and the recursion
+// terminates. Practical lookup chains are far shallower than this.
+const TARGETED_EXPANSION_MAX_DEPTH = 8;
+
+// The target columns on `model`'s related table that outer lookups need from the
+// relation `relationColumnId`: the union of `fk_lookup_column_id` for every
+// Lookup on the owner model that traverses that relation. Passed to getAst as
+// `requiredColumnIds` so exactly those columns survive a bounded nested read —
+// each kept target may itself be a Lookup/LTAR, which resolves one level deeper.
+async function requiredLookupTargets(
+  context: NcContext,
+  ownerModel: Model,
+  relationColumnId: string,
+): Promise<Set<string> | undefined> {
+  const columns = await ownerModel.getColumns();
+
+  let targets: Set<string> | undefined;
+
+  for (const col of columns) {
+    if (col.uidt !== UITypes.Lookup) continue;
+
+    const colOptions = (await col.getColOptions()) as LookupColumn;
+
+    if (
+      colOptions?.fk_relation_column_id !== relationColumnId ||
+      !colOptions.fk_lookup_column_id
+    ) {
+      continue;
+    }
+
+    (targets ??= new Set<string>()).add(colOptions.fk_lookup_column_id);
+  }
+
+  return targets;
+}
+
+// SQLite AND MSSQL forbid `ORDER BY` (and `TOP`/`LIMIT`) inside a parenthesized
+// `UNION ALL` operand — only pg/mysql accept `(SELECT … ORDER BY … LIMIT …)`
+// branches. For those two dialects we instead wrap each branch in a derived
+// table (`SELECT * FROM (<branch>)`) and tell knex NOT to parenthesize the
+// union members. MSSQL additionally requires the derived table to be aliased.
+//
+// Oracle forbids branch-level ORDER BY too, but intentionally does NOT need
+// the wrap: knex's oracledb dialect compiles `.limit()/.offset()` into a
+// ROWNUM inline-view wrapper, so each compiled branch is already a plain
+// `SELECT * FROM (… ORDER BY …) WHERE ROWNUM <= n` with no top-level
+// ORDER BY/LIMIT — a valid parenthesized UNION ALL operand (live-verified).
+function needsUnionMemberWrap(model: IBaseModelSqlV2): boolean {
+  return (model as any).isSqlite || (model as any).isMssql;
+}
+
+function wrapUnionMember(model: IBaseModelSqlV2, query: any): any {
+  if (!needsUnionMemberWrap(model)) return query;
+  return (model as any).dbDriver
+    .select()
+    .from((model as any).isMssql ? query.as('__nc_u') : query);
+}
+
+export const relationDataFetcher = (param: {
+  baseModel: IBaseModelSqlV2;
+  logger: Logger;
+}) => {
+  const { baseModel } = param;
+
+  async function postProcessData(
+    context: NcContext,
+    {
+      data,
+      model,
+      query,
+      relationColumnId,
+    }: {
+      data: any[];
+      model: Model;
+      query: any;
+      // The LTAR column on the owner model (`baseModel.model`) that this related
+      // data was read through — lets a bounded nested read keep only the target
+      // columns an outer lookup chain needs (targeted expansion, #14229).
+      relationColumnId?: string;
+    },
+  ) {
+    if (Noco.isEE()) {
+      return data;
+    }
+
+    // Seed the request-scoped cache map. Nothing in THIS function reads it (the
+    // depth counter moved to AsyncLocalStorage), but it is not dead: the EE
+    // `@NcCache` decorator self-seeds only on its first decorated call, while
+    // `LinkToAnotherRecordColumn.getRelContext` propagates the map to the
+    // related contexts *only* `if (context.cacheMap)`. Seeding here means the
+    // nested reads below share the parent's map instead of each starting a
+    // fresh one, so dropping this would cost cache hits across the relation
+    // boundary on unlicensed on-prem (EE build, `Noco.isEE()` false).
+    if (!context.cacheMap) {
+      context.cacheMap = new Map();
+    }
+
+    // Re-resolving a relation's lookups here re-enters this function for the
+    // next relation, so the recursion is bounded by depth. Below the bound the
+    // AST is built normally MINUS LTAR/Lookup (the two columns that re-enter
+    // here) — except the specific target columns an outer lookup chain still
+    // needs, which are kept via requiredColumnIds below (targeted expansion).
+    // Scalars/Rollup/Links/Formula still resolve within the single relation
+    // SELECT, which is what keeps an outer lookup's target (#14229) — dropped
+    // by the old PK+PV projection — while staying cheap. Depth is
+    // per-async-chain (AsyncLocalStorage), not a shared counter, because
+    // nocoExecute resolves sibling relations concurrently — see relation-read-depth.
+    const depth = getRelationReadDepth();
+
+    const skipRelationExpansion = depth >= MAX_NESTED_RELATION_DEPTH;
+
+    // Below the bound, keep the columns an outer lookup chain still needs from
+    // this relation (targeted expansion) instead of dropping every relation.
+    // The cyclic-safety cap stops feeding required columns past a fixed depth so
+    // a self-referential lookup chain terminates — see TARGETED_EXPANSION_MAX_DEPTH.
+    const requiredColumnIds =
+      skipRelationExpansion &&
+      relationColumnId &&
+      depth < TARGETED_EXPANSION_MAX_DEPTH
+        ? await requiredLookupTargets(
+            baseModel.context,
+            baseModel.model,
+            relationColumnId,
+          )
+        : undefined;
+
+    const { ast, parsedQuery } = await getAst(context, {
+      model,
+      query,
+      skipRelationExpansion,
+      requiredColumnIds,
+    });
+
+    return runAtNextRelationReadDepth(() =>
+      nocoExecute(ast, data, {}, parsedQuery),
+    );
+  }
+
+  return {
+    async multipleHmList(
+      {
+        colId,
+        ids: _ids,
+        apiVersion,
+        nested = false,
+        linksAsLtar = false,
+      }: {
+        colId: string;
+        ids: any[];
+        apiVersion?: NcApiVersion;
+        nested?: boolean;
+        linksAsLtar?: boolean;
+      },
+      args: { limit?; offset?; fieldsSet?: Set<string> } = {},
+    ) {
+      try {
+        // skip duplicate id
+        const ids = [...new Set(_ids)];
+
+        const { where, sort, ...rest } = baseModel._getListArgs(args as any);
+        // todo: get only required fields
+        const relColumn = (await baseModel.model.getColumns()).find(
+          (c) => c.id === colId,
+        );
+
+        const relationColOpts =
+          (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+        const { refContext } = relationColOpts.getRelContext();
+
+        const childCol = await relationColOpts.getChildColumn();
+
+        const childTable = await childCol.getModel();
+        const parentCol = await relationColOpts.getParentColumn();
+        const parentTable = await parentCol.getModel();
+        const childBaseModel = await Model.getBaseModelSQL(refContext, {
+          model: childTable,
+          dbDriver: baseModel.dbDriver,
+        });
+        await parentTable.getColumns();
+
+        const childTn = childBaseModel.getTnPath(childTable);
+        const parentTn = baseModel.getTnPath(parentTable);
+
+        const qb = childBaseModel.dbDriver(childTn);
+
+        const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+          baseModel.context,
+          childTable.id,
+        );
+
+        await childBaseModel.selectObject({
+          qb,
+          extractPkAndPv: true,
+          fieldsSet: args.fieldsSet,
+          pkAndPvOnly: relationColOpts.isCrossBaseLink() || hasLimitedAccess,
+          fk_display_value_column_id:
+            relationColOpts.fk_display_value_column_id,
+          linksAsLtar,
+        });
+        const view = relationColOpts.fk_target_view_id
+          ? await View.get(refContext, relationColOpts.fk_target_view_id)
+          : await View.getFirstCollaborativeView(
+              refContext,
+              childBaseModel.model.id,
+            );
+        await childBaseModel.applySortAndFilter({
+          table: childTable,
+          where,
+          qb,
+          sort,
+          view,
+          skipViewFilter: true,
+          prioritizePvSort: true,
+        });
+
+        // Exclude soft-deleted records from HM results so they don't leak through links
+        const hmSoftDeleteFilter = await childBaseModel.getSoftDeleteFilter();
+        if (hmSoftDeleteFilter) qb.where(hmSoftDeleteFilter);
+
+        const childQb = baseModel.dbDriver.queryBuilder().from(
+          baseModel.dbDriver
+            .unionAll(
+              ids.map((p) => {
+                const query = qb
+                  .clone()
+                  .select(baseModel.dbDriver.raw('? as ??', [p, GROUP_COL]))
+                  .whereIn(
+                    childCol.column_name,
+                    baseModel
+                      .dbDriver(parentTn)
+                      .select(parentCol.column_name)
+                      // .where(parentTable.primaryKey.cn, p)
+                      .where(_wherePk(parentTable.primaryKeys, p)),
+                  );
+                // todo: sanitize
+
+                // get one extra record to check if there are more records in case of v3 api and nested
+                query.limit(
+                  (+rest?.limit || 25) +
+                    (apiVersion === NcApiVersion.V3 && nested ? 1 : 0),
+                );
+                query.offset(+rest?.offset || 0);
+
+                return wrapUnionMember(baseModel, query);
+              }),
+              !needsUnionMemberWrap(baseModel),
+            )
+            .as('list'),
+        );
+
+        const children = await childBaseModel.execAndParse(
+          childQb,
+          await childTable.getColumns(),
+        );
+        const proto = await childBaseModel.getProto();
+
+        return groupBy(
+          children.map((c) => {
+            c.__proto__ = proto;
+            return c;
+          }),
+          GROUP_COL,
+        );
+      } catch (e) {
+        param.logger.error(e);
+      }
+    },
+
+    async mmList(
+      {
+        colId,
+        parentId,
+        apiVersion,
+        nested = false,
+        linksAsLtar = false,
+      }: {
+        colId: string;
+        parentId: any;
+        apiVersion?: NcApiVersion;
+        nested?: boolean;
+        linksAsLtar?: boolean;
+      },
+      args: {
+        limit?;
+        offset?;
+        fieldsSet?: Set<string>;
+        pkAndPvOnly?: boolean;
+      } = {},
+      selectAllRecords = false,
+    ) {
+      const { where, sort, ...rest } = baseModel._getListArgs(args as any, {
+        apiVersion,
+        nested: true,
+      });
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext, mmContext } = relColOptions.getRelContext();
+
+      // const tn = baseModel.model.tn;
+      // const cn = (await relColOptions.getChildColumn()).title;
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return [];
+      }
+
+      const mmBaseModel = await Model.getBaseModelSQL(mmContext, {
+        model: mmTable,
+        dbDriver: baseModel.dbDriver,
+      });
+      const vtn = mmBaseModel.getTnPath(mmTable);
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const refTable = await (await relColOptions.getParentColumn()).getModel();
+      const table = await (await relColOptions.getChildColumn()).getModel();
+      await table.getColumns();
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: refTable,
+      });
+
+      const refTn = refBaseModel.getTnPath(refTable);
+      const tn = baseModel.getTnPath(table);
+
+      const rtn = refTn;
+      // const rtnId = childTable.id;
+
+      const qb = baseModel
+        .dbDriver(rtn)
+        .join(vtn, `${vtn}.${vrcn}`, `${rtn}.${rcn}`)
+        .whereIn(
+          `${vtn}.${vcn}`,
+          baseModel
+            .dbDriver(tn)
+            .select(cn)
+            // .where(parentTable.primaryKey.cn, id)
+            .where(_wherePk(table.primaryKeys, parentId)),
+        );
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        refTable.id,
+      );
+
+      await refBaseModel.selectObject({
+        qb,
+        fieldsSet: args.fieldsSet,
+        pkAndPvOnly:
+          relColOptions.isCrossBaseLink() ||
+          hasLimitedAccess ||
+          !!args.pkAndPvOnly,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+        linksAsLtar,
+      });
+
+      await refTable.getViews();
+      const viewId =
+        relColumn.colOptions?.fk_target_view_id ??
+        getFirstNonPersonalView([...(refTable.views ?? [])], {
+          includeViewType: ViewTypes.GRID,
+        })?.id;
+      let view: View | null = null;
+      if (viewId) view = await View.get(refContext, viewId);
+
+      await refBaseModel.applySortAndFilter({
+        table: refTable,
+        where,
+        view,
+        qb,
+        sort,
+        skipViewFilter: true,
+        prioritizePvSort: true,
+      });
+
+      if (!sort || sort === '') {
+        const view = relColOptions.fk_target_view_id
+          ? await View.get(refContext, relColOptions.fk_target_view_id)
+          : await View.getFirstCollaborativeView(refContext, refTable.id);
+        let childSorts = [];
+        if (view) {
+          childSorts = await view.getSorts();
+          if (childSorts?.length) await sortV2(refBaseModel, childSorts, qb);
+        }
+        // No explicit sort and no view sort → fall back to the per-link order.
+        // The junction Order column grouped by the current side's FK (vcn, i.e.
+        // getMMChildColumn) holds this record's manual arrangement of its links.
+        // v1 links / external junctions have no such column → natural order.
+        // Per-link ordering is Postgres-only (the Order column exists on any
+        // isMeta source, but ordering by it is only wired/valid on pg).
+        if (!childSorts?.length && baseModel.isPg) {
+          const linkOrderCol = await relColOptions.getMMChildOrderColumn();
+          if (linkOrderCol) {
+            // Drop the default related-table order applied above (the related
+            // model's own `nc_order`/PK sort). Without this the per-link order is
+            // only appended as a tiebreaker, so the related table's row order
+            // wins and the manual link arrangement is ignored. Safe here: this
+            // branch runs only when there is NO explicit sort AND no view sort,
+            // so nothing user-intended is discarded.
+            qb.clear('order');
+            qb.orderBy(`${vtn}.${linkOrderCol.column_name}`, 'asc');
+            // Deterministic tiebreak on the related-side junction FK (part of
+            // the junction PK) so equal order values (backfill/manual/concurrent)
+            // never yield a nondeterministic read order.
+            qb.orderBy(`${vtn}.${vrcn}`, 'asc');
+          }
+        }
+      }
+
+      // todo: sanitize
+      if (!selectAllRecords) {
+        // get one extra record to check if there are more records in case of v3 api and nested
+        qb.limit(
+          (+rest?.limit || 25) +
+            (apiVersion === NcApiVersion.V3 && nested ? 1 : 0),
+        );
+      }
+      qb.offset(selectAllRecords ? 0 : +rest?.offset || 0);
+
+      // Exclude soft-deleted records from MM results so they don't leak through links
+      const mmSoftDeleteFilter = await refBaseModel.getSoftDeleteFilter();
+      if (mmSoftDeleteFilter) qb.where(mmSoftDeleteFilter);
+
+      const children = await refBaseModel.execAndParse(
+        qb,
+        await refTable.getColumns(),
+      );
+      const proto = await refBaseModel.getProto();
+
+      return await postProcessData(refContext, {
+        data: children.map((c) => {
+          c.__proto__ = proto;
+          return c;
+        }),
+        model: refTable,
+        query: args,
+        relationColumnId: colId,
+      });
+    },
+
+    // Like mmList but returns a single record (for V2 MO/OO — single-target relations via junction table)
+    async mmRead(
+      {
+        colId,
+        parentId,
+      }: {
+        colId: string;
+        parentId: any;
+      },
+      args: { fieldsSet?: Set<string> } = {},
+    ) {
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext, mmContext } = relColOptions.getRelContext();
+
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return null;
+      }
+
+      const mmBaseModel = await Model.getBaseModelSQL(mmContext, {
+        model: mmTable,
+        dbDriver: baseModel.dbDriver,
+      });
+      const vtn = mmBaseModel.getTnPath(mmTable);
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const refTable = await (await relColOptions.getParentColumn()).getModel();
+      const table = await (await relColOptions.getChildColumn()).getModel();
+      await table.getColumns();
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: refTable,
+      });
+
+      const refTn = refBaseModel.getTnPath(refTable);
+      const tn = baseModel.getTnPath(table);
+      const rtn = refTn;
+
+      const qb = baseModel
+        .dbDriver(rtn)
+        .join(vtn, `${vtn}.${vrcn}`, `${rtn}.${rcn}`)
+        .whereIn(
+          `${vtn}.${vcn}`,
+          baseModel
+            .dbDriver(tn)
+            .select(cn)
+            .where(_wherePk(table.primaryKeys, parentId)),
+        )
+        .limit(1);
+
+      // Exclude soft-deleted records from MM read results
+      const refSoftDeleteFilter = await refBaseModel.getSoftDeleteFilter();
+      if (refSoftDeleteFilter) {
+        qb.where(refSoftDeleteFilter);
+      }
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        refTable.id,
+      );
+
+      await refBaseModel.selectObject({
+        qb,
+        fieldsSet: args.fieldsSet,
+        pkAndPvOnly: relColOptions.isCrossBaseLink() || hasLimitedAccess,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+      });
+
+      const child = await refBaseModel.execAndParse(
+        qb,
+        await refTable.getColumns(),
+        { first: true },
+      );
+
+      if (!child) return null;
+
+      const proto = await refBaseModel.getProto();
+      child.__proto__ = proto;
+
+      const result = await postProcessData(refContext, {
+        data: [child],
+        model: refTable,
+        query: args,
+        relationColumnId: colId,
+      });
+
+      return result?.[0] ?? null;
+    },
+
+    async multipleHmListCount({ colId, ids }) {
+      try {
+        // const { cn } = baseModel.hasManyRelations.find(({ tn }) => tn === child) || {};
+        const relColumn = (await baseModel.model.getColumns()).find(
+          (c) => c.id === colId,
+        );
+
+        const relationColOpts =
+          (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+        const { refContext } = relationColOpts.getRelContext();
+
+        const childCol = await relationColOpts.getChildColumn();
+
+        const childTable = await childCol.getModel();
+
+        const parentCol = await relationColOpts.getParentColumn();
+
+        const parentTable = await parentCol.getModel();
+
+        await parentTable.getColumns();
+
+        const childBaseModel = await Model.getBaseModelSQL(refContext, {
+          dbDriver: baseModel.dbDriver,
+          model: childTable,
+        });
+
+        const childTn = childBaseModel.getTnPath(childTable);
+        const parentTn = baseModel.getTnPath(parentTable);
+
+        // Exclude soft-deleted records from HM count results
+        const hmCountSoftDeleteFilter =
+          await childBaseModel.getSoftDeleteFilter();
+
+        const children = await childBaseModel.execAndParse(
+          childBaseModel.dbDriver.unionAll(
+            ids.map((p) => {
+              const query = baseModel
+                .dbDriver(childTn)
+                .count(`${childCol?.column_name} as count`)
+                .whereIn(
+                  childCol.column_name,
+                  baseModel
+                    .dbDriver(parentTn)
+                    .select(parentCol.column_name)
+                    // .where(parentTable.primaryKey.cn, p)
+                    .where(_wherePk(parentTable.primaryKeys, p)),
+                )
+                .first();
+
+              if (hmCountSoftDeleteFilter) query.where(hmCountSoftDeleteFilter);
+
+              return wrapUnionMember(childBaseModel, query);
+            }),
+            !needsUnionMemberWrap(childBaseModel),
+          ),
+          null,
+          { raw: true },
+        );
+
+        return children.map(({ count }) => count);
+      } catch (e) {
+        throw e;
+      }
+    },
+
+    async hmList(
+      {
+        colId,
+        id,
+        apiVersion,
+        linksAsLtar = false,
+      }: {
+        colId: string;
+        id: any;
+        apiVersion?: NcApiVersion;
+        nested?: boolean;
+        linksAsLtar?: boolean;
+      },
+      args: {
+        limit?;
+        offset?;
+        fieldSet?: Set<string>;
+        pkAndPvOnly?: boolean;
+      } = {},
+      selectAllRecords = false,
+    ) {
+      try {
+        const { where, sort, ...rest } = baseModel._getListArgs(args as any, {
+          apiVersion,
+          nested: true,
+        });
+        // todo: get only required fields
+
+        const relColumn = (await baseModel.model.getColumns()).find(
+          (c) => c.id === colId,
+        );
+        const relationColOpts =
+          (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+        const { refContext } = relationColOpts.getRelContext();
+
+        const childCol = await relationColOpts.getChildColumn();
+
+        const childTable = await childCol.getModel();
+
+        const parentCol = await relationColOpts.getParentColumn();
+        const parentTable = await parentCol.getModel();
+        const childBaseModel = await Model.getBaseModelSQL(refContext, {
+          model: childTable,
+          dbDriver: baseModel.dbDriver,
+        });
+        await parentTable.getColumns();
+
+        const childTn = childBaseModel.getTnPath(childTable);
+        const parentTn = baseModel.getTnPath(parentTable);
+
+        const qb = baseModel.dbDriver(childTn);
+
+        await childTable.getViews();
+        const viewId =
+          relColumn.colOptions?.fk_target_view_id ??
+          getFirstNonPersonalView([...(childTable.views ?? [])], {
+            includeViewType: ViewTypes.GRID,
+          })?.id;
+        let view: View | null = null;
+        if (viewId) view = await View.get(childBaseModel.context, viewId);
+
+        qb.whereIn(
+          childCol.column_name,
+          baseModel
+            .dbDriver(parentTn)
+            .select(parentCol.column_name)
+            // .where(parentTable.primaryKey.cn, p)
+            .where(_wherePk(parentTable.primaryKeys, id)),
+        );
+        // todo: sanitize
+        // `selectAllRecords` (set by the text↔link conversion's link read) skips
+        // the limit so every linked child is returned — without it a row with
+        // >25 children would be silently truncated. Mirrors `mmList`.
+        if (!selectAllRecords) {
+          qb.limit(+rest?.limit || 25);
+        }
+        qb.offset(selectAllRecords ? 0 : +rest?.offset || 0);
+
+        const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+          baseModel.context,
+          childTable.id,
+        );
+
+        await childBaseModel.selectObject({
+          qb,
+          fieldsSet: args.fieldSet,
+          pkAndPvOnly:
+            relationColOpts.isCrossBaseLink() ||
+            hasLimitedAccess ||
+            !!args.pkAndPvOnly,
+          fk_display_value_column_id:
+            relationColOpts.fk_display_value_column_id,
+          linksAsLtar,
+        });
+
+        await childBaseModel.applySortAndFilter({
+          table: childTable,
+          where,
+          qb,
+          sort,
+          view,
+          skipViewFilter: true,
+          prioritizePvSort: true,
+        });
+
+        const hmListSoftDeleteFilter =
+          await childBaseModel.getSoftDeleteFilter();
+        if (hmListSoftDeleteFilter) qb.where(hmListSoftDeleteFilter);
+
+        const children = await childBaseModel.execAndParse(
+          qb,
+          await childTable.getColumns(),
+        );
+
+        const proto = await childBaseModel.getProto();
+
+        return await postProcessData(refContext, {
+          data: children.map((c) => {
+            c.__proto__ = proto;
+            return c;
+          }),
+          model: childTable,
+          query: args,
+          relationColumnId: colId,
+        });
+      } catch (e) {
+        throw e;
+      }
+    },
+
+    async hmListCount({ colId, id }, args) {
+      try {
+        // const { cn } = baseModel.hasManyRelations.find(({ tn }) => tn === child) || {};
+        const { where } = baseModel._getListArgs(args as any);
+        const relColumn = (await baseModel.model.getColumns()).find(
+          (c) => c.id === colId,
+        );
+
+        const relationColOpts =
+          (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+        const childCol = await relationColOpts.getChildColumn();
+
+        const { refContext } = relationColOpts.getRelContext();
+
+        const childTable = await childCol.getModel();
+        const parentCol = await (
+          (await relColumn.getColOptions()) as LinkToAnotherRecordColumn
+        ).getParentColumn();
+        const parentTable = await parentCol.getModel();
+        await parentTable.getColumns();
+
+        const childBaseModel = await Model.getBaseModelSQL(refContext, {
+          dbDriver: baseModel.dbDriver,
+          model: childTable,
+        });
+        const childTn = childBaseModel.getTnPath(childTable);
+        const parentTn = baseModel.getTnPath(parentTable);
+
+        const query = childBaseModel
+          .dbDriver(childTn)
+          .count(`${childCol?.column_name} as count`)
+          .whereIn(
+            childCol.column_name,
+            baseModel
+              .dbDriver(parentTn)
+              .select(parentCol.column_name)
+              .where(_wherePk(parentTable.primaryKeys, id)),
+          );
+
+        // Exclude soft-deleted records from HM count results
+        const hmCountSoftDeleteFilter =
+          await childBaseModel.getSoftDeleteFilter();
+        if (hmCountSoftDeleteFilter) query.where(hmCountSoftDeleteFilter);
+
+        const aliasColObjMap = await childTable.getAliasColObjMap();
+        const { filters: filterObj } = extractFilterFromXwhere(
+          childBaseModel.context,
+          where,
+          aliasColObjMap,
+        );
+
+        await conditionV2(
+          // cast as any before further refactor
+          childBaseModel as any,
+          [
+            new Filter({
+              children: filterObj,
+              is_group: true,
+              logical_op: 'and',
+            }),
+          ],
+          query,
+        );
+
+        return (
+          await childBaseModel.execAndParse(query, null, {
+            raw: true,
+            first: true,
+          })
+        )?.count;
+      } catch (e) {
+        throw e;
+      }
+    },
+
+    async multipleMmList(
+      {
+        colId,
+        parentIds: _parentIds,
+        apiVersion,
+        nested = false,
+        linksAsLtar = false,
+      }: {
+        colId: string;
+        parentIds: any[];
+        apiVersion?: NcApiVersion;
+        nested?: boolean;
+        linksAsLtar?: boolean;
+      },
+      args: { limit?; offset?; fieldsSet?: Set<string> } = {},
+    ) {
+      // skip duplicate id
+      const parentIds = [...new Set(_parentIds)];
+      const { where, sort, ...rest } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      // const tn = baseModel.model.tn;
+      // const cn = (await relColOptions.getChildColumn()).title;
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return;
+      }
+
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const cn = (await relColOptions.getChildColumn()).column_name;
+
+      const { refContext, mmContext } = relColOptions.getRelContext();
+
+      const refTable = await (await relColOptions.getParentColumn()).getModel();
+      const table = await (await relColOptions.getChildColumn()).getModel();
+      await table.getColumns();
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: refTable,
+      });
+      const mmModel = await Model.getBaseModelSQL(mmContext, {
+        dbDriver: baseModel.dbDriver,
+        model: mmTable,
+      });
+
+      const refTn = refBaseModel.getTnPath(refTable);
+      const tn = baseModel.getTnPath(table);
+      const vtn = mmModel.getTnPath(mmTable);
+      const rtn = refTn;
+
+      const qb = baseModel
+        .dbDriver(rtn)
+        .join(vtn, `${vtn}.${vrcn}`, `${rtn}.${rcn}`);
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        refTable.id,
+      );
+
+      await refBaseModel.selectObject({
+        qb,
+        fieldsSet: args.fieldsSet,
+        pkAndPvOnly: relColOptions.isCrossBaseLink() || hasLimitedAccess,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+        linksAsLtar,
+      });
+
+      const view = relColOptions.fk_target_view_id
+        ? await View.get(refContext, relColOptions.fk_target_view_id)
+        : await View.getFirstCollaborativeView(refContext, refTable.id);
+      await refBaseModel.applySortAndFilter({
+        table: refTable,
+        where,
+        qb,
+        sort,
+        view,
+        skipViewFilter: true,
+        prioritizePvSort: true,
+      });
+
+      const mmListSoftDeleteFilter = await refBaseModel.getSoftDeleteFilter();
+
+      const finalQb = refBaseModel.dbDriver.unionAll(
+        parentIds.map((id) => {
+          const query = qb
+            .clone()
+            .whereIn(
+              `${vtn}.${vcn}`,
+              baseModel
+                .dbDriver(tn)
+                .select(cn)
+                // .where(parentTable.primaryKey.cn, id)
+                .where(_wherePk(table.primaryKeys, id)),
+            )
+            .select(baseModel.dbDriver.raw('? as ??', [id, GROUP_COL]));
+
+          if (mmListSoftDeleteFilter) query.where(mmListSoftDeleteFilter);
+
+          // get one extra record to check if there are more records in case of v3 api and nested
+          query.limit(
+            (+rest?.limit || 25) +
+              (apiVersion === NcApiVersion.V3 && nested ? 1 : 0),
+          );
+          query.offset(+rest?.offset || 0);
+          return wrapUnionMember(baseModel, query);
+        }),
+        !needsUnionMemberWrap(baseModel),
+      );
+
+      const children = await refBaseModel.execAndParse(
+        finalQb,
+        await refTable.getColumns(),
+      );
+
+      const proto = await refBaseModel.getProto();
+      const gs = groupBy(
+        children.map((c) => {
+          c.__proto__ = proto;
+          return c;
+        }),
+        GROUP_COL,
+      );
+      return _parentIds.map((id) => gs[id] || []);
+    },
+
+    async multipleMmListCount({ colId, parentIds }) {
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      // Resolve mm/related contexts so cross-base junction & related tables are
+      // schema-qualified against THEIR base, not the requesting base. Mirrors the
+      // singular mmListCount; without this, cross-base link counts qualify the
+      // junction/related tables with the wrong schema.
+      const { mmContext, refContext } = relColOptions.getRelContext();
+
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return parentIds.map(() => 0);
+      }
+
+      const assocBaseModel = await Model.getBaseModelSQL(mmContext, {
+        model: mmTable,
+        dbDriver: baseModel.dbDriver,
+      });
+
+      const vtn = assocBaseModel.getTnPath(mmTable);
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const childTable = await (
+        await relColOptions.getParentColumn()
+      ).getModel();
+      const parentTable = await (
+        await relColOptions.getChildColumn()
+      ).getModel();
+      await parentTable.getColumns();
+
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: childTable,
+      });
+
+      const childTn = refBaseModel.getTnPath(childTable);
+      const parentTn = baseModel.getTnPath(parentTable);
+
+      const rtn = childTn;
+
+      const qb = baseModel
+        .dbDriver(rtn)
+        .join(vtn, `${vtn}.${vrcn}`, `${rtn}.${rcn}`)
+        // .select({
+        //   [`${tn}_${vcn}`]: `${vtn}.${vcn}`
+        // })
+        .count(`${vtn}.${vcn}`, { as: 'count' });
+
+      // Exclude soft-deleted records from MM count results
+      const mmCountSoftDeleteFilter = await refBaseModel.getSoftDeleteFilter();
+      if (mmCountSoftDeleteFilter) qb.where(mmCountSoftDeleteFilter);
+
+      // await childBaseModel.selectObject({ qb });
+      const children = await baseModel.execAndParse(
+        baseModel.dbDriver.unionAll(
+          parentIds.map((id) => {
+            const query = qb
+              .clone()
+              .whereIn(
+                `${vtn}.${vcn}`,
+                baseModel
+                  .dbDriver(parentTn)
+                  .select(cn)
+                  // .where(parentTable.primaryKey.cn, id)
+                  .where(_wherePk(parentTable.primaryKeys, id)),
+              )
+              .select(baseModel.dbDriver.raw('? as ??', [id, GROUP_COL]));
+            // baseModel._paginateAndSort(query, { sort, limit, offset }, null, true);
+            return wrapUnionMember(baseModel, query);
+          }),
+          !needsUnionMemberWrap(baseModel),
+        ),
+        null,
+        { raw: true },
+      );
+
+      const gs = groupBy(children, GROUP_COL);
+      return parentIds.map((id) => gs?.[id]?.[0] || []);
+    },
+
+    async mmListCount({ colId, parentId }, args) {
+      const { where } = baseModel._getListArgs(args as any);
+
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { mmContext, refContext } = relColOptions.getRelContext();
+
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return 0;
+      }
+
+      const assocBaseModel = await Model.getBaseModelSQL(mmContext, {
+        model: mmTable,
+        dbDriver: baseModel.dbDriver,
+      });
+
+      const vtn = assocBaseModel.getTnPath(mmTable);
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const refTable = await (await relColOptions.getParentColumn()).getModel();
+
+      const table = await (await relColOptions.getChildColumn()).getModel();
+      await table.getColumns();
+
+      const childBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: refTable,
+      });
+
+      const childTn = childBaseModel.getTnPath(refTable);
+      const parentTn = baseModel.getTnPath(table);
+
+      const rtn = childTn;
+
+      const qb = baseModel
+        .dbDriver(rtn)
+        .join(vtn, `${vtn}.${vrcn}`, `${rtn}.${rcn}`)
+        // .select({
+        //   [`${tn}_${vcn}`]: `${vtn}.${vcn}`
+        // })
+        .count(`${vtn}.${vcn}`, { as: 'count' })
+        .whereIn(
+          `${vtn}.${vcn}`,
+          baseModel
+            .dbDriver(parentTn)
+            .select(cn)
+            // .where(table.primaryKey.cn, id)
+            .where(_wherePk(table.primaryKeys, parentId)),
+        );
+
+      // Exclude soft-deleted records from MM count results
+      const mmCountSoftDeleteFilter =
+        await childBaseModel.getSoftDeleteFilter();
+      if (mmCountSoftDeleteFilter) qb.where(mmCountSoftDeleteFilter);
+
+      const aliasColObjMap = await refTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        refContext,
+        where,
+        aliasColObjMap,
+      );
+
+      await conditionV2(
+        // cast as any before further refactor
+        baseModel as any,
+        [
+          new Filter({
+            children: filterObj,
+            is_group: true,
+            logical_op: 'and',
+          }),
+        ],
+        qb,
+      );
+      return (
+        await baseModel.execAndParse(qb, null, { raw: true, first: true })
+      )?.count;
+    },
+
+    async getMmChildrenExcludedListCount(
+      { colId, pid = null },
+      args,
+    ): Promise<any> {
+      const { where } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext, mmContext } = relColOptions.getRelContext();
+
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return 0;
+      }
+      const assocBaseModel = await Model.getBaseModelSQL(mmContext, {
+        id: mmTable.id,
+        dbDriver: baseModel.dbDriver,
+      });
+
+      const vtn = assocBaseModel.getTnPath(mmTable);
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const childTable = await (
+        await relColOptions.getParentColumn()
+      ).getModel();
+
+      const childBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: childTable,
+      });
+
+      const childView = await relColOptions.getChildView(childTable);
+      const parentTable = await (
+        await relColOptions.getChildColumn()
+      ).getModel();
+      await parentTable.getColumns();
+
+      const parentBaseModel = await Model.getBaseModelSQL(baseModel.context, {
+        id: parentTable.id,
+        dbDriver: baseModel.dbDriver,
+      });
+      const childTn = childBaseModel.getTnPath(childTable);
+      const parentTn = parentBaseModel.getTnPath(parentTable);
+
+      const rtn = childTn;
+      const qb = baseModel
+        .dbDriver(rtn)
+        .count(`*`, { as: 'count' })
+        .where((qb) => {
+          qb.whereNotIn(
+            rcn,
+            baseModel
+              .dbDriver(rtn)
+              .select(`${rtn}.${rcn}`)
+              .join(vtn, `${rtn}.${rcn}`, `${vtn}.${vrcn}`)
+              .whereIn(
+                `${vtn}.${vcn}`,
+                baseModel
+                  .dbDriver(parentTn)
+                  .select(cn)
+                  // .where(parentTable.primaryKey.cn, pid)
+                  .where(_wherePk(parentTable.primaryKeys, pid)),
+              ),
+          ).orWhereNull(rcn);
+        });
+
+      // Exclude soft-deleted records from MM excluded count results
+      const mmExclCountSoftDeleteFilter =
+        await childBaseModel.getSoftDeleteFilter();
+      if (mmExclCountSoftDeleteFilter) qb.where(mmExclCountSoftDeleteFilter);
+
+      const aliasColObjMap = await childTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        childBaseModel.context,
+        where,
+        aliasColObjMap,
+      );
+
+      await childBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        // Guarded exactly as the matching LIST does. develop passed no table to
+        // getChildView here, so it returned a view only when fk_target_view_id was
+        // set; dropping the context arg shifted the optional table into the first
+        // slot and enabled the default-collaborative-view fallback, which applies
+        // that view's filters to the COUNT while the LIST stays unfiltered.
+        view: relColOptions.fk_target_view_id ? childView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: pid,
+      });
+
+      return (
+        await childBaseModel.execAndParse(qb, await childTable.getColumns(), {
+          raw: true,
+          first: true,
+        })
+      )?.count;
+    },
+
+    async getMmChildrenExcludedList({ colId, pid = null }, args): Promise<any> {
+      const { where, sort, ...rest } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const mmTable = await relColOptions.getMMModel();
+
+      // if mm table is not present then return
+      if (!mmTable) {
+        return [];
+      }
+
+      const { refContext, mmContext } = relColOptions.getRelContext();
+
+      const assocBaseModel = await Model.getBaseModelSQL(mmContext, {
+        id: mmTable.id,
+        dbDriver: baseModel.dbDriver,
+      });
+
+      const vtn = assocBaseModel.getTnPath(mmTable);
+      const vcn = (await relColOptions.getMMChildColumn()).column_name;
+      const vrcn = (await relColOptions.getMMParentColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const cn = (await relColOptions.getChildColumn()).column_name;
+
+      const refTable = await (await relColOptions.getParentColumn()).getModel();
+      const table = await (await relColOptions.getChildColumn()).getModel();
+      await table.getColumns();
+
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        id: refTable.id,
+      });
+      const refTn = refBaseModel.getTnPath(refTable);
+      const tn = baseModel.getTnPath(table);
+
+      const refView = await relColOptions.getChildView(refTable);
+      let listArgs: any = {};
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        refTable.id,
+      );
+
+      if (refView) {
+        const { dependencyFields } = await getAst(refContext, {
+          model: refTable,
+          // Honor explicit `fields` so a view-hidden requested column is still
+          // returned. Limited-access still collapses to pk/pv below.
+          query: { fields: (args as any)?.fields },
+          view: hasLimitedAccess ? null : refView,
+          throwErrorIfInvalidParams: false,
+          extractOnlyPrimaries: hasLimitedAccess,
+          allowRequestedHiddenFields: true,
+        });
+        listArgs = dependencyFields;
+      }
+
+      const rtn = refTn;
+
+      const qb = refBaseModel.dbDriver(rtn).where((qb) =>
+        qb
+          .whereNotIn(
+            rcn,
+            baseModel
+              .dbDriver(rtn)
+              .select(`${rtn}.${rcn}`)
+              .join(vtn, `${rtn}.${rcn}`, `${vtn}.${vrcn}`)
+              .whereIn(
+                `${vtn}.${vcn}`,
+                baseModel
+                  .dbDriver(tn)
+                  .select(cn)
+                  // .where(parentTable.primaryKey.cn, pid)
+                  .where(_wherePk(table.primaryKeys, pid)),
+              ),
+          )
+          .orWhereNull(rcn),
+      );
+
+      if (+rest?.shuffle) {
+        await this.shuffle({ qb });
+      }
+
+      // Exclude soft-deleted records from MM excluded list results
+      const mmExclListSoftDeleteFilter =
+        await refBaseModel.getSoftDeleteFilter();
+      if (mmExclListSoftDeleteFilter) qb.where(mmExclListSoftDeleteFilter);
+
+      await refBaseModel.selectObject({
+        qb,
+        fieldsSet: listArgs?.fieldsSet,
+        viewId: refView?.id,
+        pkAndPvOnly: relColOptions.isCrossBaseLink() || hasLimitedAccess,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+      });
+
+      const aliasColObjMap = await refTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        refContext,
+        where,
+        aliasColObjMap,
+      );
+
+      await refBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        view: relColOptions.fk_target_view_id ? refView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: pid,
+      });
+
+      await refBaseModel.applySortAndFilter({
+        table: refTable,
+        view: refView,
+        qb,
+        sort,
+        where,
+        // condition is applied in getCustomConditionsAndApply and we don't want to apply it again
+        onlySort: true,
+        prioritizePvSort: true,
+      });
+
+      applyPaginate(qb, rest);
+
+      const proto = await refBaseModel.getProto();
+      const data = await refBaseModel.execAndParse(
+        qb,
+        await refTable.getColumns(),
+      );
+      return await postProcessData(refContext, {
+        data: data.map((c) => {
+          c.__proto__ = proto;
+          return c;
+        }),
+        model: refTable,
+        query: args,
+        relationColumnId: colId,
+      });
+    },
+
+    async getHmChildrenExcludedList({ colId, pid = null }, args): Promise<any> {
+      const { where, sort, ...rest } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext } = relColOptions.getRelContext();
+
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const refTable = await (await relColOptions.getChildColumn()).getModel();
+      const table = await (await relColOptions.getParentColumn()).getModel();
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: refTable,
+      });
+      await table.getColumns();
+
+      const childView = await relColOptions.getChildView(refTable);
+
+      const childTn = refBaseModel.getTnPath(refTable);
+      const parentTn = baseModel.getTnPath(table);
+
+      const tn = childTn;
+      const rtn = parentTn;
+
+      const qb = refBaseModel.dbDriver(tn).where((qb) => {
+        qb.whereNotIn(
+          cn,
+          baseModel
+            .dbDriver(rtn)
+            .select(rcn)
+            // .where(parentTable.primaryKey.cn, pid)
+            .where(_wherePk(table.primaryKeys, pid)),
+        ).orWhereNull(cn);
+      });
+
+      if (+rest?.shuffle) {
+        await this.shuffle({ qb });
+      }
+
+      // Exclude soft-deleted records from HM excluded list results
+      const hmExclListSoftDeleteFilter =
+        await refBaseModel.getSoftDeleteFilter();
+      if (hmExclListSoftDeleteFilter) qb.where(hmExclListSoftDeleteFilter);
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        refTable.id,
+      );
+
+      await refBaseModel.selectObject({
+        qb,
+        pkAndPvOnly: relColOptions.isCrossBaseLink() || hasLimitedAccess,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+      });
+
+      const aliasColObjMap = await refTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        refContext,
+        where,
+        aliasColObjMap,
+      );
+      await refBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        view: relColOptions.fk_target_view_id ? childView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: pid,
+      });
+
+      await refBaseModel.applySortAndFilter({
+        table: refTable,
+        view: childView,
+        qb,
+        sort,
+        where,
+        // condition is applied in getCustomConditionsAndApply and we don't want to apply it again
+        onlySort: true,
+        prioritizePvSort: true,
+      });
+
+      applyPaginate(qb, rest);
+
+      const proto = await refBaseModel.getProto();
+      const data = await refBaseModel.execAndParse(
+        qb,
+        await refTable.getColumns(),
+      );
+      return await postProcessData(refContext, {
+        data: data.map((c) => {
+          c.__proto__ = proto;
+          return c;
+        }),
+        model: refTable,
+        query: args,
+        relationColumnId: colId,
+      });
+    },
+
+    async getHmChildrenExcludedListCount(
+      { colId, pid = null },
+      args,
+    ): Promise<any> {
+      const { where } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext } = relColOptions.getRelContext();
+
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const refTable = await (await relColOptions.getChildColumn()).getModel();
+      const table = await (await relColOptions.getParentColumn()).getModel();
+
+      const refView = await relColOptions.getChildView(refTable);
+
+      const refBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: refTable,
+      });
+
+      const childTn = refBaseModel.getTnPath(refTable);
+      const parentTn = baseModel.getTnPath(table);
+
+      const tn = childTn;
+      const rtn = parentTn;
+      await table.getColumns();
+
+      const qb = refBaseModel
+        .dbDriver(tn)
+        .count(`*`, { as: 'count' })
+        .where((qb) => {
+          qb.whereNotIn(
+            cn,
+            baseModel
+              .dbDriver(rtn)
+              .select(rcn)
+              // .where(parentTable.primaryKey.cn, pid)
+              .where(_wherePk(table.primaryKeys, pid)),
+          ).orWhereNull(cn);
+        });
+
+      // Exclude soft-deleted records from HM excluded count results
+      const hmExclCountSoftDeleteFilter =
+        await refBaseModel.getSoftDeleteFilter();
+      if (hmExclCountSoftDeleteFilter) qb.where(hmExclCountSoftDeleteFilter);
+
+      const aliasColObjMap = await refTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        refBaseModel.context,
+        where,
+        aliasColObjMap,
+      );
+
+      await refBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        // Guarded exactly as the matching LIST does. develop passed no table to
+        // getChildView here, so it returned a view only when fk_target_view_id was
+        // set; dropping the context arg shifted the optional table into the first
+        // slot and enabled the default-collaborative-view fallback, which applies
+        // that view's filters to the COUNT while the LIST stays unfiltered.
+        view: relColOptions.fk_target_view_id ? refView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: pid,
+      });
+
+      return (
+        await refBaseModel.execAndParse(qb, null, { raw: true, first: true })
+      )?.count;
+    },
+
+    async getExcludedOneToOneChildrenList(
+      { colId, cid = null },
+      args,
+    ): Promise<any> {
+      const { where, sort, ...rest } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext } = relColOptions.getRelContext();
+
+      // one-to-one relation is combination of both hm and bt to identify table which have
+      // foreign key column(similar to bt) we are adding a boolean flag `bt` under meta
+      const isBt = relColumn.meta?.bt;
+
+      const childContext = isBt ? baseModel.context : refContext;
+      const parentContext = isBt ? refContext : baseModel.context;
+
+      const parentCol = await relColOptions.getParentColumn();
+      const rcn = parentCol.column_name;
+      const parentTable = await parentCol.getModel();
+
+      const childCol = await relColOptions.getChildColumn();
+      const cn = childCol.column_name;
+      const childTable = await childCol.getModel();
+
+      const parentBaseModel = await Model.getBaseModelSQL(parentContext, {
+        dbDriver: baseModel.dbDriver,
+        model: parentTable,
+      });
+      const childBaseModel = await Model.getBaseModelSQL(childContext, {
+        dbDriver: baseModel.dbDriver,
+        model: childTable,
+      });
+
+      const targetView = await relColOptions.getChildView(
+        isBt ? parentTable : childTable,
+      );
+      let listArgs: any = {};
+      if (targetView) {
+        const { dependencyFields } = await getAst(refContext, {
+          model: isBt ? parentTable : childTable,
+          // Honor explicit `fields` so a view-hidden requested column is still
+          // returned. Limited-access still collapses to pk/pv below.
+          query: { fields: (args as any)?.fields },
+          view: targetView,
+          throwErrorIfInvalidParams: false,
+          allowRequestedHiddenFields: true,
+        });
+        listArgs = dependencyFields;
+      }
+
+      const rtn = parentBaseModel.getTnPath(parentTable);
+      const tn = childBaseModel.getTnPath(childTable);
+      await childTable.getColumns();
+      const refModel = isBt ? parentBaseModel : childBaseModel;
+
+      const qb = refModel.dbDriver(isBt ? rtn : tn).where((qb) => {
+        qb.whereNotIn(
+          isBt ? rcn : cn,
+          baseModel
+            .dbDriver(isBt ? tn : rtn)
+            .select(isBt ? cn : rcn)
+            .where(_wherePk((isBt ? childTable : parentTable).primaryKeys, cid))
+            .whereNotNull(isBt ? cn : rcn),
+        ).orWhereNull(isBt ? rcn : cn);
+      });
+
+      if (+rest?.shuffle) {
+        await this.shuffle({ qb });
+      }
+
+      // pre-load columns for later user
+      await parentTable.getColumns();
+      await childTable.getColumns();
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        (isBt ? parentTable : childTable).id,
+      );
+
+      await refModel.selectObject({
+        qb,
+        fieldsSet: listArgs.fieldsSet,
+        viewId: targetView?.id,
+        pkAndPvOnly: relColOptions.isCrossBaseLink() || hasLimitedAccess,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+      });
+
+      // extract col-alias map based on the correct relation table
+      const aliasColObjMap = await (isBt
+        ? parentTable
+        : childTable
+      ).getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        refModel.context,
+        where,
+        aliasColObjMap,
+      );
+
+      await refModel.getCustomConditionsAndApply({
+        column: relColumn,
+        view: relColOptions.fk_target_view_id ? targetView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: cid,
+      });
+
+      await refModel.applySortAndFilter({
+        table: isBt ? parentTable : childTable,
+        view: targetView,
+        qb,
+        sort,
+        where,
+        // condition is applied in getCustomConditionsAndApply and we don't want to apply it again
+        onlySort: true,
+        prioritizePvSort: true,
+      });
+
+      const ooExcludedListSoftDeleteFilter =
+        await refModel.getSoftDeleteFilter();
+      if (ooExcludedListSoftDeleteFilter)
+        qb.where(ooExcludedListSoftDeleteFilter);
+
+      applyPaginate(qb, rest);
+
+      const proto = await refModel.getProto();
+      const data = await refModel.execAndParse(
+        qb,
+        await (isBt ? parentTable : childTable).getColumns(),
+      );
+
+      return await postProcessData(refContext, {
+        data: data.map((c) => {
+          c.__proto__ = proto;
+          return c;
+        }),
+        model: isBt ? parentTable : childTable,
+        query: args,
+        relationColumnId: colId,
+      });
+    },
+
+    async getBtChildrenExcludedListCount(
+      { colId, cid = null },
+      args,
+    ): Promise<any> {
+      const { where } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext } = relColOptions.getRelContext();
+
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const parentTable = await (
+        await relColOptions.getParentColumn()
+      ).getModel();
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const childTable = await (
+        await relColOptions.getChildColumn()
+      ).getModel();
+
+      const parentBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: parentTable,
+      });
+
+      const childTn = baseModel.getTnPath(childTable);
+      const parentTn = parentBaseModel.getTnPath(parentTable);
+
+      const rtn = parentTn;
+      const tn = childTn;
+      await childTable.getColumns();
+
+      const qb = parentBaseModel
+        .dbDriver(rtn)
+        .where((qb) => {
+          qb.whereNotIn(
+            rcn,
+            baseModel
+              .dbDriver(tn)
+              .select(cn)
+              // .where(childTable.primaryKey.cn, cid)
+              .where(_wherePk(childTable.primaryKeys, cid))
+              .whereNotNull(cn),
+          );
+        })
+        .count(`*`, { as: 'count' });
+
+      const aliasColObjMap = await parentTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        parentBaseModel.context,
+        where,
+        aliasColObjMap,
+      );
+
+      const targetView = await relColOptions.getChildView(parentTable);
+
+      await parentBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        // Guarded exactly as the matching LIST does. develop passed no table to
+        // getChildView here, so it returned a view only when fk_target_view_id was
+        // set; dropping the context arg shifted the optional table into the first
+        // slot and enabled the default-collaborative-view fallback, which applies
+        // that view's filters to the COUNT while the LIST stays unfiltered.
+        view: relColOptions.fk_target_view_id ? targetView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: cid,
+      });
+
+      const btExcludedCountSoftDeleteFilter =
+        await parentBaseModel.getSoftDeleteFilter();
+      if (btExcludedCountSoftDeleteFilter)
+        qb.where(btExcludedCountSoftDeleteFilter);
+
+      return (
+        await parentBaseModel.execAndParse(qb, null, { raw: true, first: true })
+      )?.count;
+    },
+
+    async countExcludedOneToOneChildren(
+      { colId, cid = null },
+      args,
+    ): Promise<any> {
+      const { where } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { parentContext, childContext } =
+        await relColOptions.getParentChildContext();
+
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const parentTable = await (
+        await relColOptions.getParentColumn()
+      ).getModel();
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const childTable = await (
+        await relColOptions.getChildColumn()
+      ).getModel();
+
+      // NOTE: the list sibling resolves this from `isBt ? parentTable :
+      // childTable`. Leaving it as childTable here is inert because the guard
+      // below nulls the view unless fk_target_view_id is set, and in that case
+      // getChildView takes the View.get branch and ignores the table. Aligning
+      // it would need isBt hoisted above this call (it is declared later).
+      const childView = await relColOptions.getChildView(childTable);
+      const parentBaseModel = await Model.getBaseModelSQL(parentContext, {
+        dbDriver: baseModel.dbDriver,
+        model: parentTable,
+      });
+      const childBaseModel = await Model.getBaseModelSQL(childContext, {
+        dbDriver: baseModel.dbDriver,
+        model: childTable,
+      });
+      const childTn = childBaseModel.getTnPath(childTable);
+      const parentTn = parentBaseModel.getTnPath(parentTable);
+
+      const rtn = parentTn;
+      const tn = childTn;
+
+      // pre-load columns for later user
+      await childTable.getColumns();
+      await parentTable.getColumns();
+
+      // one-to-one relation is combination of both hm and bt to identify table which have
+      // foreign key column(similar to bt) we are adding a boolean flag `bt` under meta
+      const isBt = relColumn.meta?.bt;
+
+      const qb = baseModel
+        .dbDriver(isBt ? rtn : tn)
+        .where((qb) => {
+          qb.whereNotIn(
+            isBt ? rcn : cn,
+            baseModel
+              .dbDriver(isBt ? tn : rtn)
+              .select(isBt ? cn : rcn)
+              .where(
+                _wherePk((isBt ? childTable : parentTable).primaryKeys, cid),
+              )
+              .whereNotNull(isBt ? cn : rcn),
+          ).orWhereNull(isBt ? rcn : cn);
+        })
+        .count(`*`, { as: 'count' });
+
+      // extract col-alias map based on the correct relation table
+      const aliasColObjMap = await (isBt
+        ? parentTable
+        : childTable
+      ).getAliasColObjMap();
+
+      const refContext = isBt ? parentContext : childContext;
+      const refBaseModel = isBt ? parentBaseModel : childBaseModel;
+
+      const { filters: filterObj } = extractFilterFromXwhere(
+        refContext,
+        where,
+        aliasColObjMap,
+      );
+
+      await refBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        // Guarded exactly as the matching LIST does. develop passed no table to
+        // getChildView here, so it returned a view only when fk_target_view_id was
+        // set; dropping the context arg shifted the optional table into the first
+        // slot and enabled the default-collaborative-view fallback, which applies
+        // that view's filters to the COUNT while the LIST stays unfiltered.
+        view: relColOptions.fk_target_view_id ? childView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: cid,
+      });
+
+      const ooExcludedCountSoftDeleteFilter =
+        await refBaseModel.getSoftDeleteFilter();
+      if (ooExcludedCountSoftDeleteFilter)
+        qb.where(ooExcludedCountSoftDeleteFilter);
+
+      return (
+        await refBaseModel.execAndParse(qb, null, { raw: true, first: true })
+      )?.count;
+    },
+
+    async getBtChildrenExcludedList({ colId, cid = null }, args): Promise<any> {
+      const { where, sort, ...rest } = baseModel._getListArgs(args as any);
+      const relColumn = (await baseModel.model.getColumns()).find(
+        (c) => c.id === colId,
+      );
+      const relColOptions =
+        (await relColumn.getColOptions()) as LinkToAnotherRecordColumn;
+
+      const { refContext } = relColOptions.getRelContext();
+
+      const rcn = (await relColOptions.getParentColumn()).column_name;
+      const parentTable = await (
+        await relColOptions.getParentColumn()
+      ).getModel();
+      const cn = (await relColOptions.getChildColumn()).column_name;
+      const childTable = await (
+        await relColOptions.getChildColumn()
+      ).getModel();
+      const parentBaseModel = await Model.getBaseModelSQL(refContext, {
+        dbDriver: baseModel.dbDriver,
+        model: parentTable,
+      });
+
+      const childTn = baseModel.getTnPath(childTable);
+      const parentTn = parentBaseModel.getTnPath(parentTable);
+
+      const rtn = parentTn;
+      const tn = childTn;
+      await childTable.getColumns();
+
+      const qb = parentBaseModel.dbDriver(rtn).where((qb) => {
+        qb.whereNotIn(
+          rcn,
+          baseModel
+            .dbDriver(tn)
+            .select(cn)
+            // .where(childTable.primaryKey.cn, cid)
+            .where(_wherePk(childTable.primaryKeys, cid))
+            .whereNotNull(cn),
+        );
+      });
+
+      if (+rest?.shuffle) {
+        await this.shuffle({ qb });
+      }
+
+      const hasLimitedAccess = await hasLimitedRelatedTableAccess(
+        baseModel.context,
+        parentTable.id,
+      );
+
+      await parentBaseModel.selectObject({
+        qb,
+        pkAndPvOnly: relColOptions.isCrossBaseLink() || hasLimitedAccess,
+        fk_display_value_column_id: relColOptions.fk_display_value_column_id,
+      });
+
+      const aliasColObjMap = await parentTable.getAliasColObjMap();
+      const { filters: filterObj } = extractFilterFromXwhere(
+        parentBaseModel.context,
+        where,
+        aliasColObjMap,
+      );
+
+      const targetView = await relColOptions.getChildView(parentTable);
+      await parentBaseModel.getCustomConditionsAndApply({
+        column: relColumn,
+        view: relColOptions.fk_target_view_id ? targetView : null,
+        filters: filterObj,
+        args,
+        qb,
+        rowId: cid,
+      });
+
+      await parentBaseModel.applySortAndFilter({
+        table: parentTable,
+        view: targetView,
+        qb,
+        sort,
+        where,
+        // condition is applied in getCustomConditionsAndApply and we don't want to apply it again
+        onlySort: true,
+        prioritizePvSort: true,
+      });
+
+      const btExcludedListSoftDeleteFilter =
+        await parentBaseModel.getSoftDeleteFilter();
+      if (btExcludedListSoftDeleteFilter)
+        qb.where(btExcludedListSoftDeleteFilter);
+
+      applyPaginate(qb, rest);
+
+      const proto = await parentBaseModel.getProto();
+      const data = await parentBaseModel.execAndParse(
+        qb,
+        await parentTable.getColumns(),
+      );
+
+      return await postProcessData(refContext, {
+        data: data.map((c) => {
+          c.__proto__ = proto;
+          return c;
+        }),
+        model: parentTable,
+        query: args,
+        relationColumnId: colId,
+      });
+    },
+  };
+};

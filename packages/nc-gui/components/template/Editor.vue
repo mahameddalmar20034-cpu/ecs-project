@@ -1,0 +1,1640 @@
+<script setup lang="ts">
+import type { ColumnType, TableType } from 'nocodb-sdk'
+import { PermissionEntity, PermissionKey, RelationTypes, UITypes, isLinksOrLTAR, isSystemColumn, isVirtualCol } from 'nocodb-sdk'
+import type { CheckboxChangeEvent } from 'ant-design-vue/es/checkbox/interface'
+import { srcDestMappingColumns, tableColumns } from './utils'
+
+interface Props {
+  quickImportType: 'csv' | 'excel' | 'json'
+  baseTemplate: Record<string, any>
+  importData: Record<string, any>
+  importColumns: any[]
+  importDataOnly: boolean
+  maxRowsToParse: number
+  /** Parser settings shared with QuickImport (firstRowAsHeaders, etc.). */
+  parserConfig?: {
+    firstRowAsHeaders?: boolean
+    normalizeNested?: boolean
+    autoSelectFieldTypes?: boolean
+    maxRowsToParse?: number
+  }
+  /** What to do with parsed rows — mirrors FileImportOptions on the backend. */
+  options?: {
+    shouldImportData?: boolean
+    importDataOnly?: boolean
+    typecast?: boolean
+  }
+  baseId: string
+  sourceId: string
+  tableIcon?: string
+}
+
+interface Option {
+  label: string
+  value: string
+}
+
+const {
+  quickImportType,
+  baseTemplate,
+  importData,
+  importColumns,
+  importDataOnly,
+  maxRowsToParse,
+  parserConfig,
+  options,
+  baseId,
+  sourceId,
+} = defineProps<Props>()
+
+const emit = defineEmits(['import', 'error', 'change'])
+
+const { t } = useI18n()
+
+const { isAllowed } = usePermissions()
+
+const { appInfo } = useGlobal()
+
+const meta = inject(MetaInj, ref())
+
+const DEFAULT_LINK_DELIMITER = ','
+
+// Sentinel value for the "Create new field" option in the destination dropdown.
+// Selecting it flips the mapping into create-column mode instead of pointing at
+// an existing column.
+const CREATE_NEW_FIELD_VALUE = '__nc_create_new_field__'
+
+function getDestColumn(destCn?: string): ColumnType | undefined {
+  if (!destCn) return undefined
+  return (meta.value?.columns || []).find((c) => c.title === destCn)
+}
+
+function isLinkDest(destCn?: string): boolean {
+  const col = getDestColumn(destCn)
+  return !!col && isLinksOrLTAR(col)
+}
+
+// has-many / one-to-many / one-to-one links store an exclusive FK on the
+// child record. Linking a child that already belongs to another record
+// reassigns it — silently removing it from that other (existing) record.
+// many-to-many (junction) and belongs-to (own FK) carry no such risk.
+function isReassigningLinkDest(destCn?: string): boolean {
+  const col = getDestColumn(destCn)
+  if (!col || !isLinksOrLTAR(col)) return false
+  const relationType = (col as any).colOptions?.type
+  return (
+    relationType === RelationTypes.HAS_MANY ||
+    relationType === RelationTypes.ONE_TO_MANY ||
+    relationType === RelationTypes.ONE_TO_ONE
+  )
+}
+
+const filterForDestinationColumn = (col: ColumnType): boolean => {
+  if ([UITypes.ForeignKey, UITypes.ID].includes(col.uidt as UITypes)) {
+    return true
+  }
+  // Link columns are importable in data-only mode: their cells hold display
+  // values resolved to record links in a post-insert phase on the backend.
+  if (importDataOnly && isLinksOrLTAR(col)) {
+    return true
+  }
+  return !isSystemColumn(col) && !isVirtualCol(col) && !isAttachment(col)
+}
+
+const columns = computed(() =>
+  (meta.value?.columns || [])
+    ?.filter((col) => filterForDestinationColumn(col))
+    .map((col) => {
+      // If it is import data only, then we need to check if the field is editable
+      const isEditAllowed = importDataOnly ? isAllowed(PermissionEntity.FIELD, col.id!, PermissionKey.RECORD_FIELD_EDIT) : true
+
+      // We allow to link record throw foreign key, so we don't need to check if the field is readonly
+      const isReadonlyCol = col.readonly && col.uidt !== UITypes.ForeignKey
+
+      return {
+        ...col,
+        readonly: isReadonlyCol || !isEditAllowed,
+        permissions: {
+          isEditAllowed,
+          tooltip: isReadonlyCol
+            ? t('msg.info.fieldReadonly')
+            : !isEditAllowed
+            ? t('tooltip.youDontHavePermissionToEditThisField')
+            : '',
+        },
+      }
+    }),
+)
+
+const reloadHook = inject(ReloadViewDataHookInj, createEventHook())
+
+const reloadMetaHook = inject(ReloadViewMetaHookInj, createEventHook())
+
+const useForm = Form.useForm
+
+const { $api, $poller } = useNuxtApp()
+
+const { getMeta } = useMetas()
+
+const basesStore = useBases()
+
+const { bases } = storeToRefs(basesStore)
+
+const { activeWorkspace } = storeToRefs(useWorkspace())
+
+const baseStore = useBase()
+
+const { isMysql, isPg } = baseStore
+
+const { base: activeBase } = storeToRefs(baseStore)
+
+const base = computed(() => bases.value.get(baseId) || activeBase.value)
+
+const tablesStore = useTablesStore()
+const { openTable, loadProjectTables } = tablesStore
+const { baseTables } = storeToRefs(tablesStore)
+
+const hasSelectColumn = ref<boolean[]>([])
+
+const expansionPanel = ref<number[]>([])
+
+const autoInsertOption = ref<boolean>(false)
+
+const inputRefs = ref<HTMLInputElement[]>([])
+
+const isImporting = ref(false)
+
+const importingTips = ref<Record<string, string>>({})
+
+const importingTableTips = ref<Record<string, number>>({})
+
+const formError = ref()
+
+const srcDestMapping = ref<Record<string, Record<string, any>[]>>({})
+
+const data = reactive<{
+  title: string | null
+  name: string
+  tables: (TableType & {
+    ref_table_name: string
+    // Per-sheet "include in import" flag (multi-sheet Excel). Defaults to true;
+    // unchecking the sheet checkbox sets it false to exclude the sheet.
+    selected?: boolean
+    // Transient client-only metadata carried from the preview step (see
+    // QuickImport.vue) — used to group sheets by file and drive progress counts.
+    _serverAttachment?: Record<string, any>
+    _sheetName?: string
+    _totalRows?: number
+    columns: (ColumnType & { key: number; _disableSelect?: boolean })[]
+  })[]
+}>({
+  title: null,
+  name: 'Project Name',
+  tables: [],
+})
+
+const validators = computed(() =>
+  data.tables.reduce<Record<string, [ReturnType<typeof fieldRequiredValidator>]>>((acc: Record<string, any>, table, tableIdx) => {
+    acc[`tables.${tableIdx}.table_name`] = [
+      validateTableName,
+      {
+        validator: (_rule: any, value: any) => {
+          return new Promise<void>((resolve, reject) => {
+            if (!importDataOnly && data.tables.some((item, idx) => idx !== tableIdx && item.table_name === value)) {
+              return reject(new Error(t('msg.error.duplicateTableName')))
+            }
+            resolve()
+          })
+        },
+      },
+      {
+        validator: (_rule: any, value: any) => {
+          return new Promise<void>((resolve, reject) => {
+            if (value !== value?.trim()) {
+              return reject(new Error('Table names should not have whitespace in the beginning or their end.'))
+            }
+            resolve()
+          })
+        },
+      },
+      {
+        validator: (rule: any, value: any) => {
+          return new Promise<void>((resolve, reject) => {
+            let tableNameLengthLimit = 255
+            if (isMysql(sourceId)) {
+              tableNameLengthLimit = 64
+            } else if (isPg(sourceId)) {
+              tableNameLengthLimit = 63
+            }
+
+            const basePrefix = base?.value?.prefix || ''
+            if ((basePrefix + value).length > tableNameLengthLimit) {
+              return reject(new Error(`Table name exceeds ${tableNameLengthLimit} characters`))
+            }
+            resolve()
+          })
+        },
+      },
+    ]
+
+    acc[`tables.${tableIdx}.columns`] = [
+      {
+        validator: (_rule: any, value: any) => {
+          return new Promise<void>((resolve, reject) => {
+            // An included sheet must keep at least one field selected. An excluded
+            // sheet (checkbox off) is exempt — it isn't imported, so it neither
+            // errors nor blocks the import. The validator reads the live
+            // `table.selected`, so toggling the sheet re-evaluates it in place.
+            if (!importDataOnly && ncIsArray(value) && !value.some((item) => item.selected) && table.selected !== false) {
+              return reject(new Error(t('msg.error.selectAtleastOneColumn')))
+            }
+
+            resolve()
+          })
+        },
+      },
+    ]
+
+    hasSelectColumn.value[tableIdx] = false
+
+    table.columns?.forEach((column, columnIdx) => {
+      acc[`tables.${tableIdx}.columns.${columnIdx}.title`] = [
+        fieldRequiredValidator(),
+        {
+          validator: (_rule: any, value: any) => {
+            return new Promise<void>((resolve, reject) => {
+              const field = table.columns.find((_item, idx) => idx === columnIdx)
+
+              if (!field || !field?.selected) return resolve()
+
+              const fieldToCheck = table.columns.filter((item) => item.selected)
+              if (
+                fieldToCheck.length &&
+                table.columns.some((item, idx) => idx !== columnIdx && item.selected && item.title === value)
+              ) {
+                return reject(new Error(t('msg.error.duplicateColumnName')))
+              }
+              resolve()
+            })
+          },
+        },
+        {
+          validator: (rule: any, value: any) => {
+            return new Promise<void>((resolve, reject) => {
+              const field = table.columns.find((_item, idx) => idx === columnIdx)
+
+              if (!field || !field?.selected) return resolve()
+
+              return reservedFieldNameValidator()
+                .validator(rule, value)
+                .then(() => {
+                  resolve()
+                })
+                .catch((e) => {
+                  reject(e)
+                })
+            })
+          },
+        },
+        {
+          validator: (rule: any, value: any) => {
+            return new Promise<void>((resolve, reject) => {
+              const field = table.columns.find((_item, idx) => idx === columnIdx)
+
+              if (!field || !field?.selected) return resolve()
+
+              return fieldLengthValidator()
+                .validator(rule, value)
+                .then(() => {
+                  resolve()
+                })
+                .catch((e) => {
+                  reject(e)
+                })
+            })
+          },
+        },
+      ]
+      acc[`tables.${tableIdx}.columns.${columnIdx}.uidt`] = [fieldRequiredValidator()]
+      if (isSelect(column)) {
+        hasSelectColumn.value[tableIdx] = true
+      }
+    })
+
+    return acc
+  }, {}),
+)
+
+const { validate, validateInfos, modelRef } = useForm(data, validators)
+
+const isValid = ref(!importDataOnly)
+
+const importError = ref('')
+
+// The per-sheet "include in import" checkbox applies to any multi-sheet import —
+// creating new tables or uploading into existing ones. Single-sheet sources
+// (CSV / JSON / one-sheet Excel) never show it.
+const showSheetSelection = computed(() => data.tables.length > 1)
+
+// A sheet the user excluded (per-sheet checkbox off) isn't imported.
+const isSheetExcluded = (tableName?: string) => data.tables.find((t) => t.table_name === tableName)?.selected === false
+
+// Import is allowed only when at least one sheet is included. For new-table
+// imports every included sheet must also keep a selected field; for upload-into-
+// existing the mapping validity is handled separately (isValid).
+const canImport = computed(() => {
+  const includedTables = data.tables.filter((t) => t.selected !== false)
+  if (!includedTables.length) return false
+  if (importDataOnly) return true
+  return includedTables.every((t) => (t.columns as any[])?.some((c) => c.selected) ?? false)
+})
+
+const formRef = ref()
+
+watch(
+  [() => srcDestMapping.value, () => data.tables.map((t) => t.selected)],
+  () => {
+    let res = true
+    if (importDataOnly) {
+      for (const tn of Object.keys(srcDestMapping.value)) {
+        // Excluded sheets aren't uploaded, so their mapping needn't be valid.
+        if (isSheetExcluded(tn)) continue
+        let flag = false
+        if (atLeastOneEnabledValidation(tn)) {
+          res = false
+        }
+        for (const record of srcDestMapping.value[tn]) {
+          if (!fieldsValidation(record, tn)) {
+            res = false
+            flag = true
+            break
+          }
+        }
+        if (flag) {
+          break
+        }
+      }
+    } else {
+      for (const [_, o] of Object.entries(validateInfos)) {
+        if (o?.validateStatus) {
+          if (o.validateStatus === 'error') {
+            res = false
+          }
+        }
+      }
+    }
+    isValid.value = res
+  },
+  { deep: true },
+)
+
+onMounted(() => {
+  parseAndLoadTemplate()
+
+  if (importDataOnly) {
+    mapDefaultColumns()
+  }
+
+  nextTick(() => {
+    inputRefs.value[0]?.focus()
+  })
+})
+
+function filterOption(input: string, option: Option) {
+  // Keep the "Create new field" action visible regardless of the search term.
+  if (option.value === CREATE_NEW_FIELD_VALUE) return true
+  return option.value.toUpperCase().includes(input.toUpperCase())
+}
+
+// Build a unique title for a newly-created field, avoiding clashes with existing
+// table columns and with titles already chosen by other source-column mappings.
+function getUniqueNewFieldTitle(baseTitle: string, tn: string) {
+  const taken = new Set<string>()
+  for (const c of meta.value?.columns || []) {
+    if (c.title) taken.add(c.title)
+  }
+  for (const r of srcDestMapping.value[tn] || []) {
+    if (r.destCn) taken.add(r.destCn)
+  }
+
+  const base = (baseTitle || '').trim() || 'Field'
+  let title = base
+  let i = 1
+  while (taken.has(title)) {
+    title = `${base} ${i++}`
+  }
+  return title
+}
+
+// Handle a destination selection: the sentinel flips the row into create-column
+// mode (named after the source column), anything else maps to an existing field.
+function handleDestChange(value: string | undefined, record: Record<string, any>, tn: string) {
+  if (value === CREATE_NEW_FIELD_VALUE) {
+    record.createColumn = true
+    record.destCn = getUniqueNewFieldTitle(record.srcTitle, tn)
+    record.enabled = true
+    return
+  }
+
+  record.createColumn = false
+  record.enabled = !!value
+}
+
+// Revert a create-column row back to an unmapped state.
+function clearCreateColumn(record: Record<string, any>) {
+  record.createColumn = false
+  record.destCn = undefined
+  record.enabled = false
+}
+
+function parseAndLoadTemplate() {
+  if (baseTemplate) {
+    parseTemplate(baseTemplate)
+
+    expansionPanel.value = Array.from({ length: data.tables.length || 0 }, (_, i) => i)
+
+    hasSelectColumn.value = Array.from({ length: data.tables.length || 0 }, () => false)
+  }
+}
+
+function parseTemplate({ tables = [], ...rest }: Props['baseTemplate']) {
+  const parsedTemplate = {
+    ...rest,
+    tables: tables.map(({ v = [], columns = [], ...rest }) => ({
+      ...rest,
+      // Default every sheet to "included". The per-sheet checkbox (shown only
+      // for multi-sheet imports) flips this to false to exclude a sheet.
+      selected: true,
+      columns: [
+        ...columns.map((c: any, idx: number) => {
+          if (!importDataOnly && c.column_name?.toLowerCase() === 'id') {
+            const cn = populateUniqueColumnName('id', [], columns)
+            c.column_name = cn
+          }
+          c.key = idx
+          c.selected = true
+          return c
+        }),
+        ...v.map((v: any) => ({
+          column_name: v.title,
+          selected: true,
+          table_name: {
+            ...v,
+          },
+        })),
+      ],
+    })),
+  }
+
+  Object.assign(data, parsedTemplate)
+}
+
+function isSelect(col: ColumnType) {
+  return col.uidt === 'MultiSelect' || col.uidt === 'SingleSelect'
+}
+
+function _deleteTable(tableIdx: number) {
+  data.tables.splice(tableIdx, 1)
+}
+
+function missingRequiredColumnsValidation(tn: string, showError = false) {
+  const missingRequiredColumns = columns.value.filter(
+    (c: Record<string, any>) =>
+      (c.pk ? !c.ai && !c.cdf && !c.meta?.ag : !c.cdf && c.rqd) &&
+      !(srcDestMapping.value[tn] || []).some((r: Record<string, any>) => r.destCn === c.title),
+  )
+
+  if (missingRequiredColumns.length) {
+    const error = `${t('msg.error.columnsRequired')} : ${missingRequiredColumns.map((c) => c.title).join(', ')}`
+    if (showError) {
+      message.error(error)
+    } else {
+      return error
+    }
+
+    return true
+  }
+
+  return false
+}
+
+function atLeastOneEnabledValidation(tn: string, showError = false) {
+  if ((srcDestMapping.value[tn] || []).filter((v: Record<string, any>) => v.enabled === true).length === 0) {
+    const err = t('msg.error.selectAtleastOneColumn')
+    if (showError) {
+      message.error(err)
+    } else {
+      return err
+    }
+
+    return true
+  }
+  return false
+}
+
+function getUnselectedFields(record: Record<string, any>, tn: string) {
+  // if it is not selected, then pass validation
+  const allRecord = srcDestMapping.value[tn]
+
+  return columns.value.filter((c) => {
+    // Exclude columns that are already mapped, except for the current record's `destCn`
+
+    return !allRecord?.some((item) => item.srcTitle !== record.srcTitle && item.destCn === c.title)
+  })
+}
+
+function fieldsValidation(record: Record<string, any>, tn: string) {
+  // if it is not selected, then pass validation
+  if (!record.enabled) {
+    return true
+  }
+
+  if (!record.destCn) {
+    message.error(`${t('msg.error.columnDescriptionNotFound')} ${record.srcTitle}`)
+    return false
+  }
+
+  if ((srcDestMapping.value[tn] || []).filter((v: Record<string, any>) => v.destCn === record.destCn).length > 1) {
+    message.error(t('msg.error.duplicateMappingFound'))
+    return false
+  }
+
+  // New columns are created as text and accept any value — there is no existing
+  // destination column to type-check against, so the row is valid as-is.
+  if (record.createColumn) {
+    return true
+  }
+
+  const v = columns.value.find((c) => c.title === record.destCn) as Record<string, any>
+
+  if (!v) {
+    message.error(`Column '${record.destCn}' not found`)
+    return false
+  }
+
+  for (const tableName of Object.keys(importData)) {
+    // check if the input contains null value for a required column
+    if (v.pk ? !v.ai && !v.cdf : !v.cdf && v.rqd) {
+      if (
+        importData[tableName]
+          .slice(0, maxRowsToParse)
+          .some((r: Record<string, any>) => r[record.srcCn] === null || r[record.srcCn] === undefined || r[record.srcCn] === '')
+      ) {
+        message.error(t('msg.error.nullValueViolatesNotNull'))
+      }
+    }
+
+    switch (v.uidt) {
+      case UITypes.Number:
+        if (
+          importData[tableName]
+            .slice(0, maxRowsToParse)
+            .some(
+              (r: Record<string, any>) => r[record.sourceCn] !== null && r[record.srcCn] !== undefined && isNaN(+r[record.srcCn]),
+            )
+        ) {
+          message.error(t('msg.error.sourceHasInvalidNumbers'))
+          return false
+        }
+
+        break
+      case UITypes.Checkbox:
+        if (
+          importData[tableName].slice(0, maxRowsToParse).some((r: Record<string, any>) => {
+            if (r[record.srcCn] !== null && r[record.srcCn] !== undefined) {
+              let input = r[record.srcCn]
+              if (typeof input === 'string') {
+                input = input.replace(/["']/g, '').toLowerCase().trim()
+                return !(
+                  input === 'false' ||
+                  input === 'no' ||
+                  input === 'n' ||
+                  input === '0' ||
+                  input === 'true' ||
+                  input === 'yes' ||
+                  input === 'y' ||
+                  input === '1'
+                )
+              }
+
+              return input !== 1 && input !== 0 && input !== true && input !== false
+            }
+            return false
+          })
+        ) {
+          message.error(t('msg.error.sourceHasInvalidBoolean'))
+          return false
+        }
+        break
+    }
+  }
+  return true
+}
+
+function updateImportTips(baseName: string, tableName: string, progress: number, total: number) {
+  importingTips.value[`${baseName}-${tableName}`] = `Importing data to ${baseName} - ${tableName}: ${progress}/${total} records`
+  const percent = total > 0 ? parseInt(`${(progress / total) * 100}`) : 0
+  // Store with both table_name and title as key for template compatibility
+  importingTableTips.value[tableName] = percent
+}
+
+interface ImportFinalStats {
+  rowsInserted: number
+  rowsFailed: number
+  linksCreated?: number
+  valuesUnmatched?: number
+  linksFailed?: number
+  sampleError?: string
+}
+
+// Tables the last import wrote to, in sheet order — the first one is opened afterwards.
+const importedTableIds = ref<string[]>([])
+
+// Show a row-aware toast for the data-import job: success when everything
+// landed, a sticky error when nothing did, a warning for partial failures.
+// Default `message.success` here was masking DB-level rejections (date /
+// numeric / CHAR-width constraint errors etc.) because the poller treated
+// every 'completed' event as a success regardless of failed-row counts.
+function surfaceImportResult(stats: ImportFinalStats | undefined) {
+  // Links can come up short two ways: a display value matched no record
+  // (unmatched, skipped) or it matched but the link write failed (failed).
+  // Surface each as a soft warning so the user knows links were only partially
+  // created, but the import still ran.
+  const warnLinkIssues = () => {
+    if (stats?.valuesUnmatched) {
+      message.warning({
+        content: t('msg.warning.tableDataImportedLinksUnmatched', {
+          links: stats.linksCreated ?? 0,
+          unmatched: stats.valuesUnmatched,
+        }),
+        duration: 10,
+      })
+    }
+    if (stats?.linksFailed) {
+      message.warning({
+        content: t('msg.warning.tableDataImportedLinksFailed', {
+          failed: stats.linksFailed,
+        }),
+        duration: 10,
+      })
+    }
+  }
+
+  if (!stats || stats.rowsFailed === 0) {
+    if (stats?.valuesUnmatched || stats?.linksFailed) {
+      warnLinkIssues()
+      return
+    }
+    message.toast(t('msg.success.tableDataImported'))
+    return
+  }
+
+  const params: Record<string, string | number> = {
+    inserted: stats.rowsInserted,
+    failed: stats.rowsFailed,
+  }
+  if (stats.sampleError) params.error = stats.sampleError
+
+  if (stats.rowsInserted === 0) {
+    const key = stats.sampleError ? 'msg.error.tableDataImportFailedWithReason' : 'msg.error.tableDataImportFailed'
+    // duration: 0 keeps the toast pinned until the user dismisses it
+    message.error({
+      content: t(key, params, stats.rowsFailed),
+      duration: 0,
+    })
+  } else {
+    const key = stats.sampleError ? 'msg.error.tableDataImportPartialWithReason' : 'msg.error.tableDataImportPartial'
+    message.warning({
+      content: t(key, params, stats.rowsFailed),
+      duration: 10,
+    })
+  }
+
+  // Row failures and link issues can co-occur; the partial-failure toast
+  // above only reports rows, so surface skipped/failed links separately.
+  warnLinkIssues()
+}
+
+// One import job per uploaded file. Each job carries all the sheets that
+// came from that file, so the file is opened and deleted exactly once.
+async function importViaJob() {
+  isImporting.value = true
+  expansionPanel.value = []
+
+  let importFinalStats: ImportFinalStats | undefined
+
+  importedTableIds.value = []
+
+  try {
+    if (!importDataOnly) await validate()
+
+    const parserCfg = {
+      firstRowAsHeaders:
+        quickImportType === 'excel' || quickImportType === 'csv' ? parserConfig?.firstRowAsHeaders ?? true : false,
+      normalizeNested: quickImportType === 'json' ? parserConfig?.normalizeNested ?? true : false,
+      maxRowsToParse,
+      autoSelectFieldTypes: parserConfig?.autoSelectFieldTypes ?? true,
+    }
+    const opts = {
+      shouldImportData: options?.shouldImportData ?? true,
+      importDataOnly,
+      typecast: isEeUI && autoInsertOption.value,
+    }
+
+    // Group editor tables by the file they came from.
+    const groups = new Map<any, typeof data.tables>()
+    for (const table of data.tables) {
+      // Skip sheets the user excluded via the per-sheet checkbox — they never
+      // enter the job payload (both new-table and upload-into-existing imports),
+      // which is why no backend change is needed.
+      if (table.selected === false) continue
+
+      const key = table._serverAttachment
+      if (!groups.has(key)) groups.set(key, [] as any)
+      groups.get(key)!.push(table)
+    }
+
+    for (const [attachment, tables] of groups) {
+      const sheets: any[] = []
+      const trackedNames: string[] = []
+      const totals: Record<string, number> = {}
+
+      for (const table of tables) {
+        if (importDataOnly) {
+          const errors = getErrorByTableName(table.table_name)
+          if (errors.length) throw new Error(errors[0])
+        }
+
+        sheets.push({
+          sheetName: table._sheetName,
+          tableName: table.table_name,
+          tableId: importDataOnly ? meta.value?.id : undefined,
+          columns: (table.columns as any[])
+            ?.filter((c) => !('selected' in c) || c.selected)
+            .map((c) => ({
+              title: c.title,
+              column_name: c.column_name,
+              uidt: c.uidt,
+              key: c.key,
+              meta: c.meta,
+              dtxp: c.dtxp,
+              path: c.path,
+            })),
+          columnMapping: importDataOnly
+            ? srcDestMapping.value[table.table_name]?.map((m: any) => ({
+                sourceCn: m.srcCn,
+                destCn: m.destCn,
+                enabled: m.enabled,
+                ...(m.createColumn ? { createColumn: true } : {}),
+                ...(!m.createColumn && isLinkDest(m.destCn)
+                  ? { linkConfig: { delimiter: m.delimiter || DEFAULT_LINK_DELIMITER } }
+                  : {}),
+              }))
+            : undefined,
+        })
+
+        trackedNames.push(table.table_name)
+        totals[table.table_name] = table._totalRows || 0
+      }
+
+      const jobResult = await $api.internal.postOperation(
+        activeWorkspace.value?.id,
+        base.value.id,
+        {
+          operation: 'dataImportFile',
+          baseId: base.value.id,
+          sourceId: sourceId || base.value?.sources?.[0]?.id,
+        },
+        {
+          importType: quickImportType,
+          sourceId: sourceId || base.value?.sources?.[0]?.id,
+          attachment,
+          parserConfig: parserCfg,
+          options: opts,
+          sheets,
+        },
+      )
+      const jobId = (jobResult as any).id
+      const baseName = base.value.title as string
+
+      await new Promise<void>((resolve, reject) => {
+        $poller.subscribe(
+          { id: jobId },
+          (pollerData: { id: string; status?: string; data?: { error?: { message: string }; message?: string } }) => {
+            if (pollerData.status === 'close' || pollerData.status === 'completed') return resolve()
+            if (pollerData.status === 'failed') {
+              return reject(new Error(pollerData.data?.error?.message || 'Import failed'))
+            }
+            if (!pollerData.data?.message) return
+
+            try {
+              const progress = JSON.parse(pollerData.data.message)
+              if (progress.status === 'progress') {
+                const tname = trackedNames.includes(progress.tableName) ? progress.tableName : trackedNames[0]
+                const total = totals[tname] || progress.totalProcessed || 0
+                updateImportTips(baseName, tname, progress.totalProcessed || 0, total)
+              } else if (progress.status === 'completed') {
+                // Capture final counters so the toast below can distinguish
+                // success / partial / total failure — without this the UI
+                // always reports success even when the DB rejected rows.
+                importFinalStats = {
+                  rowsInserted: Number(progress.rowsInserted) || 0,
+                  rowsFailed: Number(progress.rowsFailed) || 0,
+                  linksCreated: Number(progress.linksCreated) || 0,
+                  valuesUnmatched: Number(progress.valuesUnmatched) || 0,
+                  linksFailed: Number(progress.linksFailed) || 0,
+                  sampleError: typeof progress.sampleError === 'string' ? progress.sampleError : undefined,
+                }
+
+                if (Array.isArray(progress.tableIds)) importedTableIds.value.push(...progress.tableIds)
+              }
+            } catch {
+              // plain-text log — ignore
+            }
+          },
+        )
+      })
+    }
+
+    if (importDataOnly) {
+      // A data-only import can now create new fields on the target table. Those
+      // are added by the backend job, so the open view's meta is stale — force a
+      // meta refresh (and notify view listeners) so the new columns appear
+      // without a manual page reload. Only when a create-field mapping ran.
+      const createdNewField = Object.values(srcDestMapping.value).some((rows) =>
+        (rows as Record<string, any>[]).some((r) => r.enabled && r.createColumn),
+      )
+      if (createdNewField && meta.value?.base_id && meta.value?.id) {
+        await getMeta(meta.value.base_id, meta.value.id, true)
+        reloadMetaHook.trigger()
+      }
+      reloadHook.trigger()
+      surfaceImportResult(importFinalStats)
+    } else {
+      await loadProjectTables(base.value.id, true)
+      if (importFinalStats && importFinalStats.rowsFailed > 0) {
+        surfaceImportResult(importFinalStats)
+      } else {
+        message.toast(t(`msg.success.${data.tables.length > 1 ? 'tableImportedPlural' : 'tableImported'}`))
+      }
+    }
+  } finally {
+    isImporting.value = false
+  }
+}
+
+async function importTemplate() {
+  await importViaJob()
+
+  // A data-only import already has its table open.
+  if (importDataOnly || !importedTableIds.value.length) return
+
+  const tables = baseTables.value.get(base.value!.id!)
+  const toBeNavigatedTable = tables?.find((t) => t.id === importedTableIds.value[0])
+  if (!toBeNavigatedTable) return
+
+  openTable(toBeNavigatedTable)
+}
+
+function mapDefaultColumns() {
+  srcDestMapping.value = {}
+  for (let i = 0; i < data.tables.length; i++) {
+    const tableName = data.tables[i]?.table_name as string
+
+    // Seed an entry for EVERY table up front, even one with no import columns
+    // (e.g. an empty sheet). The key used to be created only inside the column
+    // loop below, so a column-less table got no entry — and every accessor that
+    // indexes srcDestMapping by table name (handleCheckAllRecord's `for..of`,
+    // the required-column validation, etc.) then hit `undefined`. This keeps the
+    // invariant: every table rendered from `data.tables` has a mapping entry.
+    const mapping = (srcDestMapping.value[tableName] ??= [])
+
+    for (const col of importColumns[i] || []) {
+      const o = {
+        srcCn: col.column_name,
+        srcTitle: col.title,
+        destCn: undefined as string | undefined,
+        enabled: true,
+        createColumn: false,
+        delimiter: DEFAULT_LINK_DELIMITER,
+      }
+      if (columns.value) {
+        const tableColumn = columns.value.find((c) => !c.readonly && (c.title === col.title || c.column_name === col.column_name))
+        if (tableColumn) {
+          o.destCn = tableColumn.title as string
+        } else {
+          o.enabled = false
+        }
+      }
+      mapping.push(o)
+    }
+  }
+}
+
+defineExpose({
+  importTemplate,
+  isValid,
+  canImport,
+  importError,
+  updateImportError: (err: string) => {
+    importError.value = err
+  },
+})
+
+function getMappedColumns(tableName: string) {
+  return (srcDestMapping.value[tableName] || []).filter((item) => item.destCn)
+}
+
+function isAllMappedSelected(tableName: string) {
+  const cols = getMappedColumns(tableName)
+  return !!cols.length && getMappedColumns(tableName).every((item) => item.enabled)
+}
+
+function isSomeMappedSelected(tableName: string) {
+  const cols = getMappedColumns(tableName)
+
+  return cols.length && getMappedColumns(tableName).some((item) => item.destCn && item.enabled)
+}
+
+function handleCheckAllRecord(event: CheckboxChangeEvent, tableName: string) {
+  const isChecked = event.target.checked
+  // Defensive: mapDefaultColumns now seeds an entry for every table, but keep
+  // the `|| []` fallback (matching the other accessors) so a not-yet-built
+  // mapping can't throw "not iterable".
+  for (const record of srcDestMapping.value[tableName] || []) {
+    if (!record.destCn && isChecked) continue
+
+    record.enabled = isChecked
+  }
+}
+
+const setErrorState = (errorsFields: any[] = []) => {
+  const errorMap: any = {}
+  for (const error of errorsFields) {
+    errorMap[error.name] = error.errors
+  }
+
+  formError.value = errorMap
+}
+
+function populateUniqueColumnName(cn: string, draftCn: string[] = [], columns: ColumnType[]) {
+  let c = 2
+  let columnName = `${cn}${1}`
+  while (
+    draftCn.includes(columnName) ||
+    columns?.some((c) => {
+      return c.column_name === columnName || c.title === columnName
+    })
+  ) {
+    columnName = `${cn}${c++}`
+  }
+  return columnName
+}
+
+watch(formRef, () => {
+  setTimeout(async () => {
+    try {
+      await validate()
+      emit('change')
+      formError.value = null
+    } catch (e: any) {
+      emit('error', e)
+      setErrorState(e?.errorFields)
+    }
+  }, 500)
+})
+
+watch(modelRef, async () => {
+  try {
+    await validate()
+    emit('change')
+    formError.value = null
+  } catch (e: any) {
+    emit('error', e)
+    setErrorState(e?.errorFields)
+  }
+})
+
+function toggleTableSelecteds(table: any) {
+  if (table.columns.every((it: any) => it.selected)) {
+    for (const column of table.columns) {
+      column.selected = false
+    }
+  } else {
+    for (const column of table.columns) {
+      column.selected = true
+    }
+  }
+}
+
+const currentColumnToEdit = ref('')
+const currentTableToEdit = ref<number | undefined>()
+
+const getErrorForTable = (tableIdx: number) => {
+  const errors = [...(formError.value?.[`tables.${tableIdx}.table_name`] || [])]
+
+  // "At least one field" is derived reactively from the live selection instead of
+  // ant's validate() — validate() skips a field whose value hasn't changed, so it
+  // wouldn't refresh when a sheet is re-included without touching its fields. An
+  // excluded sheet (checkbox off) is exempt.
+  const table = data.tables[tableIdx]
+  if (table && table.selected !== false && !(table.columns as any[])?.some((c) => c.selected)) {
+    errors.push(t('msg.error.selectAtleastOneColumn'))
+  }
+
+  return errors
+}
+
+function getErrorByTableName(tableName: string) {
+  // Excluded sheets aren't uploaded, so they must not surface an error.
+  if (isSheetExcluded(tableName)) return []
+
+  const errors = []
+
+  const atLeastOneEnabledValidationErr = atLeastOneEnabledValidation(tableName)
+
+  if (atLeastOneEnabledValidationErr) {
+    errors.push(atLeastOneEnabledValidationErr)
+  }
+
+  const missingRequiredColumnsValidationErr = missingRequiredColumnsValidation(tableName)
+
+  if (missingRequiredColumnsValidationErr) {
+    errors.push(missingRequiredColumnsValidationErr)
+  }
+
+  return errors
+}
+</script>
+
+<template>
+  <div class="relative text-nc-content-gray">
+    <div v-if="importDataOnly">
+      <a-form :model="data" name="import-only">
+        <p v-if="data.tables && quickImportType === 'excel'" class="text-center">
+          {{ data.tables.length }} sheet{{ data.tables.length > 1 ? 's' : '' }}
+          available for import
+        </p>
+      </a-form>
+
+      <a-collapse
+        v-if="data.tables && data.tables.length"
+        v-model:active-key="expansionPanel"
+        class="template-collapse !rounded-lg !overflow-hidden"
+        accordion
+        expand-icon-position="right"
+      >
+        <template #expandIcon="{ isActive }">
+          <GeneralIcon
+            v-if="!isImporting"
+            icon="ncChevronDown"
+            class="text-lg !-translate-y-1/2 !transition text-nc-content-gray-subtle"
+            :class="{ '!transform !rotate-180': isActive }"
+          />
+        </template>
+
+        <a-collapse-panel
+          v-for="(table, tableIdx) of data.tables"
+          :key="tableIdx"
+          class="nc-import-table-box nc-upload-box !overflow-hidden"
+          :class="{
+            'pointer-events-none': isImporting,
+          }"
+        >
+          <template #header>
+            <div
+              class="flex items-center space-x-3 group min-h-8"
+              :class="{
+                'w-[calc(100%_-_30px)]': !isImporting,
+                'w-full': isImporting,
+              }"
+            >
+              <span v-if="!isImporting && showSheetSelection" class="flex flex-none" @click.stop>
+                <NcCheckbox
+                  v-model:checked="table.selected"
+                  v-e="['c:quick-import:sheet:toggle']"
+                  :data-testid="`nc-import-sheet-select-${table.table_name}`"
+                />
+              </span>
+              <div class="w-8 h-8 flex items-center justify-center bg-nc-bg-gray-extralight rounded-md">
+                <GeneralIcon :icon="tableIcon" class="w-5 h-5" />
+              </div>
+              <NcTooltip :title="table.table_name" show-on-truncate-only class="flex-1 truncate text-nc-content-gray">
+                <span>
+                  {{ table.table_name }}
+                </span>
+              </NcTooltip>
+              <span
+                v-if="showSheetSelection && table.selected === false"
+                class="flex-none text-bodySm text-nc-content-gray-subtle2 whitespace-nowrap"
+              >
+                {{ $t('activity.sheetExcludedFromImport') }}
+              </span>
+              <NcTooltip v-if="!isImporting && getErrorByTableName(table.table_name).length" class="ml-2">
+                <template #title>
+                  <div v-for="(err, idx) of getErrorByTableName(table.table_name)" :key="idx" class="mb-1 last-of-type:mb-0">
+                    {{ idx > 0 ? `${idx + 1}.` : '' }} {{ err }}
+                  </div>
+                </template>
+                <NcBadge color="red" :border="false" class="w-8 !px-2 flex-none !bg-nc-bg-red-light">
+                  <GeneralIcon icon="ncInfo" class="text-nc-content-red-dark" />
+                </NcBadge>
+              </NcTooltip>
+              <div v-if="isImporting && table.selected !== false" class="w-[150px]">
+                <a-progress
+                  :percent="importingTableTips[table.table_name] ?? 0"
+                  size="small"
+                  status="normal"
+                  stroke-color="var(--nc-content-brand)"
+                  trail-color="var(--nc-bg-brand-inverted)"
+                />
+              </div>
+            </div>
+          </template>
+          <div
+            v-if="srcDestMapping"
+            class="bg-nc-bg-gray-extralight pl-4 flex-1 flex"
+            :class="{ 'opacity-50 pointer-events-none': table.selected === false }"
+          >
+            <NcTable
+              class="template-form flex-1 max-h-[310px]"
+              header-row-class-name="relative"
+              body-row-class-name="template-form-row"
+              :data="srcDestMapping[table.table_name]"
+              :columns="srcDestMappingColumns"
+              :bordered="false"
+              header-row-height="40px"
+              row-height="40px"
+            >
+              <template #headerCell="{ column }">
+                <template v-if="column.key === 'source_column'">
+                  <NcTooltip>
+                    <template #title>
+                      {{
+                        isAllMappedSelected(table.table_name)
+                          ? $t('activity.deselectAllFields')
+                          : $t('tooltip.selectAllMappedFields')
+                      }}
+                    </template>
+                    <div>
+                      <NcCheckbox
+                        :indeterminate="!isAllMappedSelected(table.table_name) && isSomeMappedSelected(table.table_name)"
+                        :checked="isAllMappedSelected(table.table_name)"
+                        @change="handleCheckAllRecord($event, table.table_name)"
+                      />
+                    </div>
+                  </NcTooltip>
+                  <div class="absolute h-1 border-b bottom-0 border-nc-border-gray-medium left-3 right-3" />
+                </template>
+
+                <span
+                  v-if="column.key !== 'action'"
+                  class="font-weight-700 text-nc-content-gray-subtle2 text-small"
+                  :class="{
+                    'pl-3': column.key !== 'source_column',
+                  }"
+                >
+                  {{ column.title }}
+                </span>
+              </template>
+
+              <template #bodyCell="{ column, record, recordIndex }">
+                <div v-if="column.key === 'source_column'" class="w-full">
+                  <label class="w-full flex items-center gap-3 h-full">
+                    <NcTooltip :disabled="record.enabled || !!record.destCn">
+                      <template #title>Select NocoDB field to map</template>
+                      <NcCheckbox v-model:checked="record.enabled" :disabled="!record.destCn" />
+                    </NcTooltip>
+
+                    <NcTooltip
+                      class="inline-block flex-1 max-w-[calc(100%_-_50px)] truncate text-nc-content-gray text-sm font-weight-500"
+                      show-on-truncate-only
+                    >
+                      <template #title>{{ record.srcTitle }}</template>
+                      {{ record.srcTitle }}
+                    </NcTooltip>
+
+                    <GeneralIcon icon="ncArrowRight" class="w-4 h-4 flex-shrink-0 mr-2" />
+                  </label>
+                  <div
+                    v-if="recordIndex"
+                    class="absolute h-1 border-t border-nc-border-gray-medium top-0 left-3 right-3 cursor-default"
+                  />
+                </div>
+
+                <template v-else-if="column.key === 'destination_column'">
+                  <div class="w-full flex items-center gap-2">
+                    <div
+                      v-if="record.createColumn"
+                      class="nc-import-new-field flex-1 min-w-0 flex items-center gap-2 pl-3 pr-1 h-7 rounded-lg text-nc-content-brand"
+                      data-testid="nc-import-new-field"
+                    >
+                      <GeneralIcon icon="ncPlus" class="flex-none w-4 h-4" />
+                      <NcTooltip class="truncate flex-1 text-sm font-weight-500" show-on-truncate-only>
+                        <template #title>{{ record.destCn }}</template>
+                        {{ record.destCn }}
+                      </NcTooltip>
+                      <NcBadge color="brand" :border="false" class="flex-none !px-1.5 !h-5 text-tiny">
+                        {{ $t('general.new') }}
+                      </NcBadge>
+                      <NcButton
+                        type="text"
+                        size="xsmall"
+                        class="nc-import-new-field-clear flex-none !min-w-5 !h-5 !w-5"
+                        icon-only
+                        data-testid="nc-import-new-field-clear"
+                        @click="clearCreateColumn(record)"
+                      >
+                        <template #icon>
+                          <GeneralIcon icon="close" class="w-3.5 h-3.5 text-nc-content-gray-muted" />
+                        </template>
+                      </NcButton>
+                    </div>
+                    <a-form-item v-else class="!my-0 flex-1 min-w-0">
+                      <NcSelect
+                        v-model:value="record.destCn"
+                        class="nc-field-select-input w-full nc-select-shadow !border-none"
+                        show-search
+                        allow-clear
+                        :placeholder="`-${$t('labels.multiField.selectField').toLowerCase()}-`"
+                        :filter-option="filterOption"
+                        dropdown-class-name="nc-dropdown-filter-field"
+                        @update:value="(value) => handleDestChange(value, record, table.table_name)"
+                      >
+                        <template #suffixIcon>
+                          <GeneralIcon icon="arrowDown" class="text-current" />
+                        </template>
+                        <a-select-option
+                          v-for="(col, i) of getUnselectedFields(record, table.table_name)"
+                          :key="i"
+                          :value="col.title"
+                          :disabled="col.readonly"
+                        >
+                          <div class="flex items-center gap-2 w-full">
+                            <SmartsheetHeaderIcon
+                              :column="col"
+                              class="flex-none w-3.5 h-3.5 !mx-0"
+                              color="text-nc-content-gray-muted"
+                            />
+                            <NcTooltip class="truncate flex-1" :show-on-truncate-only="!col.readonly">
+                              <template #title>
+                                {{ col.readonly ? col.permissions?.tooltip || t('msg.info.fieldReadonly') : col.title }}
+                              </template>
+                              {{ col.title }}
+                            </NcTooltip>
+                            <component
+                              :is="iconMap.check"
+                              v-if="record.destCn === col.title"
+                              id="nc-selected-item-icon"
+                              class="flex-none text-primary w-4 h-4"
+                            />
+                          </div>
+                        </a-select-option>
+                        <a-select-option
+                          :key="CREATE_NEW_FIELD_VALUE"
+                          :value="CREATE_NEW_FIELD_VALUE"
+                          class="nc-import-create-new-field-option"
+                        >
+                          <div class="flex items-center gap-2 w-full text-nc-content-brand">
+                            <GeneralIcon icon="ncPlus" class="flex-none w-3.5 h-3.5" />
+                            <span class="truncate flex-1 text-sm font-weight-500">{{ $t('labels.createNewField') }}</span>
+                          </div>
+                        </a-select-option>
+                      </NcSelect>
+                    </a-form-item>
+                    <NcTooltip v-if="isReassigningLinkDest(record.destCn)" class="flex-none flex">
+                      <template #title>
+                        {{ $t('msg.warning.importLinkReassignField', { field: record.destCn }) }}
+                      </template>
+                      <GeneralIcon
+                        icon="ncAlertTriangle"
+                        class="w-4 h-4 text-nc-content-orange-medium"
+                        data-testid="nc-import-link-reassign-warning"
+                      />
+                    </NcTooltip>
+                    <div v-if="isLinkDest(record.destCn)" class="flex items-center gap-1.5 flex-none">
+                      <NcTooltip class="text-tiny text-nc-content-gray-muted whitespace-nowrap">
+                        <template #title>{{ $t('tooltip.linkValueDelimiter') }}</template>
+                        {{ $t('labels.linkValueDelimiter') }}
+                      </NcTooltip>
+                      <a-input
+                        v-model:value="record.delimiter"
+                        class="!w-14 !rounded-md nc-link-delimiter-input"
+                        size="small"
+                        :maxlength="3"
+                        :placeholder="DEFAULT_LINK_DELIMITER"
+                        data-testid="nc-import-link-delimiter"
+                      />
+                    </div>
+                  </div>
+                </template>
+              </template>
+            </NcTable>
+          </div>
+        </a-collapse-panel>
+      </a-collapse>
+
+      <div v-if="appInfo.ee" class="pt-4 pr-2">
+        <label class="flex">
+          <NcCheckbox v-model:checked="autoInsertOption" :disabled="isImporting" />
+          <span class="ml-2">{{ $t('labels.autoCreateMissingSelectionOptions') }}</span>
+        </label>
+      </div>
+    </div>
+
+    <a-card v-else class="!border-none !px-0 !mx-0" :body-style="{ padding: '0 !important' }">
+      <a-form ref="formRef" :model="data" name="template-editor-form" @keydown.enter="emit('import')">
+        <a-collapse
+          v-if="data.tables && data.tables.length"
+          v-model:active-key="expansionPanel"
+          class="template-collapse !rounded-lg !overflow-hidden"
+          accordion
+          expand-icon-position="right"
+        >
+          <template #expandIcon="{ isActive }">
+            <GeneralIcon
+              v-if="!isImporting"
+              icon="ncChevronDown"
+              class="text-lg !-translate-y-1/2 !transition text-nc-content-gray-subtle"
+              :class="{ '!transform !rotate-180': isActive }"
+            />
+          </template>
+
+          <a-collapse-panel v-for="(table, tableIdx) of data.tables" :key="tableIdx" class="nc-import-table-box !overflow-hidden">
+            <template #header>
+              <div
+                class="flex items-center space-x-3 nc-table-name-wrapper group min-h-6"
+                :class="{
+                  'w-[calc(100%_-_30px)]': !isImporting,
+                  'w-full': isImporting,
+                }"
+              >
+                <span v-if="!isImporting && showSheetSelection" class="flex flex-none" @click.stop>
+                  <NcCheckbox
+                    v-model:checked="table.selected"
+                    v-e="['c:quick-import:sheet:toggle']"
+                    :data-testid="`nc-import-sheet-select-${table.table_name}`"
+                  />
+                </span>
+                <GeneralIcon icon="table" class="w-4 h-4 text-nc-content-gray-subtle" />
+                <a-form-item
+                  v-if="!isImporting && currentTableToEdit === tableIdx"
+                  v-bind="validateInfos[`tables.${tableIdx}.table_name`]"
+                  class="!flex-1 !-my-1"
+                >
+                  <a-input
+                    :ref="(el: HTMLInputElement) => el?.focus?.()"
+                    v-model:value="table.table_name"
+                    class="!rounded-md animate-sidebar-node-input-padding !text-nc-content-gray"
+                    hide-details
+                    :bordered="true"
+                    @click.stop
+                    @keydown.enter.prevent.stop="currentTableToEdit = undefined"
+                    @keydown.esc.prevent.stop="currentTableToEdit = undefined"
+                    @blur.prevent.stop="currentTableToEdit = undefined"
+                  />
+                </a-form-item>
+                <template v-else>
+                  <NcTooltip :title="table.table_name" show-on-truncate-only class="flex-1 truncate text-nc-content-gray">
+                    <span class="nc-import-table-name" @click.stop="currentTableToEdit = tableIdx">
+                      {{ table.table_name }}
+                    </span>
+                  </NcTooltip>
+                  <NcButton
+                    v-if="!isImporting"
+                    type="text"
+                    size="xsmall"
+                    class="!hidden group-hover:!block !h-6 !w-6"
+                    icon-only
+                    @click.stop="currentTableToEdit = tableIdx"
+                  >
+                    <template #icon>
+                      <GeneralIcon icon="pencil" class="text-nc-content-gray-subtle2" />
+                    </template>
+                  </NcButton>
+                </template>
+
+                <span
+                  v-if="showSheetSelection && table.selected === false"
+                  class="flex-none text-bodySm text-nc-content-gray-subtle2 whitespace-nowrap"
+                >
+                  {{ $t('activity.sheetExcludedFromImport') }}
+                </span>
+
+                <NcTooltip v-if="!isImporting && getErrorForTable(tableIdx).length" class="ml-2">
+                  <template #title>
+                    <div v-for="(err, idx) of getErrorForTable(tableIdx)" :key="idx" class="mb-1 last-of-type:mb-0">
+                      {{ idx > 0 ? `${idx + 1}.` : '' }} {{ err }}
+                    </div>
+                  </template>
+                  <NcBadge color="red" :border="false" class="w-8 !px-2 flex-none !bg-nc-bg-red-light">
+                    <GeneralIcon icon="ncInfo" class="text-nc-content-red-dark" />
+                  </NcBadge>
+                </NcTooltip>
+
+                <div v-if="isImporting && table.selected !== false" class="w-[150px]">
+                  <a-progress
+                    :percent="importingTableTips[table.table_name] ?? 0"
+                    size="small"
+                    status="normal"
+                    stroke-color="var(--nc-content-brand)"
+                    trail-color="var(--nc-bg-brand-inverted)"
+                  />
+                </div>
+              </div>
+            </template>
+
+            <div
+              v-if="table.columns && table.columns.length"
+              class="bg-nc-bg-gray-extralight pl-3 flex-1 flex max-h-[310px]"
+              :class="{ 'opacity-50': table.selected === false }"
+            >
+              <NcTable
+                class="template-form flex-1"
+                body-row-class-name="template-form-row"
+                header-row-class-name="relative"
+                :data="table.columns"
+                :columns="tableColumns"
+                :bordered="false"
+                header-row-height="40px"
+                row-height="40px"
+              >
+                <template #headerCell="{ column }">
+                  <template v-if="column.key === 'enabled'">
+                    <NcCheckbox
+                      :indeterminate="
+                        table.columns.length &&
+                        table.columns.some((it) => it.selected) &&
+                        !table.columns.every((it) => it.selected)
+                      "
+                      :checked="table.columns.every((it) => it.selected)"
+                      :disabled="table.selected === false"
+                      @click="toggleTableSelecteds(table)"
+                    />
+                  </template>
+                  <template v-if="column.key === 'column_name'">
+                    <span class="font-weight-700 text-small text-nc-content-gray-subtle2">
+                      {{
+                        table.columns.every((it) => it.selected)
+                          ? $t('activity.deselectAllFields')
+                          : $t('activity.selectAllFields')
+                      }}
+                    </span>
+                    <div class="absolute h-1 border-b bottom-0 border-nc-border-gray-medium left-3 right-3" />
+                  </template>
+                </template>
+                <template #bodyCell="{ column, record, recordIndex }">
+                  <template v-if="column.key === 'enabled'">
+                    <NcCheckbox v-model:checked="record.selected" :disabled="table.selected === false" />
+                  </template>
+                  <template v-if="column.key === 'column_name'">
+                    <template v-if="`${tableIdx}-${record.column_name}` === currentColumnToEdit">
+                      <a-form-item
+                        v-bind="validateInfos[`tables.${tableIdx}.columns.${record.key}.title`]"
+                        class="nc-table-field-name !mb-0 w-full"
+                      >
+                        <a-input
+                          :ref="(el: HTMLInputElement) => {inputRefs[record.key] = el; el?.focus?.(); return el;}"
+                          v-model:value="record.title"
+                          class="!rounded-md animate-sidebar-node-input-padding !font-weight-500 !text-nc-content-gray"
+                          :autofocus="true"
+                          @keydown.enter.prevent.stop="currentColumnToEdit = ''"
+                          @keydown.esc.prevent.stop="currentColumnToEdit = ''"
+                          @blur.esc.prevent.stop="currentColumnToEdit = ''"
+                        />
+                      </a-form-item>
+                    </template>
+                    <template v-else>
+                      <div
+                        class="relative group w-full flex items-center min-h-6"
+                        @click="currentColumnToEdit = `${tableIdx}-${record.column_name}`"
+                      >
+                        <span
+                          class="font-weight-500 text-nc-content-gray max-w-[300px] inline-block truncate nc-import-table-field-name"
+                        >
+                          {{ record.title }}
+                        </span>
+                        <NcButton
+                          type="text"
+                          size="small"
+                          class="!absolute right-0 top-1/2 transform -translate-y-1/2 opacity-0 group-hover:opacity-100 pointer-events-none group-hover:pointer-events-auto"
+                          @click="currentColumnToEdit = `${tableIdx}-${record.column_name}`"
+                        >
+                          <GeneralIcon icon="pencil" />
+                        </NcButton>
+                      </div>
+                    </template>
+                    <NcTooltip v-if="formError?.[`tables.${tableIdx}.columns.${record.key}.title`]" class="flex">
+                      <template #title>
+                        <div
+                          v-for="(err, idx) of formError?.[`tables.${tableIdx}.columns.${record.key}.title`] || []"
+                          :key="idx"
+                          class="mb-1 last-of-type:mb-0"
+                        >
+                          {{ idx > 0 ? `${idx + 1}.` : '' }} {{ err }}
+                        </div>
+                      </template>
+                      <GeneralIcon icon="info" class="h-4 w-4 text-nc-content-red-medium flex-none ml-2" />
+                    </NcTooltip>
+                    <div v-if="recordIndex" class="absolute h-1 border-t border-nc-border-gray-medium top-0 left-3 right-3" />
+                  </template>
+                </template>
+              </NcTable>
+            </div>
+          </a-collapse-panel>
+        </a-collapse>
+      </a-form>
+    </a-card>
+  </div>
+</template>
+
+<style scoped lang="scss">
+.template-collapse {
+  @apply bg-nc-bg-default border-nc-border-gray-medium;
+}
+
+.nc-import-new-field {
+  @apply bg-nc-bg-brand;
+}
+
+:deep(.ant-collapse-header) {
+  @apply !items-center !py-2 !px-3;
+  & > div {
+    @apply flex;
+  }
+}
+.nc-table-field-name {
+  :deep(.ant-form-item-explain) {
+    @apply hidden;
+  }
+}
+:deep(.nc-import-table-box:last-child) {
+  @apply !rounded-b-lg;
+}
+:deep(.nc-import-table-box .ant-collapse-content) {
+  @apply !border-t-0;
+}
+:deep(.nc-import-table-box .ant-collapse-content-box) {
+  @apply !p-0;
+
+  .nc-table-header-row,
+  .nc-table-row {
+    @apply !border-none relative;
+  }
+}
+
+:deep(.ant-collapse > .ant-collapse-item) {
+  @apply !border-nc-border-gray-medium;
+}
+:deep(.nc-import-table-box.nc-upload-box .ant-collapse-content-box) {
+  .nc-table-header-row {
+    @apply !flex !h-auto !border-none !h-10;
+    span {
+      @apply !font-weight-700 text-[13px];
+    }
+  }
+}
+
+:deep(.nc-table-name-wrapper .ant-form-item-explain) {
+  @apply hidden;
+}
+
+:deep(.ant-progress-outer) {
+  margin-right: calc(-2em - 16px);
+  padding-right: calc(2em + 16px);
+}
+
+:deep(.ant-progress-text) {
+  @apply text-nc-content-gray-muted;
+}
+
+:deep(.nc-field-select-input.ant-select) {
+  .ant-select-selector {
+    @apply !bg-transparent rounded-lg;
+
+    .ant-select-selection-item {
+      @apply text-nc-content-gray text-sm font-weight-500;
+    }
+  }
+
+  &:not(.ant-select-focused):hover .ant-select-selector {
+    @apply !bg-nc-bg-gray-medium;
+  }
+
+  &:not(.ant-select-disabled):not(:hover):not(.ant-select-focused) .ant-select-selector,
+  &:not(.ant-select-disabled):hover.ant-select-disabled .ant-select-selector {
+    @apply !shadow-none;
+  }
+
+  &:hover:not(.ant-select-focused):not(.ant-select-disabled) .ant-select-selector {
+    @apply shadow-none;
+  }
+  &:not(.ant-select-focused):not(.ant-select-disabled) .ant-select-selector {
+    @apply !border-transparent;
+  }
+
+  &:not(.ant-select-focused):hover .ant-select-clear {
+    @apply !bg-nc-bg-gray-medium;
+  }
+}
+</style>

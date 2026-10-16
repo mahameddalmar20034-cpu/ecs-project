@@ -1,0 +1,257 @@
+import { ButtonActionsType } from 'nocodb-sdk';
+import type { NcContext } from '~/interface/config';
+import Noco from '~/Noco';
+import NocoCache from '~/cache/NocoCache';
+import { extractProps } from '~/helpers/extractProps';
+import { CacheGetType, CacheScope, MetaTable } from '~/utils/globals';
+import { parseMetaProp, stringifyMetaProp } from '~/utils/modelUtils';
+import { isEE } from '~/utils';
+import Filter from '~/models/Filter';
+
+export default class ButtonColumn {
+  type: ButtonActionsType;
+  label: string;
+  theme: 'solid' | 'light' | 'text';
+  icon?: string;
+  color: string;
+  fk_webhook_id?: string;
+  formula?: string;
+  formula_raw?: string;
+  fk_workspace_id?: string;
+  base_id?: string;
+  fk_column_id: string;
+  error?: string;
+
+  fk_integration_id?: string;
+  fk_script_id?: string;
+  fk_workflow_id?: string;
+  model?: string;
+  output_column_ids?: string;
+  filters?: any[];
+  id: string;
+
+  private parsed_tree?: any;
+
+  constructor(data: Partial<ButtonColumn> & { parsed_tree?: any }) {
+    const { parsed_tree, ...rest } = data;
+    this.parsed_tree = parsed_tree;
+    Object.assign(this, rest);
+  }
+
+  public static async insert(
+    context: NcContext,
+    buttonColumn: Partial<ButtonColumn> & { parsed_tree?: any },
+    ncMeta = Noco.ncMeta,
+  ) {
+    const urlProps = ['formula_raw', 'formula', 'error', 'parsed_tree'];
+
+    const webhookProps = ['fk_webhook_id'];
+
+    const scriptProps = ['fk_script_id'];
+
+    const workflowProps = ['fk_workflow_id'];
+
+    const aiProps = [
+      'formula_raw',
+      'formula',
+      'error',
+      'fk_integration_id',
+      'model',
+      'output_column_ids',
+    ];
+
+    const insertObj = extractProps(buttonColumn, [
+      ...(buttonColumn.type === ButtonActionsType.Url
+        ? urlProps
+        : buttonColumn.type === ButtonActionsType.Webhook
+        ? webhookProps
+        : buttonColumn.type === ButtonActionsType.Script && isEE
+        ? scriptProps
+        : buttonColumn.type === ButtonActionsType.Ai
+        ? aiProps
+        : buttonColumn.type === ButtonActionsType.Workflow && isEE
+        ? workflowProps
+        : []),
+      'theme',
+      'color',
+      'label',
+      'type',
+      'icon',
+      'fk_column_id',
+    ]);
+
+    if (buttonColumn.type === ButtonActionsType.Url) {
+      insertObj.parsed_tree = stringifyMetaProp(insertObj, 'parsed_tree', null);
+    }
+
+    await ncMeta.metaInsert2(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.COL_BUTTON,
+      insertObj,
+    );
+
+    return this.read(context, buttonColumn.fk_column_id, ncMeta);
+  }
+
+  public static async read(
+    context: NcContext,
+    columnId: string,
+    ncMeta = Noco.ncMeta,
+  ) {
+    let column =
+      columnId &&
+      (await NocoCache.get(
+        context,
+        `${CacheScope.COL_BUTTON}:${columnId}`,
+        CacheGetType.TYPE_OBJECT,
+      ));
+    if (!column) {
+      column = await ncMeta.metaGet2(
+        context.workspace_id,
+        context.base_id,
+        MetaTable.COL_BUTTON,
+        { fk_column_id: columnId },
+      );
+      if (column) {
+        column.parsed_tree = parseMetaProp(column, 'parsed_tree', null);
+        await NocoCache.set(
+          context,
+          `${CacheScope.COL_BUTTON}:${columnId}`,
+          column,
+        );
+      }
+    }
+
+    if (column) {
+      // Entries cached by the pre-fix `update()` hold JSON text, and nothing
+      // rewrites them — `getRaw` refreshes the TTL on every read, so a hot one
+      // never expires. Mirrors FormulaColumn.read().
+      column.parsed_tree = parseMetaProp(column, 'parsed_tree', null);
+
+      column.filters = await Filter.allButtonFilterList(
+        context,
+        { buttonColId: columnId },
+        ncMeta,
+      );
+    }
+
+    return column ? new ButtonColumn(column) : null;
+  }
+
+  static async update(
+    context: NcContext,
+    columnId: string,
+    button: Partial<ButtonColumn> & { parsed_tree?: any },
+    ncMeta = Noco.ncMeta,
+  ) {
+    const urlProps = ['fk_column_id', 'formula_raw', 'formula', 'error'];
+
+    const webhookProps = ['fk_webhook_id'];
+
+    const scriptProps = ['fk_script_id'];
+
+    const workflowProps = ['fk_workflow_id'];
+
+    const aiProps = [
+      'formula_raw',
+      'formula',
+      'error',
+      'fk_integration_id',
+      'model',
+      'output_column_ids',
+    ];
+
+    const updateObj = extractProps(button, [
+      ...(button.type === ButtonActionsType.Url
+        ? urlProps
+        : button.type === ButtonActionsType.Webhook
+        ? webhookProps
+        : button.type === ButtonActionsType.Script && isEE
+        ? scriptProps
+        : button.type === ButtonActionsType.Ai
+        ? aiProps
+        : button.type === ButtonActionsType.Workflow && isEE
+        ? workflowProps
+        : []),
+      'theme',
+      'color',
+      'type',
+      'icon',
+      'label',
+      // type-independent: the two parsed_tree-only writers (the formula builder
+      // caching a freshly built tree, Column.update invalidating it) have no
+      // `type` to pass, and the Url branch above would drop it — leaving the
+      // tree unwritable and the cache entry unable to self-correct
+      'parsed_tree',
+    ]);
+
+    if ('parsed_tree' in updateObj)
+      updateObj.parsed_tree = stringifyMetaProp(updateObj, 'parsed_tree', null);
+
+    // set meta
+    await ncMeta.metaUpdate(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.COL_BUTTON,
+      updateObj,
+      {
+        fk_column_id: columnId,
+      },
+    );
+
+    // The meta row stores `parsed_tree` as JSON text, but every reader expects
+    // the parsed tree — `read()` parses it on the way out of the DB. Caching the
+    // stringified form hands the next reader a string, the formula build throws
+    // on it, and the Button branch of the query builders drops the column from
+    // the SELECT entirely: a button that renders as nothing, with no stored
+    // error to explain it, until the column is edited.
+    //
+    // Built as a separate object rather than mutating `updateObj` back, which
+    // was already handed to `metaUpdate` above.
+    await NocoCache.update(
+      context,
+      `${CacheScope.COL_BUTTON}:${columnId}`,
+      'parsed_tree' in updateObj
+        ? {
+            ...updateObj,
+            parsed_tree: parseMetaProp(updateObj, 'parsed_tree', null),
+          }
+        : updateObj,
+    );
+  }
+
+  public getParsedTree() {
+    return this.parsed_tree;
+  }
+
+  public static async workflowUsages(
+    context: NcContext,
+    workflowId: string,
+    ncMeta = Noco.ncMeta,
+  ) {
+    return await ncMeta.metaList2(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.COL_BUTTON,
+      {
+        condition: { fk_workflow_id: workflowId },
+      },
+    );
+  }
+
+  public static async buttonUsages(
+    context: NcContext,
+    scriptId: string,
+    ncMeta = Noco.ncMeta,
+  ) {
+    return await ncMeta.metaList2(
+      context.workspace_id,
+      context.base_id,
+      MetaTable.COL_BUTTON,
+      {
+        condition: { fk_script_id: scriptId },
+      },
+    );
+  }
+}

@@ -1,0 +1,913 @@
+import {
+  ButtonActionsType,
+  isBtLikeV2Junction,
+  isFieldTrackingLmbCol,
+  isFieldTrackingLmtCol,
+  NC_ERROR_SENTINEL,
+  UITypes,
+} from 'nocodb-sdk';
+import genRollupSelectv2 from '../genRollupSelectv2';
+import type { ColumnType } from 'nocodb-sdk';
+import type { Knex } from 'knex';
+import type {
+  BarcodeColumn,
+  ButtonColumn,
+  GridViewColumn,
+  LookupColumn,
+  QrCodeColumn,
+  RollupColumn,
+} from '~/models';
+import type { IBaseModelSqlV2 } from '~/db/IBaseModelSqlV2';
+import type { Logger } from '@nestjs/common';
+import {
+  lmbFieldQueryBuilder,
+  lmtFieldQueryBuilder,
+  lmtUtcText,
+} from '~/db/formulav2/lmtFieldQueryBuilder';
+import { Column, View } from '~/models';
+import {
+  checkColumnRequired,
+  getAs,
+  getColumnName,
+  shouldSkipField,
+} from '~/helpers/dbHelpers';
+import { sanitize } from '~/helpers/sqlSanitize';
+import { NC_MAX_TEXT_LENGTH } from '~/constants';
+import {
+  FORMULA_DRY_RUN_SKIPPED_MESSAGE,
+  logFormulaBuildError,
+} from '~/db/formulav2/formulaQueryBuilderv2';
+
+export const selectObject = (baseModel: IBaseModelSqlV2, logger: Logger) => {
+  return async ({
+    qb,
+    columns: _columns,
+    fields: _fields,
+    extractPkAndPv,
+    viewId,
+    fieldsSet,
+    alias,
+    validateFormula,
+    pkAndPvOnly = false,
+    linksAsLtar = false,
+    fk_display_value_column_id,
+  }: {
+    fieldsSet?: Set<string>;
+    qb: Knex.QueryBuilder & Knex.QueryInterface;
+    columns?: Column[];
+    fields?: string[] | string;
+    extractPkAndPv?: boolean;
+    viewId?: string;
+    alias?: string;
+    validateFormula?: boolean;
+    pkAndPvOnly?: boolean;
+    linksAsLtar?: boolean;
+    fk_display_value_column_id?: string | null;
+  }): Promise<void> => {
+    // keep a common object for all columns to share across all columns
+    const aliasToColumnBuilder = {};
+    let viewOrTableColumns: Column[] | { fk_column_id?: string }[];
+
+    const res = {};
+    let view: View;
+    let fields: string[];
+
+    if (fieldsSet?.size) {
+      viewOrTableColumns = _columns || (await baseModel.model.getColumns());
+    } else {
+      view = await View.get(baseModel.context, viewId);
+      const viewColumns =
+        viewId && (await View.getColumns(baseModel.context, viewId));
+      fields = Array.isArray(_fields) ? _fields : _fields?.split(',');
+
+      // const columns = _columns ?? (await baseModel.model.getColumns());
+      // for (const column of columns) {
+      viewOrTableColumns =
+        viewColumns || _columns || (await baseModel.model.getColumns());
+    }
+    for (const viewOrTableColumn of viewOrTableColumns) {
+      const column =
+        viewOrTableColumn instanceof Column
+          ? viewOrTableColumn
+          : await Column.get(baseModel.context, {
+              colId:
+                (viewOrTableColumn as GridViewColumn).fk_column_id ??
+                (viewOrTableColumn as ColumnType).id,
+            });
+
+      if (!column) {
+        logger.warn(
+          `Column not found for viewOrTableColumn: ${JSON.stringify(
+            viewOrTableColumn,
+          )}`,
+        );
+        continue;
+      }
+
+      // hide if column marked as hidden in view
+      // of if column is system field and system field is hidden
+      if (
+        shouldSkipField(
+          fieldsSet,
+          viewOrTableColumn,
+          view,
+          column,
+          extractPkAndPv || pkAndPvOnly,
+          pkAndPvOnly,
+          fk_display_value_column_id,
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !checkColumnRequired(
+          column,
+          fields,
+          extractPkAndPv,
+          fk_display_value_column_id,
+        )
+      )
+        continue;
+
+      switch (column.uidt) {
+        case UITypes.CreatedTime:
+        case UITypes.LastModifiedTime:
+        case UITypes.DateTime:
+          {
+            // a LastModifiedTime column tracking specific fields is computed
+            // from the row-meta column — select its synthetic formula
+            // expression instead of the physical updated_at column
+            if (isFieldTrackingLmtCol(column)) {
+              try {
+                const selectQb = await lmtFieldQueryBuilder({
+                  baseModel,
+                  column,
+                  // the column may belong to a related model when reached
+                  // through a lookup traversal
+                  model: await column.getModel(),
+                  tableAlias: alias,
+                  validateFormula,
+                  aliasToColumn: aliasToColumnBuilder,
+                });
+                if ('toQuery' in selectQb.builder) {
+                  const selectQbQuery = selectQb.builder.toQuery();
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `${lmtUtcText(
+                        baseModel,
+                        selectQbQuery.replaceAll('?', '\\?'),
+                      )} as ??`,
+                      [getAs(column)],
+                    ),
+                  );
+                } else {
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `${lmtUtcText(baseModel, '??')} as ??`,
+                      [selectQb.builder, getAs(column)],
+                    ),
+                  );
+                }
+              } catch (e) {
+                if (e?.message !== FORMULA_DRY_RUN_SKIPPED_MESSAGE)
+                  logger.log(e);
+                // return dummy select
+                qb.select(
+                  baseModel.dbDriver.raw(`? as ??`, [
+                    NC_ERROR_SENTINEL,
+                    getAs(column),
+                  ]),
+                );
+              }
+              break;
+            }
+            const columnName = await getColumnName(
+              baseModel.context,
+              column,
+              _columns || (await baseModel.model.getColumns()),
+            );
+            // Emit DateTime as text with a +00:00 suffix at the SQL layer so the value
+            // round-trips through JSON aggregation (json_agg / JSON_ARRAYAGG / jsonb_build_object)
+            // without losing timezone information. Without this, `json_agg(timestamp)` /
+            // `JSON_ARRAYAGG(datetime)` strip the offset and downstream consumers (lookup group
+            // headers, JSON-built objects) render the raw UTC wall time as if it were local.
+            // Non-aggregation paths still work — _convertDateFormat parses the string through
+            // dayjs and re-emits the same shape.
+            if (baseModel.isMySQL) {
+              // MySQL stores timestamp in UTC but display in timezone
+              // To verify the timezone, run `SELECT @@global.time_zone, @@session.time_zone;`
+              // If it's SYSTEM, then the timezone is read from the configuration file
+              // if a timezone is set in a DB, the retrieved value would be converted to the corresponding timezone
+              // for example, let's say the global timezone is +08:00 in DB
+              // the value 2023-01-01 10:00:00 (UTC) would display as 2023-01-01 18:00:00 (UTC+8)
+              // our existing logic is based on UTC, during the query, we need to take the UTC value
+              // hence, we use CONVERT_TZ to convert back to UTC value
+              res[sanitize(getAs(column) || columnName)] =
+                baseModel.dbDriver.raw(
+                  `CONCAT(DATE_FORMAT(CONVERT_TZ(??, @@GLOBAL.time_zone, '+00:00'), '%Y-%m-%d %H:%i:%s'), '+00:00')`,
+                  [`${sanitize(alias || baseModel.tnPath)}.${columnName}`],
+                );
+              break;
+            } else if (baseModel.isPg) {
+              // if there is no timezone info,
+              // convert to database timezone,
+              // then convert to UTC
+              if (
+                column.dt !== 'timestamp with time zone' &&
+                column.dt !== 'timestamptz'
+              ) {
+                res[sanitize(getAs(column) || columnName)] = baseModel.dbDriver
+                  .raw(
+                    `TO_CHAR((?? AT TIME ZONE CURRENT_SETTING('timezone') AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SSTZH:TZM')`,
+                    [`${sanitize(alias || baseModel.tnPath)}.${columnName}`],
+                  )
+                  .wrap('(', ')');
+                break;
+              }
+            } else if (baseModel.isMssql) {
+              res[sanitize(getAs(column) || columnName)] =
+                baseModel.dbDriver.raw(`CONVERT(VARCHAR(19), ??, 120)`, [
+                  `${sanitize(alias || baseModel.tnPath)}.${columnName}`,
+                ]);
+              break;
+            } else if (baseModel.isOracle) {
+              // Oracle DATE/TIMESTAMP carry no zone info — NocoDB writes
+              // them as UTC wall time (`now()` emits an offset-less UTC
+              // string), so emit the stored value as text with an explicit
+              // +00:00 like the pg/mysql shapes. TZ-aware variants
+              // (TIMESTAMP WITH [LOCAL] TIME ZONE) are normalized to UTC
+              // first.
+              //
+              // The +00:00 suffix is embedded in the TO_CHAR format as a
+              // quoted literal — appending it with `||` would turn NULL
+              // cells into the literal string '+00:00' (Oracle `||` treats
+              // NULL as '' instead of propagating it the way CONCAT /
+              // pg / mssql shapes do).
+              const isTzAware = (column.dt ?? '')
+                .toUpperCase()
+                .includes('TIME ZONE');
+              res[sanitize(getAs(column) || columnName)] =
+                baseModel.dbDriver.raw(
+                  isTzAware
+                    ? `TO_CHAR(?? AT TIME ZONE '+00:00', 'YYYY-MM-DD HH24:MI:SS"+00:00"')`
+                    : `TO_CHAR(??, 'YYYY-MM-DD HH24:MI:SS"+00:00"')`,
+                  [`${sanitize(alias || baseModel.tnPath)}.${columnName}`],
+                );
+              break;
+            }
+            res[sanitize(getAs(column) || columnName)] = sanitize(
+              `${alias || baseModel.tnPath}.${columnName}`,
+            );
+          }
+          break;
+        case UITypes.Time: {
+          if (baseModel.isOracle) {
+            const columnName = await getColumnName(
+              baseModel.context,
+              column,
+              _columns || (await baseModel.model.getColumns()),
+            );
+            res[sanitize(getAs(column) || columnName)] = baseModel.dbDriver.raw(
+              `TO_CHAR(??, 'HH24:MI:SS')`,
+              [`${sanitize(alias || baseModel.tnPath)}.${columnName}`],
+            );
+          } else {
+            res[sanitize(getAs(column) || column.column_name)] = sanitize(
+              `${alias || baseModel.tnPath}.${column.column_name}`,
+            );
+          }
+          break;
+        }
+        case UITypes.LinkToAnotherRecord:
+          break;
+        case UITypes.Lookup: {
+          const lookupOpt = await column.getColOptions<LookupColumn>();
+          if (lookupOpt?.error) {
+            qb.select(
+              baseModel.dbDriver.raw(`? as ??`, [
+                NC_ERROR_SENTINEL,
+                getAs(column),
+              ]),
+            );
+          }
+          break;
+        }
+        case UITypes.QrCode: {
+          const qrCodeColumn = await column.getColOptions<QrCodeColumn>();
+
+          if (qrCodeColumn.error) {
+            qb.select(
+              baseModel.dbDriver.raw(`? as ??`, [
+                NC_ERROR_SENTINEL,
+                getAs(column),
+              ]),
+            );
+            break;
+          }
+
+          if (!qrCodeColumn.fk_qr_value_column_id) {
+            qb.select(
+              baseModel.dbDriver.raw(`? as ??`, [
+                NC_ERROR_SENTINEL,
+                getAs(column),
+              ]),
+            );
+            break;
+          }
+
+          const qrValueColumn = await Column.get(baseModel.context, {
+            colId: qrCodeColumn.fk_qr_value_column_id,
+          });
+
+          // If the referenced value cannot be found: cancel current iteration
+          if (qrValueColumn == null) {
+            break;
+          }
+
+          switch (qrValueColumn.uidt) {
+            case UITypes.Formula:
+              try {
+                const selectQb =
+                  await baseModel.getSelectQueryBuilderForFormula(
+                    qrValueColumn,
+                    alias,
+                    validateFormula,
+                    aliasToColumnBuilder,
+                  );
+                qb.select({
+                  [column.column_name]: selectQb.builder,
+                });
+              } catch {
+                continue;
+              }
+              break;
+            default: {
+              qb.select({ [column.column_name]: qrValueColumn.column_name });
+              break;
+            }
+          }
+
+          break;
+        }
+        case UITypes.Barcode: {
+          const barcodeColumn = await column.getColOptions<BarcodeColumn>();
+
+          if (barcodeColumn.error) {
+            qb.select(
+              baseModel.dbDriver.raw(`? as ??`, [
+                NC_ERROR_SENTINEL,
+                getAs(column),
+              ]),
+            );
+            break;
+          }
+
+          if (!barcodeColumn.fk_barcode_value_column_id) {
+            qb.select(
+              baseModel.dbDriver.raw(`? as ??`, [
+                NC_ERROR_SENTINEL,
+                getAs(column),
+              ]),
+            );
+            break;
+          }
+
+          const barcodeValueColumn = await Column.get(baseModel.context, {
+            colId: barcodeColumn.fk_barcode_value_column_id,
+          });
+
+          // If the referenced value cannot be found: cancel current iteration
+          if (barcodeValueColumn == null) {
+            break;
+          }
+
+          switch (barcodeValueColumn.uidt) {
+            case UITypes.Formula:
+              try {
+                const selectQb =
+                  await baseModel.getSelectQueryBuilderForFormula(
+                    barcodeValueColumn,
+                    alias,
+                    validateFormula,
+                    aliasToColumnBuilder,
+                  );
+                qb.select({
+                  [getAs(column)]: selectQb.builder,
+                });
+              } catch {
+                continue;
+              }
+              break;
+            default: {
+              qb.select({
+                [getAs(column)]: barcodeValueColumn.column_name,
+              });
+              break;
+            }
+          }
+
+          break;
+        }
+        case UITypes.Formula:
+          {
+            try {
+              const selectQb = await baseModel.getSelectQueryBuilderForFormula(
+                column,
+                alias,
+                validateFormula,
+                aliasToColumnBuilder,
+              );
+
+              if ('toQuery' in selectQb.builder) {
+                const selectQbQuery = selectQb.builder.toQuery();
+                qb.select(
+                  baseModel.dbDriver.raw(
+                    `${selectQbQuery.replaceAll('?', '\\?')} as ??`,
+                    [getAs(column)],
+                  ),
+                );
+              } else {
+                qb.select(
+                  baseModel.dbDriver.raw(`?? as ??`, [
+                    selectQb.builder,
+                    getAs(column),
+                  ]),
+                );
+              }
+            } catch (e) {
+              logFormulaBuildError(logger, e, column);
+              // return dummy select
+              qb.select(baseModel.dbDriver.raw(`'ERR' as ??`, [getAs(column)]));
+            }
+          }
+          break;
+        case UITypes.Button: {
+          try {
+            const colOption = column.colOptions as ButtonColumn;
+            if (colOption.type === ButtonActionsType.Url) {
+              const selectQb = await baseModel.getSelectQueryBuilderForFormula(
+                column,
+                alias,
+                validateFormula,
+                aliasToColumnBuilder,
+              );
+              switch (baseModel.dbDriver.clientType()) {
+                case 'mysql2':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `JSON_OBJECT('type', ? , 'label', ?, 'url', ??) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        selectQb.builder,
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'pg':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `json_build_object('type', ? ,'label', ?, 'url', ??) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        selectQb.builder,
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'sqlite3':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `json_object('type', ?, 'label', ?, 'url', ??) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        selectQb.builder,
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'mssql':
+                  // T-SQL has no JSON_OBJECT — synthesize the payload via a
+                  // single-row derived table + `FOR JSON PATH, WITHOUT_ARRAY_WRAPPER`.
+                  // `JSON_QUERY` lets a parent `FOR JSON` inline this as JSON
+                  // rather than re-stringifying.
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `JSON_QUERY(( SELECT ? AS [type], ? AS [label], ?? AS [url] FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES )) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        selectQb.builder,
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'oracledb':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `JSON_OBJECT('type' VALUE ?, 'label' VALUE ?, 'url' VALUE ??) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        selectQb.builder,
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                default:
+                  qb.select(
+                    baseModel.dbDriver.raw(`'ERR' as ??`, [getAs(column)]),
+                  );
+              }
+            } else if (
+              [
+                ButtonActionsType.Webhook,
+                ButtonActionsType.Script,
+                ButtonActionsType.Workflow,
+              ].includes(colOption.type)
+            ) {
+              const key =
+                colOption.type === ButtonActionsType.Webhook
+                  ? 'fk_webhook_id'
+                  : colOption.type === ButtonActionsType.Workflow
+                  ? 'fk_workflow_id'
+                  : 'fk_script_id';
+              switch (baseModel.dbDriver.clientType()) {
+                case 'mysql2':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `JSON_OBJECT('type', ?, 'label', ?, '${key}', ?) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        colOption[key],
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'pg':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `json_build_object('type', ?, 'label', ?, '${key}', ?) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        colOption[key],
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'sqlite3':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `json_object('type', ?, 'label', ?, '${key}', ?) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        colOption[key],
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'mssql':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `JSON_QUERY(( SELECT ? AS [type], ? AS [label], ? AS [${key}] FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES )) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        colOption[key],
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                case 'oracledb':
+                  qb.select(
+                    baseModel.dbDriver.raw(
+                      `JSON_OBJECT('type' VALUE ?, 'label' VALUE ?, '${key}' VALUE ?) as ??`,
+                      [
+                        colOption.type,
+                        `${colOption.label}`,
+                        colOption[key],
+                        getAs(column),
+                      ],
+                    ),
+                  );
+                  break;
+                default:
+                  qb.select(
+                    baseModel.dbDriver.raw(`'ERR' as ??`, [getAs(column)]),
+                  );
+              }
+            }
+          } catch (e) {
+            logFormulaBuildError(logger, e, column);
+            // return dummy select
+            qb.select(baseModel.dbDriver.raw(`'ERR' as ??`, [getAs(column)]));
+          }
+          break;
+        }
+        case UITypes.Rollup:
+        case UITypes.Links: {
+          if (
+            column.uidt === UITypes.Links &&
+            (linksAsLtar || isBtLikeV2Junction(column))
+          ) {
+            // When linksAsLtar is enabled or V2 MO/OO (single-record) —
+            // skip the rollup count select so getProto resolves nested data under column.title
+            break;
+          }
+          const rollupColOptions =
+            (await column.getColOptions()) as RollupColumn;
+
+          // Errored rollup/link (e.g. its relation was cascade-deleted):
+          // emit a NULL dummy select instead of attempting the rollup.
+          if (rollupColOptions?.error) {
+            qb.select(baseModel.dbDriver.raw(`? as ??`, [null, getAs(column)]));
+            break;
+          }
+
+          qb.select(
+            (
+              await genRollupSelectv2({
+                baseModelSqlv2: baseModel,
+                knex: baseModel.dbDriver,
+                alias,
+                columnOptions: rollupColOptions,
+              })
+            ).builder.as(getAs(column)),
+          );
+          break;
+        }
+        case UITypes.CreatedBy:
+        case UITypes.LastModifiedBy: {
+          // a LastModifiedBy column tracking specific fields is computed
+          // from the row-meta column — select its latest-tracked-editor
+          // expression; the value stays a user id, so the regular
+          // LastModifiedBy read expansion applies
+          if (isFieldTrackingLmbCol(column)) {
+            res[sanitize(getAs(column))] = (
+              await lmbFieldQueryBuilder({
+                baseModel,
+                column,
+                model: await column.getModel(),
+                tableAlias: alias,
+              })
+            ).builder;
+            break;
+          }
+          const columnName = await getColumnName(
+            baseModel.context,
+            column,
+            _columns || (await baseModel.model.getColumns()),
+          );
+
+          res[sanitize(getAs(column) || columnName)] = sanitize(
+            `${alias || baseModel.tnPath}.${columnName}`,
+          );
+          break;
+        }
+        case UITypes.SingleSelect: {
+          // NULLIF(col, '') casts '' to col's type; native PG enums reject
+          // '' with "invalid input value for enum". Native enum cells can't
+          // hold '' anyway, so select them directly.
+          if (column.internal_meta?.pg_enum_type_name) {
+            res[sanitize(getAs(column) || column.column_name)] = sanitize(
+              `${alias || baseModel.tnPath}.${column.column_name}`,
+            );
+          } else if (baseModel.isOracle) {
+            // Oracle treats '' as NULL — empty strings can't be stored, so
+            // NULLIF(col, '') degenerates to NULLIF(col, NULL). Select the
+            // column directly.
+            res[sanitize(getAs(column) || column.column_name)] = sanitize(
+              `${alias || baseModel.tnPath}.${column.column_name}`,
+            );
+          } else if (
+            baseModel.isMssql &&
+            ['text', 'ntext'].includes((column.dt ?? '').toLowerCase())
+          ) {
+            // T-SQL forbids `=` / `NULLIF` against the legacy text/ntext
+            // types. CAST to NVARCHAR(MAX) first so the empty-string
+            // normalization works (and matches the value semantics on
+            // nvarchar columns).
+            res[sanitize(getAs(column) || column.column_name)] =
+              baseModel.dbDriver.raw(`NULLIF(CAST(?? AS NVARCHAR(MAX)), '')`, [
+                sanitize(column.column_name),
+              ]);
+          } else {
+            res[sanitize(getAs(column) || column.column_name)] =
+              baseModel.dbDriver.raw(`COALESCE(NULLIF(??, ''), NULL)`, [
+                sanitize(column.column_name),
+              ]);
+          }
+          break;
+        }
+        case UITypes.LongText: {
+          if (baseModel.dbDriver.isExternal) {
+            const colPath = sanitize(
+              `${alias || baseModel.tnPath}.${column.column_name}`,
+            );
+            if (baseModel.isPg) {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`SUBSTR(??::TEXT, 1, ?)`, [
+                  colPath,
+                  NC_MAX_TEXT_LENGTH,
+                ]);
+            } else if (baseModel.isMySQL) {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`SUBSTR(??, 1, ?)`, [
+                  colPath,
+                  NC_MAX_TEXT_LENGTH,
+                ]);
+            } else if (baseModel.isSqlite) {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`SUBSTR(??, 1, ?)`, [
+                  colPath,
+                  NC_MAX_TEXT_LENGTH,
+                ]);
+            } else if (baseModel.isMssql) {
+              // T-SQL LEFT() rejects legacy text/ntext args
+              // ("Argument data type text is invalid for argument 1 of left
+              // function"). SUBSTRING accepts text/ntext as well as
+              // varchar(max)/nvarchar(max) and returns a truncated (n)varchar.
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`SUBSTRING(??, 1, ?)`, [
+                  colPath,
+                  NC_MAX_TEXT_LENGTH,
+                ]);
+            } else if (baseModel.isOracle) {
+              // Oracle has no LEFT() (ORA-00904); SUBSTR handles VARCHAR2
+              // and CLOB alike.
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`SUBSTR(??, 1, ?)`, [
+                  colPath,
+                  NC_MAX_TEXT_LENGTH,
+                ]);
+            } else {
+              // Snowflake / Databricks / other databases - use LEFT function
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`LEFT(??, ?)`, [
+                  colPath,
+                  NC_MAX_TEXT_LENGTH,
+                ]);
+            }
+            break;
+          }
+          // Else fall through
+        }
+        default:
+          if (baseModel.isPg) {
+            if (column.dt === 'bytea') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(
+                  `encode(??.??, '${
+                    column.meta?.format === 'hex' ? 'hex' : 'escape'
+                  }')`,
+                  [alias || baseModel.model.table_name, column.column_name],
+                );
+              break;
+            }
+          }
+
+          if (baseModel.isMssql) {
+            // tedious returns these T-SQL types as raw Node `Buffer` values
+            // (or driver-specific blobs). Without a server-side wrap they
+            // serialize as `{type:"Buffer", data:[…]}` in the JSON response
+            // — broken for users. Wrap each with the canonical T-SQL
+            // conversion so the client sees a usable string:
+            //
+            //   binary/varbinary/image  → `CONVERT(VARCHAR(MAX), col, 1)` —
+            //     style 1 emits `0xABCD…` hex per cast-and-convert docs.
+            //   hierarchyid             → `col.ToString()` emits the path
+            //     syntax (`/1/2/3/`) per hierarchyid method reference.
+            //   geography / geometry    → `col.STAsText()` emits the WKT
+            //     form (`POINT(1 2)`) per spatial type reference.
+            //
+            // sql_variant returns its underlying type by default so doesn't
+            // need a wrap; xml returns as nvarchar already.
+            const mssqlDt = (column.dt ?? '').toLowerCase();
+            const tnPart = alias || baseModel.tnPath;
+            if (
+              mssqlDt === 'binary' ||
+              mssqlDt === 'varbinary' ||
+              mssqlDt === 'image'
+            ) {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`CONVERT(VARCHAR(MAX), ??.??, 1)`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+            if (mssqlDt === 'hierarchyid') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`??.??.ToString()`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+            if (mssqlDt === 'geography' || mssqlDt === 'geometry') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`??.??.STAsText()`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+            // Fixed-length `char(n)` / `nchar(n)` are space-padded to the
+            // declared length — e.g. Sakila's `language.name CHAR(20)`
+            // returns `"English             "` (13 trailing spaces).
+            // RTRIM at SELECT time so the cell value matches what users
+            // see in SSMS by default. No-op for varchar/nvarchar.
+            if (mssqlDt === 'char' || mssqlDt === 'nchar') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`RTRIM(??.??)`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+          }
+
+          if (baseModel.isOracle) {
+            const oracleDt = (column.dt ?? '').toUpperCase();
+            const tnPart = alias || baseModel.tnPath;
+            // node-oracledb returns RAW as a Node Buffer, which serializes
+            // as `{type:"Buffer",data:[…]}` in the JSON response. RAWTOHEX
+            // emits the canonical hex string instead. (LONG RAW can't be
+            // passed to SQL functions — left as-is.)
+            if (oracleDt === 'RAW') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`RAWTOHEX(??.??)`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+            // BLOB / NCLOB aren't in `fetchAsString` (knex's oracledb
+            // dialect only allows clob there), so node-oracledb returns
+            // them as Lob stream objects that break JSON serialization.
+            // Emit a bounded, display-oriented snippet instead: hex for
+            // BLOB (mssql binary parity), text for NCLOB. (LONG RAW can't
+            // be passed to SQL functions — left as-is.)
+            if (oracleDt === 'BLOB') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(
+                  `RAWTOHEX(DBMS_LOB.SUBSTR(??.??, 2000, 1))`,
+                  [tnPart, column.column_name],
+                );
+              break;
+            }
+            if (oracleDt === 'NCLOB') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`DBMS_LOB.SUBSTR(??.??, 2000, 1)`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+            // CHAR(n)/NCHAR(n) are blank-padded to the declared length —
+            // RTRIM at SELECT time so cell values match user expectation,
+            // same as the mssql char/nchar handling above. No-op for
+            // VARCHAR2/NVARCHAR2.
+            if (oracleDt === 'CHAR' || oracleDt === 'NCHAR') {
+              res[sanitize(getAs(column) || column.column_name)] =
+                baseModel.dbDriver.raw(`RTRIM(??.??)`, [
+                  tnPart,
+                  column.column_name,
+                ]);
+              break;
+            }
+          }
+
+          res[sanitize(getAs(column) || column.column_name)] = sanitize(
+            `${alias || baseModel.tnPath}.${column.column_name}`,
+          );
+          break;
+      }
+    }
+    // Only append the accumulated simple-column object when it has entries.
+    // Formula/rollup/button/lookup columns emit their own `qb.select(...)` and
+    // leave `res` empty; a trailing `qb.select({})` then compiles to a stray
+    // empty term (`select <expr>,  from ...`) — malformed SQL. This surfaces
+    // when a query selects ONLY such a column, e.g. a link read restricted to a
+    // formula display-value column (`fieldsSet` of size 1) during link→text
+    // column conversion.
+    if (Object.keys(res).length) {
+      qb.select(res);
+    }
+  };
+};
