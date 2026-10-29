@@ -150,3 +150,6 @@ GUIDE.md
 .dev-comments.jsonl
 .dev-comments-threads.json
 .dev-comments.log
+
+.env
+
